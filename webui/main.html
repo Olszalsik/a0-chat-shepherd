@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Chat Shepherd</title>
+  <meta charset="utf-8">
+  <script type="module" src="/plugins/chat_shepherd/webui/shepherd-store.js"></script>
+  <style>
+    .shepherd-container { padding: 16px; color: var(--text-primary, #eee); font-family: system-ui, sans-serif; }
+    .shepherd-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .shepherd-header h2 { margin: 0; font-size: 1.3rem; }
+    .shepherd-header .refresh-btn { cursor: pointer; background: var(--bg-tertiary, #333); border: 1px solid var(--border-color, #444); color: var(--text-primary, #eee); border-radius: 6px; padding: 4px 12px; font-size: 0.85rem; }
+    .shepherd-header .refresh-btn:hover { background: var(--bg-hover, #444); }
+    .shepherd-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+    .shepherd-badge { display: flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 12px; font-size: 0.8rem; background: var(--bg-tertiary, #333); }
+    .shepherd-badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .shepherd-table { width: 100%; border-collapse: collapse; }
+    .shepherd-table th { text-align: left; padding: 8px; font-size: 0.8rem; color: var(--text-secondary, #aaa); border-bottom: 1px solid var(--border-color, #444); }
+    .shepherd-table td { padding: 8px; font-size: 0.85rem; border-bottom: 1px solid var(--border-color, #222); }
+    .shepherd-table tr:hover { background: var(--bg-hover, rgba(255,255,255,0.05)); }
+    .shepherd-chat-id { font-family: monospace; font-size: 0.8rem; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .shepherd-status { font-weight: 600; }
+    .shepherd-actions { display: flex; gap: 4px; }
+    .shepherd-btn { cursor: pointer; border: 1px solid var(--border-color, #444); border-radius: 4px; padding: 2px 8px; font-size: 0.75rem; background: var(--bg-tertiary, #333); color: var(--text-primary, #eee); }
+    .shepherd-btn:hover { background: var(--bg-hover, #444); }
+    .shepherd-empty { text-align: center; padding: 32px; color: var(--text-secondary, #888); }
+    .shepherd-history { margin-top: 24px; }
+    .shepherd-history h3 { font-size: 1rem; margin-bottom: 8px; }
+    .shepherd-history-list { max-height: 200px; overflow-y: auto; }
+    .shepherd-history-item { padding: 4px 8px; font-size: 0.8rem; border-bottom: 1px solid var(--border-color, #222); }
+    .shepherd-error { color: #f44336; padding: 8px; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <div x-data class="shepherd-container">
+    <template x-if="$store.chatShepherdStore">
+      <div x-init="$store.chatShepherdStore.onOpen()" x-destroy="$store.chatShepherdStore.cleanup()">
+        <div class="shepherd-header">
+          <h2>🐑 Chat Shepherd</h2>
+          <button class="refresh-btn" @click="$store.chatShepherdStore.fetchStatus()">Refresh</button>
+        </div>
+
+        <template x-if="$store.chatShepherdStore.error">
+          <div class="shepherd-error" x-text="$store.chatShepherdStore.error"></div>
+        </template>
+
+        <template x-if="$store.chatShepherdStore.data">
+          <div>
+            <div class="shepherd-summary">
+              <template x-for="(count, status) in $store.chatShepherdStore.data.counts" :key="status">
+                <div class="shepherd-badge">
+                  <span class="dot" :style="`background: ${$store.chatShepherdStore.statusColor(status)}`"></span>
+                  <span x-text="`${count} ${status}`"></span>
+                </div>
+              </template>
+            </div>
+
+            <template x-if="$store.chatShepherdStore.data.chats.length === 0">
+              <div class="shepherd-empty">No chats being monitored. Chats will appear here when the agent runs.</div>
+            </template>
+
+            <template x-if="$store.chatShepherdStore.data.chats.length > 0">
+              <table class="shepherd-table">
+                <thead>
+                  <tr>
+                    <th>Status</th>
+                    <th>Chat</th>
+                    <th>Reason</th>
+                    <th>Nudges</th>
+                    <th>Last Nudge</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="chat in $store.chatShepherdStore.data.chats" :key="chat.chat_id">
+                    <tr>
+                      <td class="shepherd-status">
+                        <span x-text="$store.chatShepherdStore.statusIcon(chat.status)"></span>
+                        <span :style="`color: ${$store.chatShepherdStore.statusColor(chat.status)}`" x-text="chat.status"></span>
+                      </td>
+                      <td class="shepherd-chat-id" x-text="chat.name || chat.chat_id" :title="chat.chat_id"></td>
+                      <td x-text="chat.last_classification"></td>
+                      <td x-text="chat.nudge_count"></td>
+                      <td x-text="$store.chatShepherdStore.formatTime(chat.last_nudge_at)"></td>
+                      <td class="shepherd-action">
+                        <button class="shepherd-btn" @click="$store.chatShepherdStore.nudge(chat.chat_id)">Nudge</button>
+                        <button class="shepherd-btn" @click="$store.chatShepherdStore.resolve(chat.chat_id)" x-show="chat.status === 'intervention'">Resolve</button>
+                        <button class="shepherd-btn" @click="$store.chatShepherdStore.dismiss(chat.chat_id)">Dismiss</button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </template>
+
+            <div class="shepherd-history" x-show="$store.chatShepherdStore.data.history && $store.chatShepherdStore.data.history.length > 0">
+              <h3>Recent Actions</h3>
+              <div class="shepherd-history-list">
+                <template x-for="(item, idx) in $store.chatShepherdStore.data.history" :key="idx">
+                  <div class="shepherd-history-item">
+                    <span x-text="$store.chatShepherdStore.formatTime(item.timestamp)"></span>
+                    <span x-text="item.action"></span>
+                    <span x-text="item.chat_id"></span>
+                    <template x-if="item.nudge_count">
+                      <span x-text="`(#${item.nudge_count})`"></span>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </template>
+  </div>
+</body>
+</html>

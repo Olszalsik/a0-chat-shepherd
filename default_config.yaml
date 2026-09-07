@@ -1,0 +1,16 @@
+enabled: true
+watch_all: true
+stall_minutes: 5
+max_auto_nudges: 3
+nudge_cooldown_minutes: 10
+intervention_after_failed_nudges: true
+notify_on_intervention: true
+icons:
+  running: "🏃"
+  stalled: "⚠️"
+  nudged: "🔄"
+  intervention: "🚨"
+  awaiting_user: "💬"
+  error: "❌"
+  paused: "⏸️"
+  idle: ""

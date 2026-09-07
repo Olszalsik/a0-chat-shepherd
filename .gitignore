@@ -1,0 +1,51 @@
+# --- Secrets & per-instance config (NEVER commit) ---
+config.json
+config.json.before-*.bak
+config.json.pre-*.bak
+*.before-*.bak
+*.pre-*.bak
+*.pre_*.bak
+*.bak
+*.tmp
+
+# --- Runtime state / toggles ---
+execute_record.json
+.plugin_state.json
+state.json
+.toggle-*
+.disabled
+
+# --- Logs & runtime-generated data ---
+*.log
+proxy.log
+logs/
+data/
+.cache/
+
+# --- Generated / large artifacts ---
+cache/
+stats/
+stats.db
+ccr/
+ccr.db
+cr/ccr.db
+staging/
+fragments/skillopt_prop_*/
+fragments/STAGING/
+models/reward_model/*.bin
+models/reward_model/*.safetensors
+models/reward_model/*.pt
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.swp

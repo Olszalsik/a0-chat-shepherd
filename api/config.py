@@ -1,0 +1,152 @@
+# chat_shepherd — config read/update endpoint.
+#
+# Route: POST /api/plugins/chat_shepherd/config
+#   body {}              -> returns current merged config
+#   body {...overrides}  -> persists overrides, then returns merged config
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from helpers.api import ApiHandler  # type: ignore
+from helpers import plugins as plugins_helper  # type: ignore
+from helpers import files  # type: ignore
+
+import json
+import os
+
+PLUGIN_NAME = "chat_shepherd"
+
+_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "watch_all": True,
+    "stall_minutes": 5,
+    "max_auto_nudges": 3,
+    "nudge_cooldown_minutes": 10,
+    "intervention_after_failed_nudges": True,
+    "notify_on_intervention": True,
+    "icons": {
+        "running": "🏃",
+        "stalled": "⚠️",
+        "nudged": "🔄",
+        "intervention": "🚨",
+        "awaiting_user": "💬",
+        "error": "❌",
+        "paused": "⏸️",
+        "idle": "",
+    },
+}
+
+_KNOWN_KEYS = set(_DEFAULTS.keys())
+_ICON_STATUSES = set(_DEFAULTS["icons"].keys())
+
+
+def _config_path() -> str:
+    return files.get_abs_path(files.USER_DIR, "plugins", PLUGIN_NAME, "config.json")
+
+
+def _read_disk() -> dict[str, Any]:
+    merged = dict(_DEFAULTS)
+    try:
+        path = _config_path()
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                persisted = json.load(f)
+            if isinstance(persisted, dict):
+                for k, v in persisted.items():
+                    if k in _KNOWN_KEYS:
+                        merged[k] = v
+    except Exception:
+        pass
+    return merged
+
+
+def _coerce_bool(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
+def _coerce_int(val: Any, fallback: int, lo: int, hi: int) -> int:
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return fallback
+    return max(lo, min(hi, n))
+
+
+class Config(ApiHandler):
+    async def process(self, input_data: dict, request: Any) -> dict:
+        overrides = input_data or {}
+        if not isinstance(overrides, dict):
+            return {"ok": False, "error": "body must be a JSON object"}
+
+        # No body keys = pure read
+        readable = {k: v for k, v in overrides.items() if k in _KNOWN_KEYS}
+        if not readable:
+            return {
+                "ok": True,
+                "success": True,
+                "config": _read_disk(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        # Sanitize before persisting
+        current = _read_disk()
+        if "enabled" in readable:
+            current["enabled"] = _coerce_bool(readable["enabled"])
+        if "watch_all" in readable:
+            current["watch_all"] = _coerce_bool(readable["watch_all"])
+        if "intervention_after_failed_nudges" in readable:
+            current["intervention_after_failed_nudges"] = _coerce_bool(
+                readable["intervention_after_failed_nudges"]
+            )
+        if "notify_on_intervention" in readable:
+            current["notify_on_intervention"] = _coerce_bool(
+                readable["notify_on_intervention"]
+            )
+        if "stall_minutes" in readable:
+            current["stall_minutes"] = _coerce_int(
+                readable["stall_minutes"], current["stall_minutes"], 1, 240
+            )
+        if "max_auto_nudges" in readable:
+            current["max_auto_nudges"] = _coerce_int(
+                readable["max_auto_nudges"], current["max_auto_nudges"], 0, 20
+            )
+        if "nudge_cooldown_minutes" in readable:
+            current["nudge_cooldown_minutes"] = _coerce_int(
+                readable["nudge_cooldown_minutes"],
+                current["nudge_cooldown_minutes"],
+                1,
+                240,
+            )
+
+        if "icons" in readable:
+            icons_in = readable["icons"]
+            if isinstance(icons_in, dict):
+                merged_icons = dict(current.get("icons") or _DEFAULTS["icons"])
+                for key, value in icons_in.items():
+                    if key in _ICON_STATUSES:
+                        merged_icons[key] = str(value)[:16]
+                current["icons"] = merged_icons
+
+        try:
+            plugins_helper.save_plugin_config(PLUGIN_NAME, "", "", current)
+        except Exception as e:
+            return {"ok": False, "success": False, "error": f"save failed: {e}"}
+
+        try:
+            plugins_helper.clear_plugin_cache([PLUGIN_NAME])
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "success": True,
+            "updated": sorted(readable.keys()),
+            "config": _read_disk(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
