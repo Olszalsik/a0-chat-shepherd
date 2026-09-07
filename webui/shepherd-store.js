@@ -2,6 +2,30 @@ import { createStore } from "/js/AlpineStore.js";
 
 const API = "/api/plugins/chat_shepherd";
 
+// Fallback icons; the server config (icons) overrides these per status.
+// Empty string = no pictogram shown for that state.
+export const DEFAULT_ICONS = {
+  running: "🏃",
+  stalled: "⚠️",
+  nudged: "🔄",
+  intervention: "🚨",
+  awaiting_user: "💬",
+  error: "❌",
+  paused: "⏸️",
+  idle: "",
+};
+
+const COLORS = {
+  running: "#4caf50",
+  stalled: "#ff9800",
+  nudged: "#2196f3",
+  intervention: "#f44336",
+  awaiting_user: "#9c27b0",
+  error: "#f44336",
+  paused: "#607d8b",
+  idle: "#757575",
+};
+
 async function callApi(path, body) {
   const resp = await fetch(API + path, {
     method: "POST",
@@ -20,7 +44,7 @@ export const store = createStore("chatShepherdStore", {
   data: null,
   error: "",
   pollTimer: null,
-  pollInterval: 8000,
+  pollInterval: 5000,
 
   init() {
     this.onOpen();
@@ -91,32 +115,19 @@ export const store = createStore("chatShepherdStore", {
     }
   },
 
+  iconFor(status) {
+    const custom = (this.data && this.data.config && this.data.config.icons) || {};
+    const fallback = DEFAULT_ICONS[status];
+    const ch = custom[status] !== undefined && custom[status] !== null ? custom[status] : fallback;
+    return ch || "";
+  },
+
   statusIcon(status) {
-    const icons = {
-      running: "✅",
-      stalled: "⚠️",
-      nudged: "🔄",
-      intervention: "🚨",
-      awaiting_user: "💬",
-      error: "❌",
-      paused: "⏸️",
-      idle: "💤",
-    };
-    return icons[status] || "❓";
+    return this.iconFor(status);
   },
 
   statusColor(status) {
-    const colors = {
-      running: "#4caf50",
-      stalled: "#ff9800",
-      nudged: "#2196f3",
-      intervention: "#f44336",
-      awaiting_user: "#9c27b0",
-      error: "#f44336",
-      paused: "#607d8b",
-      idle: "#757575",
-    };
-    return colors[status] || "#757575";
+    return COLORS[status] || "#757575";
   },
 
   formatTime(iso) {
