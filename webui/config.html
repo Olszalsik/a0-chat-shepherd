@@ -1,182 +1,250 @@
 <html>
 <head>
- <title>Chat Shepherd Settings</title>
- <meta charset="utf-8" />
- <style>
- .cs-card { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 6px; margin-bottom: 12px; border: 1px solid rgba(255,255,255,0.08); }
- .cs-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
- .cs-row label { display: block; font-size: 12px; margin-bottom: 4px; }
- .cs-row input[type="number"] { padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: inherit; font-size: 12px; width: 90px; }
- .cs-btn { padding: 6px 12px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.25); color: inherit; cursor: pointer; font-size: 12px; }
- .cs-btn:disabled { opacity: 0.5; cursor: not-allowed; }
- .cs-btn-primary { border-color: rgba(120,200,120,0.4); background: rgba(40,120,40,0.2); }
- .cs-msg { display: block; margin-top: 8px; opacity: 0.8; font-size: 11px; word-break: break-all; }
- .cs-on { color: #6c6; }
- .cs-err { color: #c66; }
- h4 { margin: 0 0 8px 0; }
- small.hint { opacity: 0.7; font-size: 11px; display: block; margin-top: 2px; }
- </style>
+<title>Chat Shepherd Settings</title>
+<meta charset="utf-8" />
+<style>
+.cs-card { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 6px; margin-bottom: 12px; border: 1px solid rgba(255,255,255,0.08); }
+.cs-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+.cs-row label { display: block; font-size: 12px; margin-bottom: 4px; }
+.cs-row input[type="number"] { padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: inherit; font-size: 12px; width: 90px; }
+.cs-btn { padding: 6px 12px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.25); color: inherit; cursor: pointer; font-size: 12px; }
+.cs-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.cs-btn-primary { border-color: rgba(120,200,120,0.4); background: rgba(40,120,40,0.2); }
+.cs-msg { display: block; margin-top: 8px; opacity: 0.8; font-size: 11px; word-break: break-all; }
+.cs-on { color: #6c6; }
+.cs-err { color: #c66; }
+h4 { margin: 0 0 8px 0; }
+small.hint { opacity: 0.7; font-size: 11px; display: block; margin-top: 2px; }
+[x-cloak] { display: none !important; }
+.cs-icon-field { position: relative; }
+.cs-icon-btn { width: 56px; height: 34px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: inherit; font-size: 17px; line-height: 1; cursor: pointer; padding: 2px; }
+.cs-icon-btn.empty { color: rgba(255,255,255,0.35); }
+.cs-emoji-pop { position: absolute; z-index: 60; top: 100%; left: 0; margin-top: 4px; background: #222a38; border: 1px solid rgba(255,255,255,0.22); border-radius: 8px; padding: 8px; width: 252px; max-height: 230px; overflow-y: auto; box-shadow: 0 8px 24px rgba(0,0,0,0.55); }
+.cs-emoji-clear { display: block; width: 100%; margin-bottom: 6px; padding: 3px 6px; font-size: 11px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: none; color: inherit; cursor: pointer; text-align: center; }
+.cs-emoji-clear:hover { background: rgba(255,255,255,0.1); }
+.cs-emoji-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; }
+.cs-emoji-grid button { background: none; border: none; font-size: 17px; padding: 3px 0; border-radius: 4px; cursor: pointer; line-height: 1.35; }
+.cs-emoji-grid button:hover { background: rgba(255,255,255,0.14); }
+</style>
 </head>
 <body>
 <div id="chat-shepherd-root" x-data="chatShepherdSettings()" x-init="init()">
 
- <div class="cs-card">
- <h4>
- <span x-text="cfg.enabled ? '🟢' : '🔴'"></span>
- Chat Shepherd
- </h4>
- <label style="display: block; margin: 4px 0;">
- <input type="checkbox" x-model="cfg.enabled" />
- <strong>Enable Chat Shepherd</strong>
- </label>
- <small class="hint">Watches chats for stalls, auto-nudges stalled agents, and flags chats needing human input.</small>
- <label style="display: block; margin: 8px 0 0 0;">
- <input type="checkbox" x-model="cfg.watch_all" />
- <strong>Watch all chats</strong>
- </label>
- <small class="hint">When off, only chats that have received at least one message are monitored.</small>
- </div>
+<div class="cs-card">
+<h4>
+<span x-text="cfg.enabled ? '🟢' : '🔴'"></span>
+Chat Shepherd
+</h4>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="cfg.enabled" />
+<strong>Enable Chat Shepherd</strong>
+</label>
+<small class="hint">Watches chats for stalls, auto-nudges stalled agents, and flags chats needing human input.</small>
+<label style="display: block; margin: 8px 0 0 0;">
+<input type="checkbox" x-model="cfg.watch_all" />
+<strong>Watch all chats</strong>
+</label>
+<small class="hint">When off, only chats that have received at least one message are monitored.</small>
+</div>
 
- <div class="cs-card">
- <h4>Stall detection</h4>
- <div class="cs-row">
- <div>
- <label>Stall threshold (minutes)</label>
- <input type="number" min="1" max="240" x-model.number="cfg.stall_minutes" />
- </div>
- <div>
- <label>Max auto-nudges</label>
- <input type="number" min="0" max="20" x-model.number="cfg.max_auto_nudges" />
- </div>
- <div>
- <label>Nudge cooldown (minutes)</label>
- <input type="number" min="1" max="240" x-model.number="cfg.nudge_cooldown_minutes" />
- </div>
- </div>
- <small class="hint">After max auto-nudges are exhausted, the chat escalates to intervention status.</small>
- </div>
+<div class="cs-card">
+<h4>Stall detection</h4>
+<div class="cs-row">
+<div>
+<label>Stall threshold (minutes)</label>
+<input type="number" min="1" max="240" x-model.number="cfg.stall_minutes" />
+</div>
+<div>
+<label>Max auto-nudges</label>
+<input type="number" min="0" max="20" x-model.number="cfg.max_auto_nudges" />
+</div>
+<div>
+<label>Nudge cooldown (minutes)</label>
+<input type="number" min="1" max="240" x-model.number="cfg.nudge_cooldown_minutes" />
+</div>
+</div>
+<small class="hint">After max auto-nudges are exhausted, the chat escalates to intervention status.</small>
+</div>
 
- <div class="cs-card">
- <h4>Escalation</h4>
- <label style="display: block; margin: 4px 0;">
- <input type="checkbox" x-model="cfg.intervention_after_failed_nudges" />
- <strong>Escalate to intervention after failed nudges</strong>
- </label>
- <label style="display: block; margin: 4px 0;">
- <input type="checkbox" x-model="cfg.notify_on_intervention" />
- <strong>Notify when a chat needs human intervention</strong>
- </label>
- </div>
+<div class="cs-card">
+<h4>Escalation</h4>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="cfg.intervention_after_failed_nudges" />
+<strong>Escalate to intervention after failed nudges</strong>
+</label>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="cfg.notify_on_intervention" />
+<strong>Notify when a chat needs human intervention</strong>
+</label>
+</div>
 
- <div class="cs-card">
- <h4>Status</h4>
- <div class="cs-row" style="font-size: 12px; opacity: 0.85;">
- <div>Chats tracked: <strong x-text="chatsCount"></strong></div>
- <div>Intervention: <strong x-text="interventionCount"></strong></div>
- </div>
- </div>
+<div class="cs-card">
+<h4>Sidebar pictograms</h4>
+<small class="hint">Tap a pictogram to pick an emoji or symbol from the dropdown. Choose none to hide the pictogram for that state.</small>
+<div class="cs-row" style="margin-top:8px; align-items: flex-end;">
+<template x-for="f in iconFields" :key="f.key">
+<div class="cs-icon-field" @click.outside="if (pickerField === f.key) pickerField = ''">
+<label x-text="f.label"></label>
+<button type="button" class="cs-icon-btn" :class="{ empty: !cfg.icons[f.key] }" @click="pickerField = (pickerField === f.key ? '' : f.key)" x-text="cfg.icons[f.key] || '∅'"></button>
+<div class="cs-emoji-pop" x-show="pickerField === f.key" x-cloak>
+<button type="button" class="cs-emoji-clear" @click="pickIcon(f.key, '')">∅ none (hide pictogram)</button>
+<div class="cs-emoji-grid">
+<template x-for="(e, i) in EMOJIS" :key="i">
+<button type="button" @click="pickIcon(f.key, e)" x-text="e"></button>
+</template>
+</div>
+</div>
+</div>
+</template>
+</div>
+</div>
 
- <div class="cs-card">
- <div class="cs-row">
- <button type="button" class="cs-btn cs-btn-primary" :disabled="busy" @click="save()">Save settings</button>
- <button type="button" class="cs-btn" :disabled="busy" @click="refresh()">Refresh</button>
- </div>
- <small x-show="lastMsg" x-text="lastMsg" class="cs-msg" :class="{ 'cs-err': !!lastErr, 'cs-on': !lastErr && lastOk }"></small>
- </div>
+<div class="cs-card">
+<h4>Status</h4>
+<div class="cs-row" style="font-size: 12px; opacity: 0.85;">
+<div>Chats tracked: <strong x-text="chatsCount"></strong></div>
+<div>Intervention: <strong x-text="interventionCount"></strong></div>
+</div>
+</div>
+
+<div class="cs-card">
+<div class="cs-row">
+<button type="button" class="cs-btn cs-btn-primary" :disabled="busy" @click="save()">Save settings</button>
+<button type="button" class="cs-btn" :disabled="busy" @click="refresh()">Refresh</button>
+</div>
+<small x-show="lastMsg" x-text="lastMsg" class="cs-msg" :class="{ 'cs-err': !!lastErr, 'cs-on': !lastErr && lastOk }"></small>
+</div>
 
 </div>
 
 <script>
 // Self-contained Alpine component — no global store dependency.
 function chatShepherdSettings() {
- return {
- busy: false,
- lastMsg: '',
- lastOk: false,
- lastErr: false,
- chatsCount: 0,
- interventionCount: 0,
- cfg: {
- enabled: true,
- watch_all: true,
- stall_minutes: 5,
- max_auto_nudges: 3,
- nudge_cooldown_minutes: 10,
- intervention_after_failed_nudges: true,
- notify_on_intervention: true,
- },
+return {
+busy: false,
+lastMsg: '',
+lastOk: false,
+lastErr: false,
+chatsCount: 0,
+interventionCount: 0,
+pickerField: '',
+iconFields: [
+{ key: 'running', label: 'Running' },
+{ key: 'stalled', label: 'Stalled' },
+{ key: 'nudged', label: 'Nudged' },
+{ key: 'intervention', label: 'Intervention' },
+{ key: 'awaiting_user', label: 'Awaiting you' },
+{ key: 'error', label: 'Error' },
+{ key: 'paused', label: 'Paused' },
+{ key: 'idle', label: 'Idle' },
+],
+EMOJIS: [
+'🏃','⚡','🔥','🚀','⚙️','🔧','🤖','🧠','💭','💬','🗨️','❓','❗','⚠️','🚨','🛑',
+'⛔','✅','❌','🔄','🔁','⏳','⌛','⏸️','▶️','⏹️','💤','😴','👀','🔔','📣','📢',
+'🆘','🩺','🛠️','🎯','📡','🧭','💡','⭐','🌟','🟢','🟡','🟠','🔴','🟣','🔵','⚫',
+'⚪','☑️','✔️','✖️','➡️','⏱️','🕐','📅','📞','✉️','📨','🧑‍🌾','🐑','🐐','🐕','🌾',
+'🚩','🏁','🧪','🔍','📝','✏️','🔗','🧩','🧰','🔑','🔒','♾️','❔','‼️','⁉️','♻️',
+'🎈','🫡','🤝','🫶','🙌','👏','🤔','😵','🥱','😤','🧑‍💻','🗣️'
+],
+cfg: {
+enabled: true,
+watch_all: true,
+stall_minutes: 5,
+max_auto_nudges: 3,
+nudge_cooldown_minutes: 10,
+intervention_after_failed_nudges: true,
+notify_on_intervention: true,
+icons: {
+running: '🏃',
+stalled: '⚠️',
+nudged: '🔄',
+intervention: '🚨',
+awaiting_user: '💬',
+error: '❌',
+paused: '⏸️',
+idle: '',
+},
+},
 
- async init() {
- await this.refresh();
- },
+pickIcon(key, e) {
+this.cfg.icons[key] = e;
+this.pickerField = '';
+},
 
- async api(path, body) {
- const r = await fetch('/api/plugins/chat_shepherd' + path, {
- method: 'POST',
- headers: { 'content-type': 'application/json' },
- body: JSON.stringify(body || {}),
- });
- const txt = await r.text();
- try { return JSON.parse(txt); } catch (e) { return { ok: false, error: txt }; }
- },
+async init() {
+await this.refresh();
+},
 
- setMsg(msg, ok) {
- this.lastMsg = msg;
- this.lastOk = !!ok;
- this.lastErr = !ok;
- },
+async api(path, body) {
+const r = await fetch('/api/plugins/chat_shepherd' + path, {
+method: 'POST',
+headers: { 'content-type': 'application/json' },
+body: JSON.stringify(body || {}),
+});
+const txt = await r.text();
+try { return JSON.parse(txt); } catch (e) { return { ok: false, error: txt }; }
+},
 
- async refresh() {
- this.busy = true;
- try {
- const c = await this.api('/config');
- if (c && c.ok && c.config) {
- for (const k of Object.keys(c.config)) {
- if (k in this.cfg) this.cfg[k] = c.config[k];
- }
- }
- } catch (e) { this.setMsg('config: ' + e, false); }
- try {
- const s = await this.api('/status');
- if (s && s.success) {
- const chats = s.chats || [];
- this.chatsCount = chats.length;
- this.interventionCount = chats.filter(function (c) { return c.status === 'intervention'; }).length;
- }
- } catch (e) { /* status may not be reachable yet */ }
- this.busy = false;
- },
+setMsg(msg, ok) {
+this.lastMsg = msg;
+this.lastOk = !!ok;
+this.lastErr = !ok;
+},
 
- async save() {
- this.busy = true;
- this.setMsg('saving...', true);
- try {
- const payload = {
- enabled: this.cfg.enabled,
- watch_all: this.cfg.watch_all,
- stall_minutes: this.cfg.stall_minutes,
- max_auto_nudges: this.cfg.max_auto_nudges,
- nudge_cooldown_minutes: this.cfg.nudge_cooldown_minutes,
- intervention_after_failed_nudges: this.cfg.intervention_after_failed_nudges,
- notify_on_intervention: this.cfg.notify_on_intervention,
- };
- const r = await this.api('/config', payload);
- if (r && r.ok) {
- if (r.config) {
- for (const k of Object.keys(r.config)) {
- if (k in this.cfg) this.cfg[k] = r.config[k];
- }
- }
- this.setMsg('saved: ' + ((r.updated || []).join(', ') || 'ok'), true);
- } else {
- this.setMsg('save failed: ' + ((r && r.error) || 'unknown'), false);
- }
- } catch (e) {
- this.setMsg('save: ' + e, false);
- }
- this.busy = false;
- },
- };
+async refresh() {
+this.busy = true;
+try {
+const c = await this.api('/config');
+if (c && c.ok && c.config) {
+for (const k of Object.keys(c.config)) {
+if (k in this.cfg) this.cfg[k] = c.config[k];
+}
+if (c.config.icons) this.cfg.icons = c.config.icons;
+}
+} catch (e) { this.setMsg('config: ' + e, false); }
+try {
+const s = await this.api('/status');
+if (s && s.success) {
+const chats = s.chats || [];
+this.chatsCount = chats.length;
+this.interventionCount = chats.filter(function (c) { return c.status === 'intervention'; }).length;
+}
+} catch (e) { /* status may not be reachable yet */ }
+this.busy = false;
+},
+
+async save() {
+this.busy = true;
+this.setMsg('saving...', true);
+try {
+const payload = {
+enabled: this.cfg.enabled,
+watch_all: this.cfg.watch_all,
+stall_minutes: this.cfg.stall_minutes,
+max_auto_nudges: this.cfg.max_auto_nudges,
+nudge_cooldown_minutes: this.cfg.nudge_cooldown_minutes,
+intervention_after_failed_nudges: this.cfg.intervention_after_failed_nudges,
+notify_on_intervention: this.cfg.notify_on_intervention,
+icons: this.cfg.icons,
+};
+const r = await this.api('/config', payload);
+if (r && r.ok) {
+if (r.config) {
+for (const k of Object.keys(r.config)) {
+if (k in this.cfg) this.cfg[k] = r.config[k];
+}
+if (r.config.icons) this.cfg.icons = r.config.icons;
+}
+this.setMsg('saved: ' + ((r.updated || []).join(', ') || 'ok'), true);
+} else {
+this.setMsg('save failed: ' + ((r && r.error) || 'unknown'), false);
+}
+} catch (e) {
+this.setMsg('save: ' + e, false);
+}
+this.busy = false;
+},
+};
 }
 </script>
 </body>

@@ -20,7 +20,7 @@ class Nudge(ApiHandler):
 
         try:
             from agent import AgentContext
-            from helpers.messages import UserMessage
+            from agent import UserMessage
         except Exception as e:
             return {'success': False, 'error': f'Import error: {e}'}
 
@@ -29,7 +29,7 @@ class Nudge(ApiHandler):
             return {'success': False, 'error': f'Context {chat_id} not found'}
 
         try:
-            msg = UserMessage(text or NUDGE_TEXT)
+            msg = UserMessage(message=text or NUDGE_TEXT)
             ctx.communicate(msg)
         except Exception as e:
             return {'success': False, 'error': f'Nudge failed: {e}'}

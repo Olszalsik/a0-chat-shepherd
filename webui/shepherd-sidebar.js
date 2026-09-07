@@ -2,27 +2,60 @@
  * Chat Shepherd — sidebar status icon injector.
  * Reads status from the shared Alpine store (chatShepherdStore)
  * and paints a badge on sidebar chat rows with a non-idle status.
+ * Icons are user-configurable via plugin settings (config.icons);
+ * an empty icon means "no pictogram for this state".
  */
 (function () {
   "use strict";
 
-  var POLL_MS = 10000;
+  var POLL_MS = 2500;
   var debounceTimer = null;
   var injecting = false;
 
-  var ICONS = {
-    running: { ch: "✅", color: "#4caf50", label: "Running" },
-    stalled: { ch: "⚠️", color: "#ff9800", label: "Stalled" },
-    nudged: { ch: "🔄", color: "#2196f3", label: "Nudged" },
-    intervention: { ch: "🚨", color: "#f44336", label: "Needs attention" },
-    awaiting_user: { ch: "💬", color: "#9c27b0", label: "Awaiting you" },
-    error: { ch: "❌", color: "#f44336", label: "Error" },
-    paused: { ch: "⏸️", color: "#607d8b", label: "Paused" }
+  var DEFAULT_ICONS = {
+    running: "🏃",
+    stalled: "⚠️",
+    nudged: "🔄",
+    intervention: "🚨",
+    awaiting_user: "💬",
+    error: "❌",
+    paused: "⏸️",
+    idle: "",
+  };
+
+  var LABELS = {
+    running: "Running",
+    stalled: "Stalled",
+    nudged: "Nudged",
+    intervention: "Needs attention",
+    awaiting_user: "Awaiting you",
+    error: "Error",
+    paused: "Paused",
+    idle: "Idle",
+  };
+
+  var COLORS = {
+    running: "#4caf50",
+    stalled: "#ff9800",
+    nudged: "#2196f3",
+    intervention: "#f44336",
+    awaiting_user: "#9c27b0",
+    error: "#f44336",
+    paused: "#607d8b",
+    idle: "#757575",
   };
 
   function store() {
     if (window.Alpine && Alpine.store) return Alpine.store("chatShepherdStore");
     return null;
+  }
+
+  function iconFor(s, status) {
+    var custom = (s && s.data && s.data.config && s.data.config.icons) || {};
+    if (Object.prototype.hasOwnProperty.call(custom, status)) {
+      return String(custom[status] || "");
+    }
+    return DEFAULT_ICONS[status] || "";
   }
 
   setInterval(function () {
@@ -40,11 +73,19 @@
   function chatIdFromContainer(container) {
     var li = container.closest("li");
     if (li) {
-      if (li.__x_for_context && li.__x_for_context.id) return li.__x_for_context.id;
+      try {
+        if (window.Alpine && Alpine.$data) {
+          var d = Alpine.$data(li);
+          if (d) {
+            if (d.context && d.context.id) return d.context.id;
+            if (d.child && d.child.id) return d.child.id;
+          }
+        }
+      } catch (e) {}
       if (li._x_dataStack && li._x_dataStack[0]) {
         var stack = li._x_dataStack[0];
         if (stack.context && stack.context.id) return stack.context.id;
-        if (stack.id) return stack.id;
+        if (stack.child && stack.child.id) return stack.child.id;
       }
     }
     if (container.dataset && container.dataset.chatId) return container.dataset.chatId;
@@ -76,25 +117,32 @@
           return;
         }
 
-        var meta = ICONS[status];
-        if (!meta) return;
+        var ch = iconFor(s, status);
+        var color = COLORS[status] || "#757575";
 
+        // Configurable "no pictogram" for this state.
+        if (!ch) {
+          if (existing) existing.remove();
+          return;
+        }
+
+        var label = "Chat Shepherd: " + (LABELS[status] || status);
         if (existing) {
-          if (existing.textContent !== meta.ch) {
-            existing.textContent = meta.ch;
-            existing.style.color = meta.color;
-            existing.title = "Chat Shepherd: " + meta.label;
+          if (existing.textContent !== ch) {
+            existing.textContent = ch;
+            existing.style.color = color;
+            existing.title = label;
           }
           return;
         }
 
         var badge = document.createElement("span");
         badge.className = "cs-badge";
-        badge.textContent = meta.ch;
-        badge.title = "Chat Shepherd: " + meta.label;
+        badge.textContent = ch;
+        badge.title = label;
         badge.style.cssText =
           "margin-left:6px;flex:none;font-size:12px;line-height:1;pointer-events:auto;" +
-          "color:" + meta.color + ";";
+          "color:" + color + ";";
         container.appendChild(badge);
       });
     } finally {

@@ -68,11 +68,20 @@ def _last_log_type(context: AgentContext) -> str:
 
 def _nudge_context(context: AgentContext, text: str | None = None) -> bool:
     try:
-        from helpers.messages import UserMessage
-        msg = UserMessage(text or NUDGE_TEXT)
+        # UserMessage lives in the framework's agent module, not helpers.messages.
+        from agent import UserMessage
+        msg = UserMessage(message=text or NUDGE_TEXT)
         context.communicate(msg)
         return True
-    except Exception:
+    except Exception as e:
+        try:
+            import os
+            from datetime import datetime as _dt
+            dbg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'nudge_debug.log')
+            with open(dbg, 'a', encoding='utf-8') as f:
+                f.write(f"{_dt.now().isoformat()} auto_nudge error: {e!r}\n")
+        except Exception:
+            pass
         return False
 
 
@@ -99,6 +108,9 @@ def classify_chat(
     last_log_type = _last_log_type(context)
     last_msg_dt = _parse_dt(getattr(context, 'last_message', ''))
     minutes_idle = _minutes_since(last_msg_dt)
+
+    if last_log_type == '':
+        return STATUS_IDLE, 'New chat, no messages yet'
 
     if last_log_type == 'response':
         return STATUS_AWAITING_USER, 'Agent finished response, waiting for user'
