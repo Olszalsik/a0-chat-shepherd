@@ -4,8 +4,19 @@ stall_minutes: 5
 max_auto_nudges: 3
 max_nudges_per_tick: 1
 nudge_cooldown_minutes: 10
+allowed_chat_ids: []
 intervention_after_failed_nudges: true
 notify_on_intervention: true
+# v1.2.0 wedge remediation ladder: a running chat whose log is frozen for
+# >= stall_minutes is wedged. After wedge_nudge_after_minutes it gets an
+# automatic "continue" (Tier 1); when remediations are exhausted and
+# wedge_soft_restart is true, the last attempt kills the hung task and
+# re-sends the framework nudge (Tier 2, loses the hung call's output).
+# wedge_max_remediations 0 disables wedge auto-remediation.
+wedge_nudge_after_minutes: 10
+wedge_max_remediations: 2
+wedge_remediation_cooldown_minutes: 10
+wedge_soft_restart: false
 icons:
   running: "🏃"
   stalled: "⚠️"

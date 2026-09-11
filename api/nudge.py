@@ -24,7 +24,7 @@ class Nudge(ApiHandler):
         except Exception as e:
             return {'success': False, 'error': f'Import error: {e}'}
 
-        ctx = AgentContext.use(chat_id)
+        ctx = AgentContext.get(chat_id)
         if ctx is None:
             return {'success': False, 'error': f'Context {chat_id} not found'}
 
@@ -39,6 +39,7 @@ class Nudge(ApiHandler):
         entry = get_chat(state, chat_id)
         new_count = entry.get('nudge_count', 0) + 1
         update_chat(state, chat_id,
+        nudges_sent=entry.get('nudges_sent', 0) + 1,
             nudge_count=new_count,
             last_nudge_at=now_iso,
             status='nudged',

@@ -17,10 +17,5 @@ class ChatShepherdTick(Extension):
         try:
             tick(cfg)
         except Exception as e:
-            try:
-                from datetime import datetime as _dt
-                dbg = files.get_abs_path('usr/plugins/chat_shepherd/data/tick_debug.log')
-                with open(dbg, 'a', encoding='utf-8') as f:
-                    f.write(_dt.now().isoformat() + ' tick error: ' + repr(e) + chr(10))
-            except Exception:
-                pass
+            from usr.plugins.chat_shepherd.helpers.monitor import _debug_log
+            _debug_log('tick_fail', repr(e))

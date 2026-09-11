@@ -134,6 +134,27 @@ class Status(ApiHandler):
         }
         chat_list.sort(key=lambda c: status_order.get(c['status'], 99))
 
+        # R2: nudge-effectiveness per chat + global aggregate (v1.2.0 also
+        # carries the wedge remediation ladder counters).
+        for c in chat_list:
+            src = chats_state.get(c['chat_id'], {})
+            sent = src.get('nudges_sent', 0)
+            eff = src.get('nudges_effective', 0)
+            c['nudges_sent'] = sent
+            c['nudges_effective'] = eff
+            c['hit_rate'] = round(100.0 * eff / sent) if sent else None
+            c['wedge_nudge_count'] = src.get('wedge_nudge_count', 0)
+            c['wedge_nudges_sent'] = src.get('wedge_nudges_sent', 0)
+            c['wedge_nudges_effective'] = src.get('wedge_nudges_effective', 0)
+        _total_sent = sum(c['nudges_sent'] for c in chat_list)
+        _total_eff = sum(c['nudges_effective'] for c in chat_list)
+        effectiveness = {
+            'sent': _total_sent,
+            'effective': _total_eff,
+            'hit_rate': round(100.0 * _total_eff / _total_sent) if _total_sent else None,
+            'wedge_sent': sum(c['wedge_nudges_sent'] for c in chat_list),
+            'wedge_effective': sum(c['wedge_nudges_effective'] for c in chat_list),
+        }
         counts: dict[str, int] = {}
         for c in chat_list:
             counts[c['status']] = counts.get(c['status'], 0) + 1
@@ -146,10 +167,17 @@ class Status(ApiHandler):
                 'max_auto_nudges': cfg.get('max_auto_nudges', 3),
                 'max_nudges_per_tick': cfg.get('max_nudges_per_tick', 1),
                 'nudge_cooldown_minutes': cfg.get('nudge_cooldown_minutes', 10),
+                'wedge_nudge_after_minutes': cfg.get('wedge_nudge_after_minutes', 10),
+                'wedge_max_remediations': cfg.get('wedge_max_remediations', 2),
+                'wedge_remediation_cooldown_minutes': cfg.get(
+                    'wedge_remediation_cooldown_minutes', 10
+                ),
+                'wedge_soft_restart': bool(cfg.get('wedge_soft_restart', False)),
                 'icons': icons,
             },
             'last_tick': state.get('last_tick', ''),
             'chats': chat_list,
             'counts': counts,
+            'effectiveness': effectiveness,
             'history': state.get('history', [])[:20],
         }

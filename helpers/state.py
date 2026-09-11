@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,7 +41,10 @@ def load_state() -> dict[str, Any]:
 
 
 def save_state(state: dict[str, Any]) -> None:
-    files.write_file(STATE_FILE, json.dumps(state, ensure_ascii=False, indent=2))
+    # Atomic replace: a crash mid-write must never truncate state.json.
+    tmp_rel = STATE_FILE + '.tmp'
+    files.write_file(tmp_rel, json.dumps(state, ensure_ascii=False, indent=2))
+    os.replace(files.get_abs_path(tmp_rel), files.get_abs_path(STATE_FILE))
 
 
 def get_chat(state: dict, chat_id: str) -> dict[str, Any]:
@@ -61,6 +65,16 @@ def get_chat(state: dict, chat_id: str) -> dict[str, Any]:
             # P3 wedge detection: log length at last tick + when it froze.
             'last_log_len': -1,
             'log_len_since': '',
+            # R2 nudge-effectiveness counters (lifetime per chat).
+            'nudges_sent': 0,
+            'nudges_effective': 0,
+            'last_nudge_outcome_at': '',
+            # v1.2.0 wedge remediation ladder (budget is per wedge episode).
+            'wedge_nudge_count': 0,
+            'wedge_nudges_sent': 0,
+            'wedge_nudges_effective': 0,
+            'last_wedge_nudge_at': '',
+            'last_wedge_outcome_at': '',
         }
         chats[chat_id] = entry
     return entry

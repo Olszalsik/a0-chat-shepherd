@@ -32,6 +32,8 @@ class Resolve(ApiHandler):
                 return {'success': True, 'message': f'Chat {chat_id} removed from watch list'}
             return {'success': False, 'error': f'Chat {chat_id} not found in state'}
 
+        if chat_id not in state.get('chats', {}):
+         return {'success': False, 'error': f'Chat {chat_id} not found in state'}
         update_chat(state, chat_id,
             status='awaiting_user',
             nudge_count=0,

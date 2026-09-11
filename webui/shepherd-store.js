@@ -117,6 +117,12 @@ export const store = createStore("chatShepherdStore", {
     }
   },
 
+  effectLabel() {
+  const e = (this.data && this.data.effectiveness) || null;
+  if (!e || !e.sent) return '';
+  return '🎯 ' + e.hit_rate + '% nudge hit-rate (' + e.effective + '/' + e.sent + ')';
+  },
+  
   iconFor(status) {
     const custom = (this.data && this.data.config && this.data.config.icons) || {};
     const fallback = DEFAULT_ICONS[status];

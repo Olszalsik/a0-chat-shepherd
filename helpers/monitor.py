@@ -19,9 +19,14 @@ from usr.plugins.chat_shepherd.helpers.constants import (
     STATUS_IDLE,
     NUDGE_TEXT,
     RESUME_TEXT,
+    WEDGE_NUDGE_TEXT,
+    WEDGE_NUDGE_AFTER_MIN,
+    WEDGE_MAX_REMEDIATIONS,
+    WEDGE_REMEDIATION_COOLDOWN_MIN,
     PLUGIN_NAME,
     MAX_TRACKED_CHATS,
     CHAT_ID_PATTERN,
+    NUDGE_EFFECTIVE_WINDOW_MIN,
 )
 from usr.plugins.chat_shepherd.helpers import state as state_mod
 
@@ -143,6 +148,97 @@ def _wedge_minutes(context: AgentContext, prev_entry: dict[str, Any]) -> float:
     return _minutes_since(since)
 
 
+def _debug_log(kind: str, message: str) -> None:
+    # R2: no more silently swallowed exceptions - kind-tagged,
+    # daily-rotated debug log under the plugin data dir.
+    try:
+        day = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        rel = 'usr/plugins/chat_shepherd/data/debug-' + day + '.log'
+        line = (
+            datetime.now(timezone.utc).isoformat() + ' ' + kind + ' ' + str(message) + '\n'
+        )
+        with open(files.get_abs_path(rel), 'a', encoding='utf-8') as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+def _notify(kind: str, message: str, priority: str = 'normal') -> bool:
+    # R2: central notification helper. Returns True when accepted;
+    # failures are logged, never silently swallowed.
+    try:
+        from helpers.notification import (
+            NotificationManager,
+            NotificationPriority,
+            NotificationType,
+        )
+        ntype = NotificationType.INFO
+        if kind == 'warning':
+            ntype = NotificationType.WARNING
+        elif kind == 'error':
+            ntype = NotificationType.ERROR
+        npri = (
+            NotificationPriority.HIGH if priority == 'high' else NotificationPriority.NORMAL
+        )
+        NotificationManager.send_notification(
+            ntype, npri, message, title='Chat Shepherd'
+        )
+        return True
+    except Exception as e:
+        _debug_log('notify_fail', repr(e) + ' :: ' + message)
+        return False
+
+
+def _record_nudge_outcome(state: dict, chat_id: str, now_iso: str) -> None:
+    # R2 nudge effectiveness: when a nudged chat reaches running or
+    # awaiting_user within NUDGE_EFFECTIVE_WINDOW_MIN minutes of its
+    # last nudge, credit that nudge as effective and log it.
+    entry = state_mod.get_chat(state, chat_id)
+    if entry.get('nudge_count', 0) <= 0 or not entry.get('last_nudge_at', ''):
+        return
+    nudged_at = _parse_dt(entry.get('last_nudge_at', ''))
+    if nudged_at is None:
+        return
+    minutes = _minutes_since(nudged_at)
+    if minutes > NUDGE_EFFECTIVE_WINDOW_MIN:
+        return
+    entry['nudges_effective'] = entry.get('nudges_effective', 0) + 1
+    entry['last_nudge_outcome_at'] = now_iso
+    entry['nudge_count'] = 0
+    entry['last_nudge_at'] = ''
+    state_mod.append_history(state, {
+        'chat_id': chat_id,
+        'action': 'nudge_effective',
+        'minutes_after_nudge': round(minutes, 1),
+        'timestamp': now_iso,
+    })
+
+
+def _record_wedge_outcome(state: dict, chat_id: str, now_iso: str) -> None:
+    # v1.2.0 wedge ladder: when a remediated wedge recovers (log grows or the
+    # turn ends) within NUDGE_EFFECTIVE_WINDOW_MIN minutes of the last wedge
+    # remediation, credit it and clear the wedge budget for a fresh episode.
+    entry = state_mod.get_chat(state, chat_id)
+    if entry.get('wedge_nudge_count', 0) <= 0 or not entry.get('last_wedge_nudge_at', ''):
+        return
+    nudged_at = _parse_dt(entry.get('last_wedge_nudge_at', ''))
+    if nudged_at is None:
+        return
+    minutes = _minutes_since(nudged_at)
+    entry['wedge_nudge_count'] = 0
+    entry['last_wedge_nudge_at'] = ''
+    if minutes > NUDGE_EFFECTIVE_WINDOW_MIN:
+        return
+    entry['wedge_nudges_effective'] = entry.get('wedge_nudges_effective', 0) + 1
+    entry['last_wedge_outcome_at'] = now_iso
+    state_mod.append_history(state, {
+        'chat_id': chat_id,
+        'action': 'wedge_nudge_effective',
+        'minutes_after_nudge': round(minutes, 1),
+        'timestamp': now_iso,
+    })
+
+
 def _nudge_context(context: AgentContext, text: str | None = None) -> bool:
     try:
         # P4 cross-thread contract (audited 2026-09-10): tick() runs on the
@@ -187,15 +283,31 @@ def classify_chat(
         return STATUS_PAUSED, 'Context is paused'
 
     if context.is_running():
-        # P3: frozen != stalled. A running context whose log stopped growing
-        # for stall_minutes is wedged (2026-09-09 loop freezes) — nudging it
-        # only queues a message that can never drain, so classify as
-        # intervention instead. Only a human nudge may target these.
+        # P3 (v1.1.0), superseded in v1.2.0: frozen != stalled. A running
+        # context whose log stopped growing for stall_minutes is wedged and
+        # classified as intervention — but it is no longer left for a human
+        # only: communicate() on an alive task sets agent.intervention (a
+        # plain attribute write that drains at the agent's next safe point),
+        # the same mechanics that make a manual "continue" unwedge these
+        # chats. tick() runs the v1.2.0 remediation ladder on them.
         stall_minutes = float(cfg.get('stall_minutes', 5))
         if frozen_minutes >= stall_minutes:
-            return STATUS_INTERVENTION, (
+            reason = (
                 f'Agent appears wedged: running but log frozen for {frozen_minutes:.0f}m'
             )
+            wedge_count = int(prev_entry.get('wedge_nudge_count', 0) or 0)
+            max_remediations = max(0, min(5, int(cfg.get(
+                'wedge_max_remediations', WEDGE_MAX_REMEDIATIONS
+            ))))
+            if wedge_count > 0:
+                if wedge_count >= max_remediations:
+                    reason += ', remediation exhausted'
+                else:
+                    reason += (
+                        f', auto-continue sent (attempt {wedge_count}'
+                        f'/{max_remediations})'
+                    )
+            return STATUS_INTERVENTION, reason
         return STATUS_RUNNING, 'Agent is actively running'
 
     if _check_error_file(chat_id):
@@ -256,13 +368,27 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
     # oldest stall first. 0 disables auto-nudging entirely.
     max_nudges_per_tick = max(0, min(10, int(cfg.get('max_nudges_per_tick', 1))))
 
+    # v1.2.0 wedge remediation ladder. wedge_max_remediations 0 disables
+    # wedge auto-remediation entirely (chats stay intervention-only).
+    wedge_nudge_after = float(cfg.get('wedge_nudge_after_minutes', WEDGE_NUDGE_AFTER_MIN))
+    wedge_max_remediations = max(0, min(5, int(cfg.get(
+        'wedge_max_remediations', WEDGE_MAX_REMEDIATIONS
+    ))))
+    wedge_cooldown = float(cfg.get(
+        'wedge_remediation_cooldown_minutes', WEDGE_REMEDIATION_COOLDOWN_MIN
+    ))
+    wedge_soft_restart = bool(cfg.get('wedge_soft_restart', False))
+
     # P1: only real UI chats are tracked. Contexts without a persisted
     # usr/chats/<id> directory (ad-hoc message_async ids) are invisible here.
     watch_all = bool(cfg.get('watch_all', True))
+    allowed_chat_ids = cfg.get('allowed_chat_ids') or []
     live_contexts: dict[str, Any] = {}
     try:
         for ctx in AgentContext.all():
             if not _has_chat_dir(ctx.id):
+                continue
+            if allowed_chat_ids and ctx.id not in allowed_chat_ids:
                 continue
             if not watch_all and _log_len(ctx) <= 0:
                 continue
@@ -277,6 +403,8 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
         'nudged': 0,
         'intervention': 0,
         'wedged': 0,
+        'wedge_nudged': 0,
+        'wedge_restarts': 0,
         'error': 0,
         'awaiting': 0,
         'idle': 0,
@@ -284,6 +412,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
         'nudges_this_tick': 0,
         'interrupted': 0,
         'resumed': 0,
+        'notify_failures': 0,
         'pruned': 0,
     }
 
@@ -291,6 +420,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
     # post-loop throttle pass (never nudged inline in this loop).
     nudge_queue: list[tuple[float, str, Any, dict, float]] = []
     resume_queue: list[tuple[float, str, Any, dict, str, Any]] = []
+    wedge_queue: list[tuple[float, str, Any, dict, float]] = []
 
     for chat_id, ctx in live_contexts.items():
         summary['checked'] += 1
@@ -318,6 +448,9 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
                 frozen_minutes = _minutes_since(frozen_since)
         else:
             prev['log_len_since'] = ''
+            # v1.2.0: the log grew again (or the task stopped) — a pending
+            # wedge remediation either worked or is moot; credit it if recent.
+            _record_wedge_outcome(state, chat_id, now_iso)
 
         new_status, reason = classify_chat(ctx, chat_id, cfg, prev, frozen_minutes)
 
@@ -332,7 +465,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             )
             and getattr(ctx, 'type', None) == AgentContextType.USER
             and not ctx.is_running()
-            and not ctx.paused
+            and not getattr(ctx, 'paused', False)
             and _last_entry_type(ctx) != 'response'
         ):
             new_status = STATUS_INTERRUPTED
@@ -354,6 +487,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
         if new_status == STATUS_RUNNING:
             entry['last_seen_running'] = now_iso
             summary['running'] += 1
+            _record_nudge_outcome(state, chat_id, now_iso)
         elif new_status == STATUS_PAUSED:
             summary['paused'] += 1
         elif new_status == STATUS_ERROR:
@@ -361,6 +495,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             summary['error'] += 1
         elif new_status == STATUS_AWAITING_USER:
             summary['awaiting'] += 1
+            _record_nudge_outcome(state, chat_id, now_iso)
         elif new_status == STATUS_STALLED:
             summary['stalled'] += 1
             last_nudge_dt = _parse_dt(prev.get('last_nudge_at', ''))
@@ -374,20 +509,31 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             summary['intervention'] += 1
             if 'log frozen' in reason:
                 summary['wedged'] += 1
+                # v1.2.0 remediation ladder: USER chats frozen past the grace
+                # period get an automatic "continue" (Tier 1), with the
+                # framework's ctx.nudge() (kill + fw.msg_nudge.md) available
+                # as the final attempt when wedge_soft_restart is enabled.
+                # Scheduler TASK contexts are excluded — the scheduler
+                # resumes its own task chats on its own cadence.
+                wedge_count = int(prev.get('wedge_nudge_count', 0) or 0)
+                last_wedge_dt = _parse_dt(prev.get('last_wedge_nudge_at', ''))
+                wedge_cooldown_ok = _minutes_since(last_wedge_dt) >= wedge_cooldown
+                if (
+                    wedge_max_remediations > 0
+                    and wedge_count < wedge_max_remediations
+                    and wedge_cooldown_ok
+                    and frozen_minutes >= wedge_nudge_after
+                    and getattr(ctx, 'type', None) == AgentContextType.USER
+                ):
+                    # Oldest freeze first; final ordering post-loop.
+                    wedge_queue.append((frozen_minutes, chat_id, ctx, entry, now_iso))
             if old_status != STATUS_INTERVENTION and notify_on_intervention:
-                try:
-                    from helpers.notification import (
-                        NotificationManager,
-                        NotificationPriority,
-                    )
-                    nm = NotificationManager()
-                    nm.notify(
-                        title='Chat Shepherd',
-                        message=f'Chat {chat_id} needs human intervention: {reason}',
-                        priority=NotificationPriority.HIGH,
-                    )
-                except Exception:
-                    pass
+                if not _notify(
+                    'warning',
+                    f'Chat {chat_id} needs human intervention: {reason}',
+                    priority='high',
+                ):
+                    summary['notify_failures'] += 1
         elif new_status == STATUS_INTERRUPTED:
             summary['interrupted'] += 1
             nudge_count = entry.get('nudge_count', 0)
@@ -420,6 +566,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             if _nudge_context(ctx, text):
                 prev = state_mod.get_chat(state, chat_id)
                 entry['nudge_count'] = prev.get('nudge_count', 0) + 1
+                entry['nudges_sent'] = entry.get('nudges_sent', 0) + 1
                 entry['last_nudge_at'] = now_iso
                 entry['status'] = STATUS_NUDGED
                 entry['last_classification'] = (
@@ -443,6 +590,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             if _nudge_context(ctx):
                 prev = state_mod.get_chat(state, chat_id)
                 entry['nudge_count'] = prev.get('nudge_count', 0) + 1
+                entry['nudges_sent'] = entry.get('nudges_sent', 0) + 1
                 entry['last_nudge_at'] = now_iso
                 entry['status'] = STATUS_NUDGED
                 entry['last_classification'] = (
@@ -457,6 +605,53 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
                     'timestamp': now_iso,
                 })
 
+    # v1.2.0 wedge drain: oldest freeze first, own small burst budget so a
+    # wedge never starves behind the stalled queue. The last remediation
+    # attempt of an episode escalates to the framework's ctx.nudge() (kill
+    # the hung task + fw.msg_nudge.md) when wedge_soft_restart is enabled;
+    # otherwise every attempt is a Tier 1 "continue" intervention nudge.
+    if wedge_queue and wedge_max_remediations > 0:
+        wedge_queue.sort(key=lambda item: item[0], reverse=True)
+        wedge_budget = max(1, max_nudges_per_tick)
+        for frozen_minutes, chat_id, ctx, entry, now_iso in wedge_queue:
+            if summary['wedge_nudged'] + summary['wedge_restarts'] >= wedge_budget:
+                break
+            prev = state_mod.get_chat(state, chat_id)
+            attempt = prev.get('wedge_nudge_count', 0) + 1
+            final_attempt = attempt >= wedge_max_remediations
+            action = 'wedge_auto_continue'
+            if final_attempt and wedge_soft_restart:
+                # Tier 2: kill_process() is a non-blocking future.cancel()
+                # (helpers/defer.py), safe to call from this thread; on a
+                # truly dead loop it is a harmless no-op and the chat stays
+                # intervention for a human.
+                try:
+                    ctx.nudge()
+                    action = 'wedge_soft_restart'
+                    summary['wedge_restarts'] += 1
+                except Exception as e:
+                    _debug_log('wedge_restart_fail', chat_id + ' ' + repr(e))
+                    continue
+            else:
+                if not _nudge_context(ctx, WEDGE_NUDGE_TEXT):
+                    continue
+                summary['wedge_nudged'] += 1
+            entry['wedge_nudge_count'] = attempt
+            entry['wedge_nudges_sent'] = prev.get('wedge_nudges_sent', 0) + 1
+            entry['last_wedge_nudge_at'] = now_iso
+            entry['status'] = STATUS_INTERVENTION
+            entry['last_classification'] = (
+                f'Wedged: auto-continue sent (attempt {attempt}'
+                f'/{wedge_max_remediations})'
+            )
+            state_mod.append_history(state, {
+                'chat_id': chat_id,
+                'action': action,
+                'wedge_nudge_count': attempt,
+                'frozen_minutes': round(frozen_minutes, 1),
+                'timestamp': now_iso,
+            })
+
     if server_restarted:
         state_mod.append_history(state, {
             'chat_id': '',
@@ -468,30 +663,21 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             'timestamp': datetime.now(timezone.utc).isoformat(),
         })
         if summary['resumed'] and notify_on_intervention:
-            try:
-                from helpers.notification import (
-                    NotificationManager,
-                    NotificationPriority,
-                )
-                nm = NotificationManager()
-                nm.notify(
-                    title='Chat Shepherd',
-                    message=(
-                        'Server restarted: resumed '
-                        + str(summary['resumed']) + ' of '
-                        + str(summary['interrupted']) + ' interrupted chat(s)'
-                    ),
-                    priority=getattr(
-                        NotificationPriority, 'NORMAL', NotificationPriority.HIGH
-                    ),
-                )
-            except Exception:
-                pass
+            msg = (
+                'Server restarted: resumed ' + str(summary['resumed'])
+                + ' of ' + str(summary['interrupted']) + ' interrupted chat(s)'
+            )
+            if not _notify('info', msg):
+                summary['notify_failures'] += 1
 
     for chat_id, entry in list(state.get('chats', {}).items()):
         if entry.get('status') in (STATUS_RUNNING, STATUS_AWAITING_USER, STATUS_PAUSED):
             entry['nudge_count'] = 0
             entry['last_nudge_at'] = ''
+            # v1.2.0: wedge budget clears on recovery (crediting already
+            # happened in the frozen-clock reset above, when applicable).
+            entry['wedge_nudge_count'] = 0
+            entry['last_wedge_nudge_at'] = ''
 
     # P1: prune state entries that are neither live nor persisted chats
     # (the chat dir is gone and no context exists -> dead history), then cap

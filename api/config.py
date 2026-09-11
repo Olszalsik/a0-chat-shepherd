@@ -25,8 +25,13 @@ _DEFAULTS: dict[str, Any] = {
     "max_auto_nudges": 3,
     "max_nudges_per_tick": 1,
     "nudge_cooldown_minutes": 10,
+ "allowed_chat_ids": [],
     "intervention_after_failed_nudges": True,
     "notify_on_intervention": True,
+    "wedge_nudge_after_minutes": 10,
+    "wedge_max_remediations": 2,
+    "wedge_remediation_cooldown_minutes": 10,
+    "wedge_soft_restart": False,
     "icons": {
         "running": "🏃",
         "stalled": "⚠️",
@@ -110,6 +115,10 @@ class Config(ApiHandler):
             current["notify_on_intervention"] = _coerce_bool(
                 readable["notify_on_intervention"]
             )
+        if "wedge_soft_restart" in readable:
+            current["wedge_soft_restart"] = _coerce_bool(
+                readable["wedge_soft_restart"]
+            )
         if "stall_minutes" in readable:
             current["stall_minutes"] = _coerce_int(
                 readable["stall_minutes"], current["stall_minutes"], 1, 240
@@ -132,6 +141,38 @@ class Config(ApiHandler):
                 1,
                 240,
             )
+        if "wedge_nudge_after_minutes" in readable:
+            current["wedge_nudge_after_minutes"] = _coerce_int(
+                readable["wedge_nudge_after_minutes"],
+                current["wedge_nudge_after_minutes"],
+                2,
+                240,
+            )
+        if "wedge_max_remediations" in readable:
+            current["wedge_max_remediations"] = _coerce_int(
+                readable["wedge_max_remediations"],
+                current["wedge_max_remediations"],
+                0,
+                5,
+            )
+        if "wedge_remediation_cooldown_minutes" in readable:
+            current["wedge_remediation_cooldown_minutes"] = _coerce_int(
+                readable["wedge_remediation_cooldown_minutes"],
+                current["wedge_remediation_cooldown_minutes"],
+                1,
+                240,
+            )
+        if "allowed_chat_ids" in readable:
+            raw = readable["allowed_chat_ids"]
+            if isinstance(raw, str):
+                raw = raw.split(",")
+            cleaned: list[str] = []
+            if isinstance(raw, list):
+                for item in raw:
+                    s = str(item).strip()
+                    if s and len(s) <= 64 and s not in cleaned:
+                        cleaned.append(s)
+            current["allowed_chat_ids"] = cleaned[:200]
 
         if "icons" in readable:
             icons_in = readable["icons"]
