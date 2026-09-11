@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from helpers.extension import Extension
-from helpers import plugins
+from helpers import files, plugins
 
 from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME
 from usr.plugins.chat_shepherd.helpers.monitor import tick
@@ -16,5 +16,11 @@ class ChatShepherdTick(Extension):
             return
         try:
             tick(cfg)
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                from datetime import datetime as _dt
+                dbg = files.get_abs_path('usr/plugins/chat_shepherd/data/tick_debug.log')
+                with open(dbg, 'a', encoding='utf-8') as f:
+                    f.write(_dt.now().isoformat() + ' tick error: ' + repr(e) + chr(10))
+            except Exception:
+                pass

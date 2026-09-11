@@ -6,7 +6,11 @@ from typing import Any
 
 from helpers import files
 
-from usr.plugins.chat_shepherd.helpers.constants import STATE_FILE, HISTORY_LIMIT
+from usr.plugins.chat_shepherd.helpers.constants import (
+    STATE_FILE,
+    HISTORY_LIMIT,
+    MAX_TRACKED_CHATS,
+)
 
 
 def _now_iso() -> str:
@@ -52,7 +56,11 @@ def get_chat(state: dict, chat_id: str) -> dict[str, Any]:
             'last_classification': '',
             'last_log_type': '',
             'first_seen': _now_iso(),
+            'last_ticked': '',
             'error_detected': False,
+            # P3 wedge detection: log length at last tick + when it froze.
+            'last_log_len': -1,
+            'log_len_since': '',
         }
         chats[chat_id] = entry
     return entry
@@ -68,3 +76,23 @@ def append_history(state: dict, item: dict[str, Any]) -> None:
     history = state.setdefault('history', [])
     history.insert(0, item)
     state['history'] = history[:HISTORY_LIMIT]
+
+
+def cap_chats(state: dict, keep: int = MAX_TRACKED_CHATS) -> list[str]:
+    """P1: cap the chats dict to the `keep` most recently ticked entries.
+
+    Returns the chat_ids that were dropped (callers use this for history).
+    Ties / missing timestamps fall back to insertion order (dicts preserve it).
+    """
+    chats = state.get('chats')
+    if not isinstance(chats, dict) or len(chats) <= keep:
+        return []
+    ranked = sorted(
+        chats.items(),
+        key=lambda kv: kv[1].get('last_ticked', '') or '',
+        reverse=True,
+    )
+    doomed = {chat_id for chat_id, _ in ranked[keep:]}
+    for chat_id in doomed:
+        chats.pop(chat_id, None)
+    return sorted(doomed)

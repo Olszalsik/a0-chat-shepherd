@@ -23,6 +23,7 @@ _DEFAULTS: dict[str, Any] = {
     "watch_all": True,
     "stall_minutes": 5,
     "max_auto_nudges": 3,
+    "max_nudges_per_tick": 1,
     "nudge_cooldown_minutes": 10,
     "intervention_after_failed_nudges": True,
     "notify_on_intervention": True,
@@ -31,6 +32,7 @@ _DEFAULTS: dict[str, Any] = {
         "stalled": "⚠️",
         "nudged": "🔄",
         "intervention": "🚨",
+        "interrupted": "🔌",
         "awaiting_user": "💬",
         "error": "❌",
         "paused": "⏸️",
@@ -115,6 +117,13 @@ class Config(ApiHandler):
         if "max_auto_nudges" in readable:
             current["max_auto_nudges"] = _coerce_int(
                 readable["max_auto_nudges"], current["max_auto_nudges"], 0, 20
+            )
+        if "max_nudges_per_tick" in readable:
+            current["max_nudges_per_tick"] = _coerce_int(
+                readable["max_nudges_per_tick"],
+                current["max_nudges_per_tick"],
+                0,
+                10,
             )
         if "nudge_cooldown_minutes" in readable:
             current["nudge_cooldown_minutes"] = _coerce_int(

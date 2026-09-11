@@ -2,6 +2,7 @@ enabled: true
 watch_all: true
 stall_minutes: 5
 max_auto_nudges: 3
+max_nudges_per_tick: 1
 nudge_cooldown_minutes: 10
 intervention_after_failed_nudges: true
 notify_on_intervention: true
@@ -10,6 +11,7 @@ icons:
   stalled: "⚠️"
   nudged: "🔄"
   intervention: "🚨"
+  interrupted: "🔌"
   awaiting_user: "💬"
   error: "❌"
   paused: "⏸️"

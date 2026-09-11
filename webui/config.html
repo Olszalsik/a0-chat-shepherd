@@ -62,8 +62,12 @@ Chat Shepherd
 <label>Nudge cooldown (minutes)</label>
 <input type="number" min="1" max="240" x-model.number="cfg.nudge_cooldown_minutes" />
 </div>
+<div>
+<label>Max nudges per tick</label>
+<input type="number" min="0" max="10" x-model.number="cfg.max_nudges_per_tick" />
 </div>
-<small class="hint">After max auto-nudges are exhausted, the chat escalates to intervention status.</small>
+</div>
+<small class="hint">Global burst throttle: at most this many auto-nudges are sent per watch tick (0 disables auto-nudging). After max auto-nudges are exhausted, the chat escalates to intervention status.</small>
 </div>
 
 <div class="cs-card">
@@ -133,6 +137,7 @@ iconFields: [
 { key: 'stalled', label: 'Stalled' },
 { key: 'nudged', label: 'Nudged' },
 { key: 'intervention', label: 'Intervention' },
+{ key: 'interrupted', label: 'Interrupted' },
 { key: 'awaiting_user', label: 'Awaiting you' },
 { key: 'error', label: 'Error' },
 { key: 'paused', label: 'Paused' },
@@ -151,6 +156,7 @@ enabled: true,
 watch_all: true,
 stall_minutes: 5,
 max_auto_nudges: 3,
+max_nudges_per_tick: 1,
 nudge_cooldown_minutes: 10,
 intervention_after_failed_nudges: true,
 notify_on_intervention: true,
@@ -159,6 +165,7 @@ running: '🏃',
 stalled: '⚠️',
 nudged: '🔄',
 intervention: '🚨',
+interrupted: '🔌',
 awaiting_user: '💬',
 error: '❌',
 paused: '⏸️',
@@ -222,6 +229,7 @@ enabled: this.cfg.enabled,
 watch_all: this.cfg.watch_all,
 stall_minutes: this.cfg.stall_minutes,
 max_auto_nudges: this.cfg.max_auto_nudges,
+max_nudges_per_tick: this.cfg.max_nudges_per_tick,
 nudge_cooldown_minutes: this.cfg.nudge_cooldown_minutes,
 intervention_after_failed_nudges: this.cfg.intervention_after_failed_nudges,
 notify_on_intervention: this.cfg.notify_on_intervention,

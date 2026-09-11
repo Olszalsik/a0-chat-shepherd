@@ -14,6 +14,7 @@ DEFAULT_ICONS: dict[str, str] = {
     'stalled': '⚠️',
     'nudged': '🔄',
     'intervention': '🚨',
+    'interrupted': '🔌',
     'awaiting_user': '💬',
     'error': '❌',
     'paused': '⏸️',
@@ -72,7 +73,12 @@ class Status(ApiHandler):
             prev = chats_state.get(chat_id, {})
             ctx_obj = info.pop('ctx')
             try:
-                live_status, reason = monitor.classify_chat(ctx_obj, chat_id, cfg, prev)
+                # Pass the frozen-log clock so a wedged context shows as
+                # intervention in the UI too, matching what tick() decided.
+                frozen_minutes = monitor._wedge_minutes(ctx_obj, prev)
+                live_status, reason = monitor.classify_chat(
+                    ctx_obj, chat_id, cfg, prev, frozen_minutes
+                )
             except Exception:
                 live_status, reason = prev.get('status', 'idle'), ''
             chat_list.append({
@@ -118,12 +124,13 @@ class Status(ApiHandler):
         status_order = {
             'intervention': 0,
             'error': 1,
-            'stalled': 2,
-            'nudged': 3,
-            'running': 4,
-            'awaiting_user': 5,
-            'paused': 6,
-            'idle': 7,
+            'interrupted': 2,
+            'stalled': 3,
+            'nudged': 4,
+            'running': 5,
+            'awaiting_user': 6,
+            'paused': 7,
+            'idle': 8,
         }
         chat_list.sort(key=lambda c: status_order.get(c['status'], 99))
 
@@ -137,6 +144,7 @@ class Status(ApiHandler):
                 'enabled': bool(cfg.get('enabled', False)),
                 'stall_minutes': cfg.get('stall_minutes', 5),
                 'max_auto_nudges': cfg.get('max_auto_nudges', 3),
+                'max_nudges_per_tick': cfg.get('max_nudges_per_tick', 1),
                 'nudge_cooldown_minutes': cfg.get('nudge_cooldown_minutes', 10),
                 'icons': icons,
             },

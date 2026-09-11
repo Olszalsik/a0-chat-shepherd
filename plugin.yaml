@@ -1,7 +1,7 @@
 name: chat_shepherd
 title: Chat Shepherd
 description: Continuously watches your chats, auto-nudges stalled agents back to work, and flags chats that need human input. Glanceable dashboard with per-chat status icons.
-version: 1.0.0
+version: 1.1.1
 settings_sections:
  - agent
 per_project_config: false
