@@ -32,6 +32,10 @@ _DEFAULTS: dict[str, Any] = {
     "wedge_max_remediations": 2,
     "wedge_remediation_cooldown_minutes": 10,
     "wedge_soft_restart": False,
+    "webhook_url": "",
+    "webhook_allow_private": False,
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
     "icons": {
         "running": "🏃",
         "stalled": "⚠️",
@@ -174,6 +178,15 @@ class Config(ApiHandler):
                         cleaned.append(s)
             current["allowed_chat_ids"] = cleaned[:200]
 
+        if "webhook_url" in readable:
+            current["webhook_url"] = str(readable["webhook_url"]).strip()[:500]
+        if "webhook_allow_private" in readable:
+            current["webhook_allow_private"] = _coerce_bool(readable["webhook_allow_private"])
+        if "telegram_bot_token" in readable:
+            current["telegram_bot_token"] = str(readable["telegram_bot_token"]).strip()[:200]
+        if "telegram_chat_id" in readable:
+            current["telegram_chat_id"] = str(readable["telegram_chat_id"]).strip()[:64]
+        
         if "icons" in readable:
             icons_in = readable["icons"]
             if isinstance(icons_in, dict):

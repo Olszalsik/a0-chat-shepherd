@@ -106,6 +106,17 @@ Chat Shepherd
 </div>
 
 <div class='cs-card'>
+<h4>External alerts (optional)</h4>
+<input type='text' x-model='cfg.webhook_url' placeholder='https://hooks.example.com/...' style='width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:inherit;font-size:12px;box-sizing:border-box;' />
+<label style='display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12px;'>
+<input type='checkbox' x-model='cfg.webhook_allow_private' /> Allow private/LAN webhook targets
+</label>
+<input type='password' x-model='cfg.telegram_bot_token' placeholder='Telegram bot token' style='width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:inherit;font-size:12px;box-sizing:border-box;' />
+<input type='text' x-model='cfg.telegram_chat_id' placeholder='Telegram chat id' style='width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:inherit;font-size:12px;box-sizing:border-box;' />
+<small class='hint'>Fires alongside in-app notifications for intervention + restart alerts.</small>
+</div>
+
+<div class='cs-card'>
 <h4>Chat allowlist (optional)</h4>
 <textarea x-model='cfg.allowed_chat_ids_text' rows='2' placeholder='G34Q4xbU, abcd1234' style='width:100%;padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:inherit;font-size:12px;box-sizing:border-box;'></textarea>
 <small class='hint'>Comma-separated chat IDs to watch. Empty = watch all chats.</small>
@@ -194,6 +205,10 @@ wedge_nudge_after_minutes: 10,
 wedge_max_remediations: 2,
 wedge_remediation_cooldown_minutes: 10,
 wedge_soft_restart: false,
+webhook_url: '',
+webhook_allow_private: false,
+telegram_bot_token: '',
+telegram_chat_id: '',
 icons: {
 running: '🏃',
 stalled: '⚠️',
@@ -272,6 +287,10 @@ wedge_nudge_after_minutes: this.cfg.wedge_nudge_after_minutes,
 wedge_max_remediations: this.cfg.wedge_max_remediations,
 wedge_remediation_cooldown_minutes: this.cfg.wedge_remediation_cooldown_minutes,
 wedge_soft_restart: this.cfg.wedge_soft_restart,
+webhook_url: (this.cfg.webhook_url || '').trim(),
+webhook_allow_private: !!this.cfg.webhook_allow_private,
+telegram_bot_token: (this.cfg.telegram_bot_token || '').trim(),
+telegram_chat_id: (this.cfg.telegram_chat_id || '').trim(),
 allowed_chat_ids: (this.cfg.allowed_chat_ids_text || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean),
 icons: this.cfg.icons,
 };
@@ -282,6 +301,10 @@ for (const k of Object.keys(r.config)) {
 if (k in this.cfg) this.cfg[k] = r.config[k];
 }
 if (r.config.icons) this.cfg.icons = r.config.icons;
+this.cfg.webhook_url = r.config.webhook_url || '';
+this.cfg.webhook_allow_private = !!r.config.webhook_allow_private;
+this.cfg.telegram_bot_token = r.config.telegram_bot_token || '';
+this.cfg.telegram_chat_id = r.config.telegram_chat_id || '';
 }
 this.setMsg('saved: ' + ((r.updated || []).join(', ') || 'ok'), true);
 } else {

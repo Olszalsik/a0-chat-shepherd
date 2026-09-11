@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -163,9 +164,70 @@ def _debug_log(kind: str, message: str) -> None:
         pass
 
 
-def _notify(kind: str, message: str, priority: str = 'normal') -> bool:
-    # R2: central notification helper. Returns True when accepted;
-    # failures are logged, never silently swallowed.
+def _post_json(url: str, payload: dict, timeout: float = 5.0) -> bool:
+    # R3: minimal JSON POST for external alert channels. Returns
+    # True on 2xx; kept separate so tests can monkeypatch it.
+    import requests
+    resp = requests.post(url, json=payload, timeout=timeout)
+    return 200 <= resp.status_code < 300
+
+def _dispatch_external(cfg: dict, kind: str, message: str, priority: str = 'normal', sync: bool = False) -> None:
+    # R3: fan the alert out to optional external channels (generic
+    # webhook + Telegram). URL validation happens on the calling
+    # (tick) thread because it is cheap; the actual POST runs in a
+    # daemon thread so the event-loop tick never blocks. sync=True
+    # is for tests only.
+    if not isinstance(cfg, dict):
+        return
+    jobs: list[tuple[str, str, dict]] = []
+    webhook_url = str(cfg.get('webhook_url') or '').strip()
+    if webhook_url and not bool(cfg.get('webhook_allow_private', False)):
+        try:
+            from helpers.network import validate_public_http_url
+            validate_public_http_url(webhook_url)
+        except Exception as e:
+            _debug_log('webhook_skip', 'URL rejected: ' + repr(e) + ' :: ' + webhook_url)
+            webhook_url = ''
+    if webhook_url:
+        jobs.append((
+            'webhook', webhook_url,
+            {
+                'plugin': 'chat_shepherd',
+                'kind': kind,
+                'priority': priority,
+                'message': message,
+            },
+        ))
+    token = str(cfg.get('telegram_bot_token') or '').strip()
+    tg_chat = str(cfg.get('telegram_chat_id') or '').strip()
+    if token and tg_chat:
+        jobs.append((
+            'telegram',
+            'https://api.telegram.org/bot' + token + '/sendMessage',
+            {'chat_id': tg_chat, 'text': '[Chat Shepherd/' + kind + '] ' + message},
+        ))
+    if not jobs:
+        return
+
+    def _run() -> None:
+        for channel, url, payload in jobs:
+            try:
+                if not _post_json(url, payload):
+                    _debug_log(channel + '_fail', 'non-2xx :: ' + message)
+            except Exception as e:
+                _debug_log(channel + '_fail', repr(e) + ' :: ' + message)
+
+    if sync:
+        _run()
+    else:
+        threading.Thread(target=_run, daemon=True, name='chat_shepherd_alert').start()
+
+def _notify(kind: str, message: str, priority: str = 'normal', cfg: dict | None = None) -> bool:
+    # R2/R3: central notification helper. Returns True when the
+    # in-framework notification was accepted; failures are logged,
+    # never silently swallowed. R3: also fans out to optional
+    # external channels (webhook/Telegram) without blocking.
+    fw_ok = False
     try:
         from helpers.notification import (
             NotificationManager,
@@ -183,10 +245,18 @@ def _notify(kind: str, message: str, priority: str = 'normal') -> bool:
         NotificationManager.send_notification(
             ntype, npri, message, title='Chat Shepherd'
         )
-        return True
+        fw_ok = True
     except Exception as e:
         _debug_log('notify_fail', repr(e) + ' :: ' + message)
-        return False
+    try:
+        if cfg is None:
+            from helpers import plugins as _plugins
+            from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME as _PN
+            cfg = _plugins.get_plugin_config(_PN) or {}
+        _dispatch_external(cfg, kind, message, priority)
+    except Exception as e:
+        _debug_log('alert_dispatch_fail', repr(e))
+    return fw_ok
 
 
 def _record_nudge_outcome(state: dict, chat_id: str, now_iso: str) -> None:
@@ -532,6 +602,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
                     'warning',
                     f'Chat {chat_id} needs human intervention: {reason}',
                     priority='high',
+                    cfg=cfg,
                 ):
                     summary['notify_failures'] += 1
         elif new_status == STATUS_INTERRUPTED:
@@ -667,7 +738,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
                 'Server restarted: resumed ' + str(summary['resumed'])
                 + ' of ' + str(summary['interrupted']) + ' interrupted chat(s)'
             )
-            if not _notify('info', msg):
+            if not _notify('info', msgcfg=cfg):
                 summary['notify_failures'] += 1
 
     for chat_id, entry in list(state.get('chats', {}).items()):

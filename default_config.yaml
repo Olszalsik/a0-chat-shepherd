@@ -17,6 +17,13 @@ wedge_nudge_after_minutes: 10
 wedge_max_remediations: 2
 wedge_remediation_cooldown_minutes: 10
 wedge_soft_restart: false
+# R3 external alert channels (optional, off by default). webhook_url
+# receives a JSON POST per alert; Telegram uses a bot token + chat id.
+# Private/LAN webhook targets require webhook_allow_private: true.
+webhook_url: ""
+webhook_allow_private: false
+telegram_bot_token: ""
+telegram_chat_id: ""
 icons:
   running: "🏃"
   stalled: "⚠️"

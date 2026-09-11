@@ -307,6 +307,50 @@ def main():
         assert len(ctx_o.communicated) == 0, 'ladder disabled but nudge sent'
         print('TEST4H_WEDGE_DISABLED_OK')
 
+        # --- 5: external alert channels
+        orig_post = monitor._post_json
+        orig_dbg = monitor._debug_log
+        import ipaddress as _cs_ipa
+        from helpers import network as _cs_net
+        orig_resolve = _cs_net.resolve_host_ips
+        def _cs_fake_resolve(hostname):
+            # Offline-deterministic DNS stub for the SSRF gate:
+            # IP literals resolve to themselves (keeps the private-IP
+            # rejection honest), names resolve to a fake public IP.
+            # Mirrors resolve_host_ips() semantics.
+            try:
+                return (_cs_ipa.ip_address(hostname),)
+            except ValueError:
+                return (_cs_ipa.ip_address('93.184.216.34'),)
+        _cs_net.resolve_host_ips = _cs_fake_resolve
+        try:
+            posted = []
+            monitor._post_json = lambda url, payload, timeout=5.0: posted.append((url, payload)) or True
+            cfg_w = {'webhook_url': 'https://hooks.example.com/abc'}
+            monitor._dispatch_external(cfg_w, 'warning', 'test message', 'high', sync=True)
+            assert len(posted) == 1 and posted[0][0] == 'https://hooks.example.com/abc', posted
+            assert posted[0][1]['kind'] == 'warning' and posted[0][1]['priority'] == 'high', posted[0][1]
+            print('TEST5A_WEBHOOK_OK')
+            dbg = []
+            monitor._debug_log = lambda kind, msg: dbg.append((kind, msg)) or None
+            cfg_p = {'webhook_url': 'http://127.0.0.1:9999/hook', 'webhook_allow_private': False}
+            monitor._dispatch_external(cfg_p, 'warning', 'test', sync=True)
+            assert len(posted) == 1, posted  # no new post for private target
+            assert any(k == 'webhook_skip' for k, _ in dbg), dbg
+            cfg_p2 = {'webhook_url': 'http://127.0.0.1:9999/hook', 'webhook_allow_private': True}
+            monitor._dispatch_external(cfg_p2, 'warning', 'test', sync=True)
+            assert len(posted) == 2 and posted[1][0].startswith('http://127.0.0.1'), posted
+            print('TEST5B_SSRF_GUARD_OK')
+            cfg_t = {'telegram_bot_token': 'TOK123', 'telegram_chat_id': '42'}
+            monitor._dispatch_external(cfg_t, 'info', 'hello', sync=True)
+            assert len(posted) == 3 and '/botTOK123/sendMessage' in posted[2][0], posted
+            assert posted[2][1]['chat_id'] == '42', posted[2][1]
+            print('TEST5C_TELEGRAM_OK')
+        finally:
+            monitor._post_json = orig_post
+            _cs_net.resolve_host_ips = orig_resolve
+            monitor._debug_log = orig_dbg
+        
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file
