@@ -351,6 +351,44 @@ def main():
             _cs_net.resolve_host_ips = orig_resolve
             monitor._debug_log = orig_dbg
         
+        # --- 6: human-readable chat names in alerts (v1.4.0)
+        import json as _json6
+        _dir_a = files.get_abs_path('usr/chats/' + FAKE_CHAT_A)
+        with open(os.path.join(_dir_a, 'chat.json'), 'w') as _f:
+            _json6.dump({'id': FAKE_CHAT_A, 'name': 'Alpha Rescue Chat'}, _f)
+        assert monitor._chat_display_name(FAKE_CHAT_A) == 'Alpha Rescue Chat', monitor._chat_display_name(FAKE_CHAT_A)
+        print('TEST6A_FILE_NAME_OK')
+        _ctx_n = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=0)
+        _ctx_n.name = 'Ctx Name Wins'
+        assert monitor._chat_display_name(FAKE_CHAT_A, _ctx_n) == 'Ctx Name Wins'
+        print('TEST6B_CTX_NAME_OK')
+        assert monitor._chat_display_name('zzzzzzzz') == 'zzzzzzzz'
+        print('TEST6C_FALLBACK_ID_OK')
+        # regression: _notify('info', msg, cfg=cfg) signature (msgcfg bug)
+        from helpers import notification as _cs_notif
+        _orig_send = _cs_notif.NotificationManager.send_notification
+        _sent = []
+        _cs_notif.NotificationManager.send_notification = lambda *a, **k: _sent.append(k) or True
+        try:
+            assert monitor._notify('info', 'restart smoke', cfg={}) is True
+            assert _sent, 'fw send_notification not called'
+        finally:
+            _cs_notif.NotificationManager.send_notification = _orig_send
+        print('TEST6D_NOTIFY_SIG_OK')
+        _orig_notify = monitor._notify
+        _captured = []
+        monitor._notify = lambda kind, message, priority='normal', cfg=None: _captured.append(message) or True
+        try:
+            write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 3, 'last_nudge_at': (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()}})
+            _ctx_i = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+            FakeAgentContext._all = [_ctx_i]
+            monitor.tick(dict(cfg, notify_on_intervention=True))
+            assert _captured, 'no intervention notification captured'
+            assert 'Alpha Rescue Chat' in _captured[-1] and FAKE_CHAT_A in _captured[-1], _captured[-1]
+        finally:
+            monitor._notify = _orig_notify
+        print('TEST6E_ALERT_NAME_OK')
+        
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

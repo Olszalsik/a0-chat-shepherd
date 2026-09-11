@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import threading
+import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -162,6 +164,57 @@ def _debug_log(kind: str, message: str) -> None:
             f.write(line)
     except Exception:
         pass
+
+
+_NAME_CACHE: dict[str, tuple[Any, str]] = {}
+_NAME_CACHE_MAX = 120
+
+def _read_chat_title(chat_id: str) -> str:
+    # Human-readable chat title from usr/chats/<id>/chat.json.
+    # The 'name' field sits in the first bytes, so a bounded head
+    # read is enough - never parse the embedded context payload.
+    path = files.get_abs_path('usr/chats/' + chat_id + '/chat.json')
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(4096).decode('utf-8', errors='replace')
+        m = re.search(r'"name"\s*:\s*"((?:[^"\\]|\\.)*)"', head)
+        if not m:
+            return ''
+        raw = m.group(1)
+        try:
+            return str(json.loads('"' + raw + '"'))
+        except Exception:
+            return raw
+    except Exception:
+        return ''
+
+def _chat_display_name(chat_id: str, ctx: Any = None, prev: dict | None = None) -> str:
+    # v1.4.0: resolve the chat title a human sees in the WebUI for
+    # notifications. Precedence: live ctx.name, persisted state
+    # name, cached chat.json lookup (mtime-keyed), then the raw id.
+    name = ''
+    if ctx is not None:
+        name = str(getattr(ctx, 'name', '') or '')
+    if not name and isinstance(prev, dict):
+        name = str(prev.get('name', '') or '')
+    if not name:
+        key = None
+        path = files.get_abs_path('usr/chats/' + chat_id + '/chat.json')
+        try:
+            st = os.stat(path)
+            key = (st.st_mtime, st.st_size)
+        except OSError:
+            key = None
+        cached = _NAME_CACHE.get(chat_id)
+        if key is not None and cached and cached[0] == key:
+            name = cached[1]
+        elif key is not None:
+            name = _read_chat_title(chat_id)
+            if len(_NAME_CACHE) >= _NAME_CACHE_MAX and chat_id not in _NAME_CACHE:
+                _NAME_CACHE.clear()
+            _NAME_CACHE[chat_id] = (key, name)
+    name = name.strip()[:80]
+    return name if name else chat_id
 
 
 def _post_json(url: str, payload: dict, timeout: float = 5.0) -> bool:
@@ -490,6 +543,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
     # post-loop throttle pass (never nudged inline in this loop).
     nudge_queue: list[tuple[float, str, Any, dict, float]] = []
     resume_queue: list[tuple[float, str, Any, dict, str, Any]] = []
+    resumed_names: list[str] = []
     wedge_queue: list[tuple[float, str, Any, dict, float]] = []
 
     for chat_id, ctx in live_contexts.items():
@@ -544,9 +598,11 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
                 'mid-task work interrupted'
             )
 
+        fname = _chat_display_name(chat_id, ctx, prev)
         entry = state_mod.update_chat(
             state,
             chat_id,
+            name=fname,
             status=new_status,
             last_classification=reason,
             last_log_type=_last_log_type(ctx) if ctx else '',
@@ -600,7 +656,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             if old_status != STATUS_INTERVENTION and notify_on_intervention:
                 if not _notify(
                     'warning',
-                    f'Chat {chat_id} needs human intervention: {reason}',
+                    f'Chat "{fname}" ({chat_id}) needs human intervention: {reason}',
                     priority='high',
                     cfg=cfg,
                 ):
@@ -645,6 +701,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
                     + str(entry['nudge_count']) + '/' + str(max_nudges) + ')'
                 )
                 summary['resumed'] += 1
+                resumed_names.append(_chat_display_name(chat_id, ctx, entry))
                 summary['nudges_this_tick'] += 1
                 state_mod.append_history(state, {
                     'chat_id': chat_id,
@@ -734,11 +791,13 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             'timestamp': datetime.now(timezone.utc).isoformat(),
         })
         if summary['resumed'] and notify_on_intervention:
+            name_list = ', '.join(resumed_names[:5]) + ('...' if len(resumed_names) > 5 else '')
             msg = (
                 'Server restarted: resumed ' + str(summary['resumed'])
                 + ' of ' + str(summary['interrupted']) + ' interrupted chat(s)'
+                + (': ' + name_list if name_list else '')
             )
-            if not _notify('info', msgcfg=cfg):
+            if not _notify('info', msg, cfg=cfg):
                 summary['notify_failures'] += 1
 
     for chat_id, entry in list(state.get('chats', {}).items()):
