@@ -25,6 +25,7 @@ _DEFAULTS: dict[str, Any] = {
     "max_auto_nudges": 3,
     "max_nudges_per_tick": 1,
     "nudge_cooldown_minutes": 10,
+    "poll_seconds": 5,
  "allowed_chat_ids": [],
     "intervention_after_failed_nudges": True,
     "notify_on_intervention": True,
@@ -144,6 +145,13 @@ class Config(ApiHandler):
                 current["nudge_cooldown_minutes"],
                 1,
                 240,
+            )
+        if "poll_seconds" in readable:
+            current["poll_seconds"] = _coerce_int(
+                readable["poll_seconds"],
+                current["poll_seconds"],
+                2,
+                120,
             )
         if "wedge_nudge_after_minutes" in readable:
             current["wedge_nudge_after_minutes"] = _coerce_int(

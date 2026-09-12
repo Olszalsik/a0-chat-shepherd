@@ -4,6 +4,8 @@ stall_minutes: 5
 max_auto_nudges: 3
 max_nudges_per_tick: 1
 nudge_cooldown_minutes: 10
+# WebUI dashboard refresh interval in seconds (2-120).
+poll_seconds: 5
 allowed_chat_ids: []
 intervention_after_failed_nudges: true
 notify_on_intervention: true

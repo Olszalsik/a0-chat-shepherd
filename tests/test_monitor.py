@@ -389,6 +389,29 @@ def main():
             monitor._notify = _orig_notify
         print('TEST6E_ALERT_NAME_OK')
         
+        # --- 7: per-chat history API (v1.5.0)
+        import asyncio as _aio7
+        from usr.plugins.chat_shepherd.api.history import History as _CSHistory
+        _h7 = _CSHistory(None, None)
+        _hist7 = [
+            {'chat_id': FAKE_CHAT_A, 'action': 'manual_nudge', 'nudge_count': 2, 'timestamp': '2026-09-12T08:02:00+00:00'},
+            {'chat_id': FAKE_CHAT_B, 'action': 'auto_nudge', 'nudge_count': 1, 'timestamp': '2026-09-12T08:01:00+00:00'},
+            {'chat_id': FAKE_CHAT_A, 'action': 'auto_nudge', 'nudge_count': 1, 'timestamp': '2026-09-12T08:00:00+00:00'},
+        ]
+        write_state(fresh_tick, chats={})
+        _st7 = read_state()
+        _st7['history'] = _hist7
+        files.write_file(TEST_STATE, json.dumps(_st7, ensure_ascii=False))
+        _r7 = _aio7.run(_h7.process({'chat_id': FAKE_CHAT_A}, None))
+        assert _r7.get('success') is True, _r7
+        assert [i7['action'] for i7 in _r7['history']] == ['manual_nudge', 'auto_nudge'], _r7
+        assert all(i7['chat_id'] == FAKE_CHAT_A for i7 in _r7['history']), _r7
+        assert isinstance(_r7['name'], str) and _r7['name'], _r7
+        _r7b = _aio7.run(_h7.process({}, None))
+        assert _r7b.get('success') is False, _r7b
+        _r7c = _aio7.run(_h7.process({'chat_id': FAKE_CHAT_A, 'limit': 999}, None))
+        assert _r7c['success'] is True and len(_r7c['history']) == 2, _r7c
+        print('TEST7_HISTORY_API_OK')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

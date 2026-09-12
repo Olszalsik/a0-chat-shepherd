@@ -47,6 +47,17 @@ Chat Shepherd
 <small class="hint">When off, only chats that have received at least one message are monitored.</small>
 </div>
 
+<div class='cs-card'>
+<h4>Dashboard</h4>
+<div class='cs-row'>
+<div>
+<label>Status poll interval (seconds)</label>
+<input type='number' min='2' max='120' x-model.number='cfg.poll_seconds' />
+</div>
+</div>
+<small class='hint'>How often the monitor panel refreshes itself (2-120 seconds; clamped on save). Takes effect after the next status fetch.</small>
+</div>
+
 <div class="cs-card">
 <h4>Stall detection</h4>
 <div class="cs-row">
@@ -198,6 +209,7 @@ stall_minutes: 5,
 max_auto_nudges: 3,
 max_nudges_per_tick: 1,
 nudge_cooldown_minutes: 10,
+poll_seconds: 5,
 allowed_chat_ids_text: '',
 intervention_after_failed_nudges: true,
 notify_on_intervention: true,
@@ -281,6 +293,7 @@ stall_minutes: this.cfg.stall_minutes,
 max_auto_nudges: this.cfg.max_auto_nudges,
 max_nudges_per_tick: this.cfg.max_nudges_per_tick,
 nudge_cooldown_minutes: this.cfg.nudge_cooldown_minutes,
+poll_seconds: Number(this.cfg.poll_seconds) || 5,
 intervention_after_failed_nudges: this.cfg.intervention_after_failed_nudges,
 notify_on_intervention: this.cfg.notify_on_intervention,
 wedge_nudge_after_minutes: this.cfg.wedge_nudge_after_minutes,

@@ -159,6 +159,12 @@ class Status(ApiHandler):
         for c in chat_list:
             counts[c['status']] = counts.get(c['status'], 0) + 1
 
+        poll_seconds = cfg.get('poll_seconds', 5)
+        try:
+            poll_seconds = int(poll_seconds)
+        except (TypeError, ValueError):
+            poll_seconds = 5
+        poll_seconds = max(2, min(120, poll_seconds))
         return {
             'success': True,
             'config': {
@@ -174,6 +180,7 @@ class Status(ApiHandler):
                 ),
                 'wedge_soft_restart': bool(cfg.get('wedge_soft_restart', False)),
                 'icons': icons,
+                'poll_seconds': poll_seconds,
             },
             'last_tick': state.get('last_tick', ''),
             'chats': chat_list,

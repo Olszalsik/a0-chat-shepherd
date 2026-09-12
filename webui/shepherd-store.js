@@ -45,6 +45,9 @@ async function callApi(path, body) {
 export const store = createStore("chatShepherdStore", {
   data: null,
   error: "",
+  statusFilter: '',
+  timelineOpen: '',
+  timelines: {},
   pollTimer: null,
   pollInterval: 5000,
 
@@ -79,6 +82,7 @@ export const store = createStore("chatShepherdStore", {
       if (json && json.success) {
         this.data = json;
         this.error = "";
+      this.applyPollFromConfig();
       } else {
         this.error = (json && json.error) || "Status request failed";
       }
@@ -112,6 +116,58 @@ export const store = createStore("chatShepherdStore", {
       const json = await callApi("/resolve", { chat_id: chatId, action: "dismiss" });
       if (!json || !json.success) this.error = (json && json.error) || "Dismiss failed";
       this.fetchStatus();
+    } catch (e) {
+      this.error = String(e);
+    }
+  },
+
+  applyPollFromConfig() {
+    const cfg = (this.data && this.data.config) || {};
+    let secs = Number(cfg.poll_seconds);
+    if (!Number.isFinite(secs)) secs = 5;
+    secs = Math.max(2, Math.min(120, secs));
+    const ms = secs * 1000;
+    if (ms !== this.pollInterval) {
+      this.pollInterval = ms;
+      this.startPolling();
+    }
+  },
+
+  filteredChats() {
+    const chats = (this.data && this.data.chats) || [];
+    if (!this.statusFilter) return chats;
+    return chats.filter((c) => c.status === this.statusFilter);
+  },
+
+  nameFor(chatId) {
+    const chats = (this.data && this.data.chats) || [];
+    const hit = chats.find((c) => c.chat_id === chatId);
+    return (hit && (hit.name || hit.chat_id)) || chatId;
+  },
+
+  timelineFor(chatId) {
+    const t = (this.timelines && this.timelines[chatId]) || null;
+    return (t && t.history) || [];
+  },
+
+  timelineName(chatId) {
+    const t = (this.timelines && this.timelines[chatId]) || null;
+    return (t && t.name) || this.nameFor(chatId);
+  },
+
+  async toggleTimeline(chatId) {
+    if (this.timelineOpen === chatId) {
+      this.timelineOpen = '';
+      return;
+    }
+    try {
+      const json = await callApi('/history', { chat_id: chatId, limit: 30 });
+      if (json && json.success) {
+        this.timelines[chatId] = json;
+        this.timelineOpen = chatId;
+      } else {
+        this.error = (json && json.error) || 'History failed';
+      }
     } catch (e) {
       this.error = String(e);
     }
