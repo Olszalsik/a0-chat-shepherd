@@ -91,6 +91,34 @@ Chat Shepherd
 <input type="checkbox" x-model="cfg.notify_on_intervention" />
 <strong>Notify when a chat needs human intervention</strong>
 </label>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="cfg.notify_on_resume" />
+<strong>Notify when server restart resumes chats (info)</strong>
+</label>
+<div class="cs-row">
+  <div>
+    <label>Persistent-intervention page after (minutes, 0 = at once)</label>
+    <input type="number" min="0" max="720" x-model.number="cfg.notify_after_minutes" />
+  </div>
+  <div>
+    <label>Re-page interval for the same episode (minutes, 0 = once)</label>
+    <input type="number" min="0" max="720" x-model.number="cfg.notify_rearm_minutes" />
+  </div>
+</div>
+    <label style="display: block; margin: 4px 0;">
+    <input type="checkbox" x-model="cfg.goal_gate_enabled" />
+    <strong>Goal completion gate: nudge when the agent claims done but its goal is still active</strong>
+    </label>
+    <div class="cs-row">
+     <div>
+     <label>Max gate nudges per goal version (0 = off)</label>
+     <input type="number" min="0" max="10" x-model.number="cfg.goal_gate_max_nudges" />
+     </div>
+     <div>
+     <label>Gate nudge cooldown (minutes)</label>
+     <input type="number" min="0" max="240" x-model.number="cfg.goal_gate_cooldown_minutes" />
+     </div>
+    </div>
 </div>
 
 <div class="cs-card">
@@ -213,6 +241,12 @@ poll_seconds: 5,
 allowed_chat_ids_text: '',
 intervention_after_failed_nudges: true,
 notify_on_intervention: true,
+notify_after_minutes: 30,
+notify_rearm_minutes: 60,
+notify_on_resume: false,
+goal_gate_enabled: true,
+goal_gate_max_nudges: 2,
+goal_gate_cooldown_minutes: 15,
 wedge_nudge_after_minutes: 10,
 wedge_max_remediations: 2,
 wedge_remediation_cooldown_minutes: 10,
@@ -296,6 +330,12 @@ nudge_cooldown_minutes: this.cfg.nudge_cooldown_minutes,
 poll_seconds: Number(this.cfg.poll_seconds) || 5,
 intervention_after_failed_nudges: this.cfg.intervention_after_failed_nudges,
 notify_on_intervention: this.cfg.notify_on_intervention,
+notify_after_minutes: Number(this.cfg.notify_after_minutes) || 0,
+notify_rearm_minutes: Number(this.cfg.notify_rearm_minutes) || 0,
+notify_on_resume: !!this.cfg.notify_on_resume,
+goal_gate_enabled: !!this.cfg.goal_gate_enabled,
+goal_gate_max_nudges: Number(this.cfg.goal_gate_max_nudges) || 0,
+goal_gate_cooldown_minutes: Number(this.cfg.goal_gate_cooldown_minutes) || 0,
 wedge_nudge_after_minutes: this.cfg.wedge_nudge_after_minutes,
 wedge_max_remediations: this.cfg.wedge_max_remediations,
 wedge_remediation_cooldown_minutes: this.cfg.wedge_remediation_cooldown_minutes,

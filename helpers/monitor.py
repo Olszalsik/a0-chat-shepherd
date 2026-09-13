@@ -29,6 +29,12 @@ from usr.plugins.chat_shepherd.helpers.constants import (
     PLUGIN_NAME,
     MAX_TRACKED_CHATS,
     CHAT_ID_PATTERN,
+    NOTIFY_AFTER_MIN,
+    NOTIFY_REARM_MIN,
+    GOAL_GATE_TEXT,
+    GOAL_GATE_MAX_NUDGES,
+    GOAL_GATE_COOLDOWN_MIN,
+    GOAL_GATE_OBJECTIVE_MAX,
     NUDGE_EFFECTIVE_WINDOW_MIN,
 )
 from usr.plugins.chat_shepherd.helpers import state as state_mod
@@ -468,6 +474,139 @@ def classify_chat(
     return STATUS_IDLE, f'Idle {minutes_idle:.0f}m, within grace period'
 
 
+def _active_goal(chat_id: str) -> dict[str, Any] | None:
+    # v1.8.0 goal completion gate: read the chat's native goal-system
+    # goal. Returns it only when it exists and is still open
+    # (active/paused); import or read failures are logged and silent so
+    # the gate can never break the tick loop.
+    try:
+        from plugins._goal.tools.goal import get_goal, ACTIVE_STATUSES
+        goal = get_goal(chat_id)
+    except Exception as e:
+        _debug_log('goal_gate_read_fail', chat_id + ' ' + repr(e))
+        return None
+    if not goal or goal.get('status') not in ACTIVE_STATUSES:
+        return None
+    return goal
+
+
+def _last_response_text(context: AgentContext) -> str:
+    # v1.8.0: heading + content of the most recent response log item
+    # (completion-claim evidence). Same lock discipline as _last_log_type.
+    try:
+        with context.log._lock:
+            logs = list(context.log.logs)
+        for item in reversed(logs):
+            if getattr(item, 'type', '') == 'response':
+                heading = str(getattr(item, 'heading', '') or '')
+                content = str(getattr(item, 'content', '') or '')
+                return heading + '\n' + content
+    except Exception:
+        pass
+    return ''
+
+
+# v1.8.0: conservative completion-claim heuristic - subject word followed
+# by a completion verb, global claims ("all done"), explicit first-person
+# finishes, and bare "is complete". Windows containing negation or
+# pending/remaining language are rejected.
+_GOAL_GATE_RE = re.compile(
+    r'\b(?:task|work|job|goal|implementation|refactor\w*|migration|setup|repair|'
+    r'fix(?:es)?|plan|roadmap|build|port|update|upgrade|install(?:ation)?|'
+    r'feature|module|script|tool|plugin|test(?:s)?)\b'
+    r'[^.?!]{0,60}?\b(?:complete[ds]?|completion|finished|done|achieved|fulfilled)\b'
+    r'|\b(?:all|everything)\b[^.?!]{0,40}?\b(?:complete[ds]?|finished|done)\b'
+    r"|\bI\s*(?:'ve|ve| have|'m|m| am| will|'ll)?\s*(?:now\s+|just\s+)?"
+    r'(?:complete[ds]?|finished|done)\b'
+    r'|\bis\s+(?:now\s+|successfully\s+)?complete[ds]?\b',
+    re.IGNORECASE,
+)
+_GOAL_GATE_NEG_RE = re.compile(
+    r"\b(?:not|no|never|cannot|can't|won't|isn't|aren't|hasn't|haven't|"
+    r"didn't|doesn't|don't|without|pending|remaining|incomplete)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_completion(text: str) -> bool:
+    if not text:
+        return False
+    snippet = text[-4000:]
+    for match in _GOAL_GATE_RE.finditer(snippet):
+        window = snippet[max(0, match.start() - 40):match.end() + 10]
+        if not _GOAL_GATE_NEG_RE.search(window):
+            return True
+    return False
+
+
+def _goal_gate_check(
+    state: dict[str, Any],
+    chat_id: str,
+    ctx: AgentContext,
+    entry: dict[str, Any],
+    cfg: dict[str, Any],
+    now_iso: str,
+    summary: dict[str, Any],
+) -> bool:
+    # v1.8.0 goal completion gate: silent nudge when a USER chat's latest
+    # response claims completion while its native goal is still open.
+    # Budget (goal_gate_count) applies per goal version and resets when
+    # the goal record changes (goal_gate_key = goal updated_at). Returns
+    # True when a nudge was sent.
+    if not bool(cfg.get('goal_gate_enabled', True)):
+        return False
+    max_nudges = max(0, min(10, int(cfg.get(
+        'goal_gate_max_nudges', GOAL_GATE_MAX_NUDGES
+    ))))
+    if max_nudges <= 0:
+        return False
+    cooldown = float(cfg.get(
+        'goal_gate_cooldown_minutes', GOAL_GATE_COOLDOWN_MIN
+    ))
+    goal = _active_goal(chat_id)
+    if not goal:
+        return False
+    if not _looks_like_completion(_last_response_text(ctx)):
+        return False
+    goal_key = str(goal.get('updated_at') or goal.get('objective') or '')
+    if str(entry.get('goal_gate_key', '')) != goal_key:
+        entry['goal_gate_key'] = goal_key
+        entry['goal_gate_count'] = 0
+    count = int(entry.get('goal_gate_count', 0) or 0)
+    if count >= max_nudges:
+        return False
+    if cooldown > 0 and _minutes_since(
+        _parse_dt(entry.get('last_goal_gate_at', ''))
+    ) < cooldown:
+        return False
+    objective = str(goal.get('objective', ''))[:GOAL_GATE_OBJECTIVE_MAX]
+    if not _nudge_context(
+        ctx, GOAL_GATE_TEXT.replace('{objective}', objective)
+    ):
+        return False
+    entry['goal_gate_count'] = count + 1
+    entry['last_goal_gate_at'] = now_iso
+    entry['goal_gate_nudges_sent'] = (
+        int(entry.get('goal_gate_nudges_sent', 0) or 0) + 1
+    )
+    summary['goal_gate_nudged'] = summary.get('goal_gate_nudged', 0) + 1
+    try:
+        state_mod.append_history(state, {
+            'chat_id': chat_id,
+            'action': 'goal_gate_nudge',
+            'goal_key': goal_key,
+            'timestamp': now_iso,
+        })
+    except Exception as e:
+        _debug_log('goal_gate_history_fail', repr(e))
+    _debug_log(
+        'goal_gate',
+        chat_id + ' nudge #' + str(count + 1) + ' (goal still active)',
+    )
+    return True
+
+
+
 def tick(cfg: dict[str, Any]) -> dict[str, Any]:
     if not cfg.get('enabled', False):
         return {'skipped': True, 'reason': 'disabled'}
@@ -487,6 +626,12 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
     nudge_cooldown = float(cfg.get('nudge_cooldown_minutes', 10))
     max_nudges = int(cfg.get('max_auto_nudges', 3))
     notify_on_intervention = bool(cfg.get('notify_on_intervention', True))
+    # v1.7.0 quiet bell: persistence-gated intervention paging.
+    notify_after = float(cfg.get('notify_after_minutes', NOTIFY_AFTER_MIN))
+    notify_rearm = float(cfg.get('notify_rearm_minutes', NOTIFY_REARM_MIN))
+    notify_on_resume = bool(cfg.get('notify_on_resume', False))
+    # v1.8.0 goal completion gate (thresholds read inside the check).
+    goal_gate_enabled = bool(cfg.get('goal_gate_enabled', True))
     # P2: global burst throttle — at most this many auto-nudges per tick,
     # oldest stall first. 0 disables auto-nudging entirely.
     max_nudges_per_tick = max(0, min(10, int(cfg.get('max_nudges_per_tick', 1))))
@@ -536,6 +681,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
         'interrupted': 0,
         'resumed': 0,
         'notify_failures': 0,
+        'goal_gate_nudged': 0,
         'pruned': 0,
     }
 
@@ -609,6 +755,11 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             last_log_len=cur_log_len,
             last_ticked=now_iso,
         )
+        if new_status != STATUS_INTERVENTION:
+            # v1.7.0: episode ended (recovered / awaiting / error) - clear the
+            # quiet-bell clock so a future episode pages on its own merits.
+            entry['intervention_since'] = ''
+            entry['intervention_notify_at'] = ''
 
         if new_status == STATUS_RUNNING:
             entry['last_seen_running'] = now_iso
@@ -622,6 +773,20 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
         elif new_status == STATUS_AWAITING_USER:
             summary['awaiting'] += 1
             _record_nudge_outcome(state, chat_id, now_iso)
+            # v1.8.0 goal completion gate: a response that claims the work is
+            # done while the chat's native goal is still open gets a silent
+            # nudge to finish the goal or close it via the goal tool.
+            if (
+                goal_gate_enabled
+                and getattr(ctx, 'type', None) == AgentContextType.USER
+                and _goal_gate_check(
+                    state, chat_id, ctx, entry, cfg, now_iso, summary
+                )
+            ):
+                entry['status'] = STATUS_NUDGED
+                entry['last_classification'] = (
+                    'Goal gate: completion claim while goal still active'
+                )
         elif new_status == STATUS_STALLED:
             summary['stalled'] += 1
             last_nudge_dt = _parse_dt(prev.get('last_nudge_at', ''))
@@ -653,14 +818,34 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
                 ):
                     # Oldest freeze first; final ordering post-loop.
                     wedge_queue.append((frozen_minutes, chat_id, ctx, entry, now_iso))
-            if old_status != STATUS_INTERVENTION and notify_on_intervention:
-                if not _notify(
-                    'warning',
-                    f'Chat "{fname}" ({chat_id}) needs human intervention: {reason}',
-                    priority='high',
-                    cfg=cfg,
-                ):
-                    summary['notify_failures'] += 1
+            # v1.7.0 quiet bell: persistence-gated paging. A fresh episode starts
+            # the clock silently; the bell rings only once the chat has
+            # persistently needed human help for >= notify_after minutes
+            # (0 = page immediately). notify_rearm re-pages an ongoing
+            # episode (0 = one page per episode). Self-healed episodes (e.g.
+            # the wedge auto-continue worked) never page.
+            if notify_on_intervention:
+                since_dt = _parse_dt(prev.get('intervention_since', ''))
+                if since_dt is None:
+                    entry['intervention_since'] = now_iso
+                    since_dt = _parse_dt(now_iso)
+                waited = _minutes_since(since_dt)
+                if waited >= notify_after:
+                    notify_at_dt = _parse_dt(entry.get('intervention_notify_at', ''))
+                    rearm_ok = notify_at_dt is None or (
+                        notify_rearm > 0
+                        and _minutes_since(notify_at_dt) >= notify_rearm
+                    )
+                    if rearm_ok:
+                        if not _notify(
+                            'warning',
+                            f'Chat {fname!r} ({chat_id}) still needs human '
+                            f'intervention after {waited:.0f}m: {reason}',
+                            priority='high',
+                            cfg=cfg,
+                            ):
+                            summary['notify_failures'] += 1
+                        entry['intervention_notify_at'] = now_iso
         elif new_status == STATUS_INTERRUPTED:
             summary['interrupted'] += 1
             nudge_count = entry.get('nudge_count', 0)
@@ -790,7 +975,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             ),
             'timestamp': datetime.now(timezone.utc).isoformat(),
         })
-        if summary['resumed'] and notify_on_intervention:
+        if summary['resumed'] and notify_on_resume:
             name_list = ', '.join(resumed_names[:5]) + ('...' if len(resumed_names) > 5 else '')
             msg = (
                 'Server restarted: resumed ' + str(summary['resumed'])

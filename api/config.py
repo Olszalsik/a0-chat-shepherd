@@ -29,6 +29,12 @@ _DEFAULTS: dict[str, Any] = {
  "allowed_chat_ids": [],
     "intervention_after_failed_nudges": True,
     "notify_on_intervention": True,
+    "notify_after_minutes": 30,
+    "notify_rearm_minutes": 60,
+    "notify_on_resume": False,
+    "goal_gate_enabled": True,
+    "goal_gate_max_nudges": 2,
+    "goal_gate_cooldown_minutes": 15,
     "wedge_nudge_after_minutes": 10,
     "wedge_max_remediations": 2,
     "wedge_remediation_cooldown_minutes": 10,
@@ -120,6 +126,38 @@ class Config(ApiHandler):
             current["notify_on_intervention"] = _coerce_bool(
                 readable["notify_on_intervention"]
             )
+            if "notify_on_resume" in readable:
+                current["notify_on_resume"] = _coerce_bool(readable["notify_on_resume"])
+                if "goal_gate_enabled" in readable:
+                 current["goal_gate_enabled"] = _coerce_bool(readable["goal_gate_enabled"])
+                if "goal_gate_max_nudges" in readable:
+                 current["goal_gate_max_nudges"] = _coerce_int(
+                 readable["goal_gate_max_nudges"],
+                 current["goal_gate_max_nudges"],
+                 0,
+                 10,
+                 )
+                if "goal_gate_cooldown_minutes" in readable:
+                 current["goal_gate_cooldown_minutes"] = _coerce_int(
+                 readable["goal_gate_cooldown_minutes"],
+                 current["goal_gate_cooldown_minutes"],
+                 0,
+                 240,
+                 )
+            if "notify_after_minutes" in readable:
+                current["notify_after_minutes"] = _coerce_int(
+                    readable["notify_after_minutes"],
+                    current["notify_after_minutes"],
+                    0,
+                    720,
+                )
+            if "notify_rearm_minutes" in readable:
+                current["notify_rearm_minutes"] = _coerce_int(
+                    readable["notify_rearm_minutes"],
+                    current["notify_rearm_minutes"],
+                    0,
+                    720,
+                )
         if "wedge_soft_restart" in readable:
             current["wedge_soft_restart"] = _coerce_bool(
                 readable["wedge_soft_restart"]

@@ -17,6 +17,14 @@ FAKE_CHAT_A = 'csTstA01'
 FAKE_CHAT_B = 'csTstB02'
 FAKE_CHAT_C = 'csTstC03'
 
+TEST_JOURNAL = 'usr/plugins/chat_shepherd/data/test_history.jsonl'
+
+def _truncate_journal():
+    try:
+        os.unlink(files.get_abs_path(TEST_JOURNAL))
+    except Exception:
+        pass
+
 
 class FakeCtx:
     def __init__(self, cid, log_types, idle_minutes, ctype=None, running=False):
@@ -50,13 +58,21 @@ class FakeAgentContext:
         return list(cls._all)
 
 
+
 def write_state(last_tick, chats=None):
     payload = {'chats': chats or {}, 'history': [], 'last_tick': last_tick}
     files.write_file(TEST_STATE, json.dumps(payload, ensure_ascii=False))
+    _truncate_journal()
+
 
 
 def read_state():
-    return json.loads(files.read_file(files.get_abs_path(TEST_STATE)))
+    st = json.loads(files.read_file(files.get_abs_path(TEST_STATE)))
+    try:
+        st['history'] = state_mod.read_journal()
+    except Exception:
+        st['history'] = []
+    return st
 
 
 def make_chat_dirs():
@@ -76,16 +92,22 @@ def cleanup():
             shutil.rmtree(d, ignore_errors=True)
         except Exception:
             pass
+
     try:
         os.unlink(files.get_abs_path(TEST_STATE))
+        _truncate_journal()
     except Exception:
         pass
 
 
 def main():
     orig_state_file = state_mod.STATE_FILE
+
+    orig_journal_file = state_mod.JOURNAL_FILE
     orig_agent_ctx = monitor.AgentContext
     state_mod.STATE_FILE = TEST_STATE
+
+    state_mod.JOURNAL_FILE = TEST_JOURNAL
     monitor.AgentContext = FakeAgentContext
     try:
         make_chat_dirs()
@@ -382,13 +404,143 @@ def main():
             write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 3, 'last_nudge_at': (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()}})
             _ctx_i = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
             FakeAgentContext._all = [_ctx_i]
-            monitor.tick(dict(cfg, notify_on_intervention=True))
+            monitor.tick(dict(cfg, notify_on_intervention=True, notify_after_minutes=0))
             assert _captured, 'no intervention notification captured'
             assert 'Alpha Rescue Chat' in _captured[-1] and FAKE_CHAT_A in _captured[-1], _captured[-1]
         finally:
             monitor._notify = _orig_notify
         print('TEST6E_ALERT_NAME_OK')
         
+        # --- 9: quiet bell (v1.7.0): persistence-gated intervention paging ---
+        _orig_notify9 = monitor._notify
+        _captured9 = []
+        monitor._notify = lambda kind, message, priority='normal', cfg=None: _captured9.append(message) or True
+        try:
+            qb_cfg = dict(cfg, notify_on_intervention=True, notify_after_minutes=30, notify_rearm_minutes=60)
+            stale_nudge = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+            def _qb_entry(since_min=0, notify_min=None):
+                e9 = {'status': 'stalled', 'nudge_count': 3, 'last_nudge_at': stale_nudge}
+                if since_min:
+                    e9['intervention_since'] = (datetime.now(timezone.utc) - timedelta(minutes=since_min)).isoformat()
+                if notify_min is not None:
+                    e9['intervention_notify_at'] = (datetime.now(timezone.utc) - timedelta(minutes=notify_min)).isoformat()
+                return e9
+            # 9a: fresh episode stays silent; the clock starts
+            write_state(fresh_tick, chats={FAKE_CHAT_A: _qb_entry()})
+            FakeAgentContext._all = [FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)]
+            monitor.tick(qb_cfg)
+            assert not _captured9, _captured9
+            st9 = read_state()['chats'][FAKE_CHAT_A]
+            assert st9.get('intervention_since'), st9
+            print('TEST9A_FRESH_EPISODE_SILENT_OK')
+            # 9b: episode persisted 45m -> exactly one page
+            write_state(fresh_tick, chats={FAKE_CHAT_A: _qb_entry(since_min=45)})
+            FakeAgentContext._all = [FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)]
+            monitor.tick(qb_cfg)
+            assert len(_captured9) == 1, _captured9
+            st9 = read_state()['chats'][FAKE_CHAT_A]
+            assert st9.get('intervention_notify_at'), st9
+            print('TEST9B_PERSISTENT_PAGE_OK')
+            # 9c: re-arm while the episode persists
+            write_state(fresh_tick, chats={FAKE_CHAT_A: _qb_entry(since_min=105, notify_min=70)})
+            FakeAgentContext._all = [FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)]
+            monitor.tick(qb_cfg)
+            assert len(_captured9) == 2, _captured9
+            print('TEST9C_REARM_OK')
+            # 9d: recovery clears the quiet-bell clock without paging
+            write_state(fresh_tick, chats={FAKE_CHAT_A: _qb_entry(since_min=45, notify_min=15)})
+            FakeAgentContext._all = [FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)]
+            monitor.tick(qb_cfg)
+            st9 = read_state()['chats'][FAKE_CHAT_A]
+            assert st9['status'] == 'awaiting_user', st9
+            assert not st9.get('intervention_since') and not st9.get('intervention_notify_at'), st9
+            assert len(_captured9) == 2, _captured9
+            print('TEST9D_RECOVERY_CLEARS_OK')
+        finally:
+            monitor._notify = _orig_notify9
+        # --- 10: goal completion gate (v1.8.0) ---
+        _orig_active_goal = monitor._active_goal
+        _goal_state = {'objective': 'Build the demo widget', 'status': 'active', 'updated_at': '2026-09-13T10:00:00+00:00'}
+        monitor._active_goal = lambda cid: dict(_goal_state)
+        try:
+            gcfg = dict(cfg, goal_gate_enabled=True, goal_gate_max_nudges=2, goal_gate_cooldown_minutes=0)
+            def _goal_ctx(claim=True):
+                cg = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=1)
+                cg.log.logs.append(types.SimpleNamespace(
+                 type='response',
+                 heading='Done' if claim else 'Question',
+                 content=(
+                 'The task is now complete. All done!'
+                 if claim else 'Which database should I use?'
+                 ),
+                ))
+                return cg
+            # 10a: completion claim + active goal -> one silent gate nudge
+            write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'running'}})
+            ctx_g = _goal_ctx()
+            FakeAgentContext._all = [ctx_g]
+            s10 = monitor.tick(gcfg)
+            assert len(ctx_g.communicated) == 1, ctx_g.communicated
+            _m10 = ctx_g.communicated[0]
+            _txt10 = str(getattr(_m10, 'message', None) or getattr(_m10, 'content', None) or _m10)
+            assert 'goal' in _txt10.lower(), _txt10
+            assert 'Build the demo widget' in _txt10, _txt10
+            st10 = read_state()['chats'][FAKE_CHAT_A]
+            assert st10['status'] == 'nudged', st10
+            assert st10.get('goal_gate_count') == 1, st10
+            assert s10.get('goal_gate_nudged') == 1, s10
+            print('TEST10A_GATE_NUDGE_OK')
+            # 10b: per-goal budget exhausted -> silent
+            write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'nudged', 'goal_gate_key': '2026-09-13T10:00:00+00:00', 'goal_gate_count': 2}})
+            ctx_g2 = _goal_ctx()
+            FakeAgentContext._all = [ctx_g2]
+            monitor.tick(gcfg)
+            assert len(ctx_g2.communicated) == 0, ctx_g2.communicated
+            print('TEST10B_BUDGET_EXHAUSTED_OK')
+            # 10c: goal record changed -> budget reset -> nudges again
+            _goal_state['updated_at'] = '2026-09-13T11:30:00+00:00'
+            write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'nudged', 'goal_gate_key': '2026-09-13T10:00:00+00:00', 'goal_gate_count': 2}})
+            ctx_g3 = _goal_ctx()
+            FakeAgentContext._all = [ctx_g3]
+            monitor.tick(gcfg)
+            assert len(ctx_g3.communicated) == 1, ctx_g3.communicated
+            st10 = read_state()['chats'][FAKE_CHAT_A]
+            assert st10.get('goal_gate_count') == 1, st10
+            assert st10.get('goal_gate_key') == '2026-09-13T11:30:00+00:00', st10
+            print('TEST10C_BUDGET_RESET_OK')
+            # 10d: no completion claim -> silent
+            _goal_state['updated_at'] = '2026-09-13T12:00:00+00:00'
+            write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'running'}})
+            ctx_g4 = _goal_ctx(claim=False)
+            FakeAgentContext._all = [ctx_g4]
+            monitor.tick(gcfg)
+            assert len(ctx_g4.communicated) == 0, ctx_g4.communicated
+            print('TEST10D_NO_CLAIM_SILENT_OK')
+            # 10e: goal already final -> silent
+            write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'running'}})
+            ctx_g5 = _goal_ctx()
+            FakeAgentContext._all = [ctx_g5]
+            monitor._active_goal = lambda cid: None
+            monitor.tick(gcfg)
+            assert len(ctx_g5.communicated) == 0, ctx_g5.communicated
+            print('TEST10E_GOAL_FINAL_SILENT_OK')
+            # 10f: gate disabled -> silent
+            monitor._active_goal = lambda cid: dict(_goal_state)
+            write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'running'}})
+            ctx_g6 = _goal_ctx()
+            FakeAgentContext._all = [ctx_g6]
+            monitor.tick(dict(gcfg, goal_gate_enabled=False))
+            assert len(ctx_g6.communicated) == 0, ctx_g6.communicated
+            print('TEST10F_DISABLED_SILENT_OK')
+            # 10g: cooldown active -> silent
+            write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'nudged', 'goal_gate_key': '2026-09-13T12:00:00+00:00', 'goal_gate_count': 0, 'last_goal_gate_at': (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()}})
+            ctx_g7 = _goal_ctx()
+            FakeAgentContext._all = [ctx_g7]
+            monitor.tick(dict(gcfg, goal_gate_cooldown_minutes=15))
+            assert len(ctx_g7.communicated) == 0, ctx_g7.communicated
+            print('TEST10G_COOLDOWN_OK')
+        finally:
+            monitor._active_goal = _orig_active_goal
         # --- 7: per-chat history API (v1.5.0)
         import asyncio as _aio7
         from usr.plugins.chat_shepherd.api.history import History as _CSHistory
@@ -398,10 +550,10 @@ def main():
             {'chat_id': FAKE_CHAT_B, 'action': 'auto_nudge', 'nudge_count': 1, 'timestamp': '2026-09-12T08:01:00+00:00'},
             {'chat_id': FAKE_CHAT_A, 'action': 'auto_nudge', 'nudge_count': 1, 'timestamp': '2026-09-12T08:00:00+00:00'},
         ]
+
         write_state(fresh_tick, chats={})
-        _st7 = read_state()
-        _st7['history'] = _hist7
-        files.write_file(TEST_STATE, json.dumps(_st7, ensure_ascii=False))
+        for h in reversed(_hist7):
+            state_mod.append_journal(h)
         _r7 = _aio7.run(_h7.process({'chat_id': FAKE_CHAT_A}, None))
         assert _r7.get('success') is True, _r7
         assert [i7['action'] for i7 in _r7['history']] == ['manual_nudge', 'auto_nudge'], _r7
@@ -412,9 +564,58 @@ def main():
         _r7c = _aio7.run(_h7.process({'chat_id': FAKE_CHAT_A, 'limit': 999}, None))
         assert _r7c['success'] is True and len(_r7c['history']) == 2, _r7c
         print('TEST7_HISTORY_API_OK')
+
+        # --- 8: append-only history journal (v1.6.0)
+        import asyncio as _aio8
+        write_state(fresh_tick, chats={})
+        state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'ev_one', 'timestamp': '2026-09-12T09:00:00+00:00'})
+        files.write_file(TEST_STATE, json.dumps({'chats': {}, 'history': [], 'last_tick': fresh_tick}, ensure_ascii=False))
+        state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'ev_two', 'timestamp': '2026-09-12T09:01:00+00:00'})
+        _j8 = state_mod.read_journal()
+        assert [h['action'] for h in _j8][:2] == ['ev_two', 'ev_one'], _j8
+        with open(files.get_abs_path(TEST_JOURNAL), 'a', encoding='utf-8') as _f8:
+            _f8.write(chr(123) + 'broken' + chr(10))
+        _j8b = state_mod.read_journal()
+        assert [h['action'] for h in _j8b][:2] == ['ev_two', 'ev_one'], _j8b
+        _st8 = state_mod.load_state()
+        assert [h['action'] for h in _st8['history']][:2] == ['ev_two', 'ev_one'], _st8['history']
+        files.write_file(TEST_STATE, json.dumps({'chats': {}, 'history': [{'chat_id': FAKE_CHAT_A, 'action': 'legacy_ev', 'timestamp': '2026-09-12T08:30:00+00:00'}], 'last_tick': fresh_tick}, ensure_ascii=False))
+        os.unlink(files.get_abs_path(TEST_JOURNAL))
+        _st8m = state_mod.load_state()
+        assert any(h.get('action') == 'legacy_ev' for h in _st8m['history']), _st8m['history']
+        _j8m = state_mod.read_journal()
+        assert any(h.get('action') == 'legacy_ev' for h in _j8m), _j8m
+        _ok8a = state_mod.JOURNAL_MAX_BYTES
+        _ok8b = state_mod.JOURNAL_KEEP
+        state_mod.JOURNAL_MAX_BYTES = 10
+        state_mod.JOURNAL_KEEP = 2
+        try:
+            # v1.6.0: every append triggers compaction (MAX_BYTES=10) and the
+            # newest-two invariant must keep all three entries (KEEP >= written).
+            # Truncate instead of unlink: the 9p bind mount can diverge
+            # path->inode resolution after unlink+recreate churn, and production
+            # never unlinks the journal (append-only).
+            open(files.get_abs_path(TEST_JOURNAL), 'w', encoding='utf-8').close()
+            state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'c1'})
+            state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'c2'})
+            state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'c3'})
+            _j8c = state_mod.read_journal()
+            assert [h['action'] for h in _j8c] == ['c3', 'c2', 'c1'], _j8c
+        finally:
+            state_mod.JOURNAL_MAX_BYTES = _ok8a
+            state_mod.JOURNAL_KEEP = _ok8b
+        from usr.plugins.chat_shepherd.api.export import Export as _CSExport
+        _x8 = _CSExport(None, None)
+        _r8 = _aio8.run(_x8.process({}, None))
+        assert _r8.get('success') is True, _r8
+        assert any(h.get('action') == 'c3' for h in _r8.get('history', [])), _r8.get('history', [])[:5]
+        assert 'chats' in _r8.get('state', {}), list(_r8.keys())
+        print('TEST8_JOURNAL_EXPORT_OK')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file
+
+        state_mod.JOURNAL_FILE = orig_journal_file
         monitor.AgentContext = orig_agent_ctx
         FakeAgentContext._all = []
         cleanup()

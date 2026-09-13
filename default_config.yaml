@@ -9,6 +9,21 @@ poll_seconds: 5
 allowed_chat_ids: []
 intervention_after_failed_nudges: true
 notify_on_intervention: true
+# v1.7.0 quiet bell: the intervention bell is persistence-gated. It rings
+# only after a chat has needed human help continuously for
+# notify_after_minutes (0 = page immediately); an ongoing episode is
+# re-paged every notify_rearm_minutes (0 = one page per episode).
+notify_after_minutes: 30
+notify_rearm_minutes: 60
+# v1.7.0: informational bell for the server-restart resume sweep
+# (default off; the sidebar icons already surface this).
+notify_on_resume: false
+# v1.8.0 goal completion gate: when an agent declares its work done in
+# a USER chat while its native goal-system goal is still open, it gets
+# a silent nudge to finish the goal or close it with the goal tool.
+goal_gate_enabled: true
+goal_gate_max_nudges: 2
+goal_gate_cooldown_minutes: 15
 # v1.2.0 wedge remediation ladder: a running chat whose log is frozen for
 # >= stall_minutes is wedged. After wedge_nudge_after_minutes it gets an
 # automatic "continue" (Tier 1); when remediations are exhausted and
