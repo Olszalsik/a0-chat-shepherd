@@ -26,6 +26,7 @@ _DEFAULTS: dict[str, Any] = {
     "max_nudges_per_tick": 1,
     "nudge_cooldown_minutes": 10,
     "poll_seconds": 5,
+    "hot_reload_enabled": True,
  "allowed_chat_ids": [],
     "intervention_after_failed_nudges": True,
     "notify_on_intervention": True,
@@ -130,6 +131,10 @@ class Config(ApiHandler):
                 current["notify_on_resume"] = _coerce_bool(readable["notify_on_resume"])
                 if "goal_gate_enabled" in readable:
                  current["goal_gate_enabled"] = _coerce_bool(readable["goal_gate_enabled"])
+                if "hot_reload_enabled" in readable:
+                 current["hot_reload_enabled"] = _coerce_bool(
+                     readable["hot_reload_enabled"]
+                 )
                 if "goal_gate_max_nudges" in readable:
                  current["goal_gate_max_nudges"] = _coerce_int(
                  readable["goal_gate_max_nudges"],

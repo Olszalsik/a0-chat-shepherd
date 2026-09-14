@@ -8,6 +8,7 @@ from helpers import plugins
 from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME
 from usr.plugins.chat_shepherd.helpers.state import load_state
 from usr.plugins.chat_shepherd.helpers import monitor
+from usr.plugins.chat_shepherd.helpers import hotreload
 
 DEFAULT_ICONS: dict[str, str] = {
     'running': '🏃',
@@ -181,8 +182,10 @@ class Status(ApiHandler):
                 'wedge_soft_restart': bool(cfg.get('wedge_soft_restart', False)),
                 'icons': icons,
                 'poll_seconds': poll_seconds,
+                'hot_reload_enabled': bool(cfg.get('hot_reload_enabled', True)),
             },
             'last_tick': state.get('last_tick', ''),
+    'hot_reload': hotreload.status(),
             'chats': chat_list,
             'counts': counts,
             'effectiveness': effectiveness,

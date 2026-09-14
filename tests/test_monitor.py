@@ -611,6 +611,86 @@ def main():
         assert any(h.get('action') == 'c3' for h in _r8.get('history', [])), _r8.get('history', [])[:5]
         assert 'chats' in _r8.get('state', {}), list(_r8.keys())
         print('TEST8_JOURNAL_EXPORT_OK')
+
+        # --- TEST11: graceful reload engine (v1.9.0) ---
+        import importlib.util
+        import time as _time
+
+        from usr.plugins.chat_shepherd.helpers import hotreload
+
+        mod_name = 'cs_hr_test_mod'
+        tmp_mod = files.get_abs_path('usr/plugins/chat_shepherd/data/hr_tmp_mod.py')
+        try:
+            V1 = 'VALUE = 1\n\ndef get():\n    return VALUE\n'
+            V2 = 'VALUE = 2\n\ndef get():\n    return VALUE\n'
+            with open(tmp_mod, 'w', encoding='utf-8') as f:
+                f.write(V1)
+            spec = importlib.util.spec_from_file_location(mod_name, tmp_mod)
+            hr_mod = importlib.util.module_from_spec(spec)
+            sys.modules[mod_name] = hr_mod
+            spec.loader.exec_module(hr_mod)
+            watch = [(mod_name, tmp_mod)]
+
+            # 11a: first call primes, second is clean
+            r1 = hotreload.check_and_reload(None, modules=watch)
+            assert r1['status'] == 'primed', r1
+            r2 = hotreload.check_and_reload(None, modules=watch)
+            assert r2['status'] == 'clean', r2
+
+            # 11b: source change -> reload, new code live, same module object
+            with open(tmp_mod, 'w', encoding='utf-8') as f:
+                f.write(V2)
+            _bump = _time.time() + 10
+            os.utime(tmp_mod, (_bump, _bump))
+            r3 = hotreload.check_and_reload(None, modules=watch)
+            assert r3['status'] == 'reloaded', r3
+            assert mod_name in r3['reloaded'], r3
+            assert hr_mod.get() == 2, hr_mod.VALUE
+
+            # 11c: compile error -> nothing loads, old code stays, backoff on
+            with open(tmp_mod, 'w', encoding='utf-8') as f:
+                f.write('def broken(:\n    pass\n')
+            _bump += 10
+            os.utime(tmp_mod, (_bump, _bump))
+            r4 = hotreload.check_and_reload(None, modules=watch)
+            assert r4['status'] == 'compile_error', r4
+            assert hr_mod.get() == 2, hr_mod.VALUE
+            r5 = hotreload.check_and_reload(None, modules=watch)
+            assert r5['status'] == 'backoff', r5
+            hotreload._fail_until = 0.0
+
+            # 11d: exec failure -> rolled back to the previous namespace
+            with open(tmp_mod, 'w', encoding='utf-8') as f:
+                f.write("VALUE = 3\nraise RuntimeError('cs_hr_boom')\n")
+            _bump += 10
+            os.utime(tmp_mod, (_bump, _bump))
+            r6 = hotreload.check_and_reload(None, modules=watch)
+            assert r6['status'] == 'failed', r6
+            assert r6.get('rolled_back'), r6
+            assert hr_mod.get() == 2, hr_mod.VALUE
+            hotreload._fail_until = 0.0
+
+            # 11e: restore good source; config gate honors hot_reload_enabled
+            with open(tmp_mod, 'w', encoding='utf-8') as f:
+                f.write(V2)
+            _bump += 10
+            os.utime(tmp_mod, (_bump, _bump))
+            r7 = hotreload.check_and_reload({'hot_reload_enabled': False}, modules=watch)
+            assert r7['status'] == 'disabled', r7
+
+            # 11f: force=True overrides the gate and lands V2
+            r8 = hotreload.check_and_reload(None, force=True, modules=watch)
+            assert r8['status'] == 'reloaded', r8
+            assert hr_mod.get() == 2, hr_mod.VALUE
+            print('TEST11_HOTRELOAD_OK')
+        finally:
+            try:
+                os.unlink(tmp_mod)
+            except Exception:
+                pass
+            sys.modules.pop(mod_name, None)
+            hotreload._fail_until = 0.0
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

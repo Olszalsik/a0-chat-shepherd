@@ -51,3 +51,7 @@ icons:
   error: "❌"
   paused: "⏸️"
   idle: ""
+# v1.9.0 graceful reload: watch helpers between ticks and re-import
+# them when their source changes (compile-gated, rollback on
+# failure). Disable to fall back to restart-based deploys.
+hot_reload_enabled: true

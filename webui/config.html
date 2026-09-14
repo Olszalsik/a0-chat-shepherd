@@ -122,6 +122,14 @@ Chat Shepherd
 </div>
 
 <div class="cs-card">
+<h4>Graceful reload</h4>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="cfg.hot_reload_enabled" />
+<strong>Hot-reload patched helpers between ticks (no restart needed)</strong>
+</label>
+</div>
+
+<div class="cs-card">
 <h4>Wedge auto-recovery</h4>
 <div class="cs-row">
 <div>
@@ -247,6 +255,7 @@ notify_on_resume: false,
 goal_gate_enabled: true,
 goal_gate_max_nudges: 2,
 goal_gate_cooldown_minutes: 15,
+hot_reload_enabled: true,
 wedge_nudge_after_minutes: 10,
 wedge_max_remediations: 2,
 wedge_remediation_cooldown_minutes: 10,
@@ -336,6 +345,7 @@ notify_on_resume: !!this.cfg.notify_on_resume,
 goal_gate_enabled: !!this.cfg.goal_gate_enabled,
 goal_gate_max_nudges: Number(this.cfg.goal_gate_max_nudges) || 0,
 goal_gate_cooldown_minutes: Number(this.cfg.goal_gate_cooldown_minutes) || 0,
+hot_reload_enabled: !!this.cfg.hot_reload_enabled,
 wedge_nudge_after_minutes: this.cfg.wedge_nudge_after_minutes,
 wedge_max_remediations: this.cfg.wedge_max_remediations,
 wedge_remediation_cooldown_minutes: this.cfg.wedge_remediation_cooldown_minutes,
