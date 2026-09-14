@@ -821,6 +821,44 @@ def main():
         assert saved13['stall_minutes'] == 7, saved13
         assert saved13['legacy_key'] == 'v', ('P6.1b regression: unknown key erased on save', saved13)
         print('TEST13C_SAVE_PRESERVE_OK')
+        # ================= TEST 14: throttle snapshot (v1.12.0) =================
+        # 14a: resume-drain snapshot integrity - no false capped flag
+        _cfg14 = {'enabled': True, 'watch_all': True, 'stall_minutes': 5, 'max_auto_nudges': 3, 'max_nudges_per_tick': 5, 'nudge_cooldown_minutes': 0, 'notify_on_intervention': False}
+        _th_stale = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        write_state(_th_stale, chats={FAKE_CHAT_A: {'status': 'running', 'nudge_count': 0, 'last_nudge_at': ''}})
+        _ctx14a = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        FakeAgentContext._all = [_ctx14a]
+        monitor.tick(_cfg14)
+        _th14a = read_state().get('throttle')
+        assert isinstance(_th14a, dict), _th14a
+        assert _th14a['nudges_this_tick'] == 1, _th14a
+        assert _th14a['budget'] == 5, _th14a
+        assert _th14a['capped'] is False, _th14a
+        assert _th14a['stalled_queued'] == 0 and _th14a['stalled_nudged'] == 0, _th14a
+        assert _th14a['resume_nudged'] == 1, _th14a
+        assert _th14a['wedge_nudged'] == 0 and _th14a['wedge_restarts'] == 0, _th14a
+        assert _th14a['wedge_budget'] == 5, _th14a
+        assert _th14a['timestamp'], _th14a
+        print('TEST14A_THROTTLE_RESUME_OK')
+        # 14b: stalled queue truncated by the per-tick budget -> capped
+        _cfg14b = dict(_cfg14, max_nudges_per_tick=1)
+        _now14 = datetime.now(timezone.utc)
+        write_state((_now14 - timedelta(minutes=1)).isoformat(), chats={
+         FAKE_CHAT_A: {'status': 'running', 'nudge_count': 0, 'last_nudge_at': (_now14 - timedelta(minutes=20)).isoformat()},
+         FAKE_CHAT_B: {'status': 'running', 'nudge_count': 0, 'last_nudge_at': (_now14 - timedelta(minutes=25)).isoformat()},
+        })
+        _ctx14a2 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        _ctx14b2 = FakeCtx(FAKE_CHAT_B, ['user', 'tool'], idle_minutes=35)
+        FakeAgentContext._all = [_ctx14a2, _ctx14b2]
+        _s14b = monitor.tick(_cfg14b)
+        assert _s14b['nudged'] == 1, _s14b
+        assert _s14b['nudges_this_tick'] == 1, _s14b
+        _th14b = read_state()['throttle']
+        assert _th14b['budget'] == 1, _th14b
+        assert _th14b['stalled_queued'] == 2, _th14b
+        assert _th14b['stalled_nudged'] == 1, _th14b
+        assert _th14b['capped'] is True, _th14b
+        print('TEST14B_THROTTLE_CAPPED_OK')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

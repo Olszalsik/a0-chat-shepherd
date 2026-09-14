@@ -23,6 +23,13 @@ DEFAULT_ICONS: dict[str, str] = {
 }
 
 
+def _to_int(value: Any) -> int:
+ try:
+  return max(0, int(value))
+ except (TypeError, ValueError):
+  return 0
+
+
 def _resolve_icons(cfg: dict[str, Any]) -> dict[str, str]:
     icons = dict(DEFAULT_ICONS)
     custom = cfg.get('icons')
@@ -161,6 +168,25 @@ class Status(ApiHandler):
         for c in chat_list:
             counts[c['status']] = counts.get(c['status'], 0) + 1
 
+        # v1.12.0: per-tick throttle snapshot persisted by tick(); old state
+        # files fall back to zeroed defaults with a config-derived budget.
+        _th_raw = state.get('throttle')
+        _th = _th_raw if isinstance(_th_raw, dict) else {}
+        try:
+         _th_budget = max(0, min(10, int(_th.get('budget', cfg.get('max_nudges_per_tick', 1)))))
+        except (TypeError, ValueError):
+         _th_budget = 1
+        throttle = {
+         'nudges_this_tick': _to_int(_th.get('nudges_this_tick')),
+         'budget': _th_budget,
+         'capped': bool(_th.get('capped', False)),
+         'stalled_queued': _to_int(_th.get('stalled_queued')),
+         'stalled_nudged': _to_int(_th.get('stalled_nudged')),
+         'resume_nudged': _to_int(_th.get('resume_nudged')),
+         'wedge_this_tick': _to_int(_th.get('wedge_nudged')) + _to_int(_th.get('wedge_restarts')),
+         'wedge_budget': max(1, _th_budget),
+         'timestamp': str(_th.get('timestamp', '') or ''),
+        }
         poll_seconds = cfg.get('poll_seconds', 5)
         try:
             poll_seconds = int(poll_seconds)
@@ -191,5 +217,6 @@ class Status(ApiHandler):
             'chats': chat_list,
             'counts': counts,
             'effectiveness': effectiveness,
+            'throttle': throttle,
             'history': state.get('history', [])[:20],
         }

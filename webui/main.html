@@ -13,6 +13,7 @@
     .shepherd-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
     .shepherd-badge { display: flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 12px; font-size: 0.8rem; background: var(--bg-tertiary, #333); }
     .shepherd-badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .shepherd-throttle-capped { color: #f44336; border: 1px solid #f44336; }
     .shepherd-table { width: 100%; border-collapse: collapse; }
     .shepherd-table th { text-align: left; padding: 8px; font-size: 0.8rem; color: var(--text-secondary, #aaa); border-bottom: 1px solid var(--border-color, #444); }
     .shepherd-table td { padding: 8px; font-size: 0.85rem; border-bottom: 1px solid var(--border-color, #222); }
@@ -61,6 +62,9 @@
 
             <div class='shepherd-badge' x-show='$store.chatShepherdStore.effectLabel().length > 0'>
             <span x-text='$store.chatShepherdStore.effectLabel()'></span>
+            </div>
+            <div class='shepherd-badge' :class="{'shepherd-throttle-capped': $store.chatShepherdStore.throttleCapped()}" x-show='$store.chatShepherdStore.throttleLabel().length > 0'>
+             <span x-text='$store.chatShepherdStore.throttleLabel()'></span>
             </div>
             <template x-if="$store.chatShepherdStore.data.chats.length === 0">
               <div class="shepherd-empty">No chats being monitored. Chats will appear here when the agent runs.</div>

@@ -938,6 +938,8 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
                     'timestamp': now_iso,
                 })
 
+    pre_drain_nudged = summary['nudged']
+    nudge_queue_len = len(nudge_queue)
     if nudge_queue and max_nudges_per_tick > 0:
         nudge_queue.sort(key=lambda item: item[0], reverse=True)
         for minutes_idle, chat_id, ctx, entry, now_iso in nudge_queue:
@@ -1087,5 +1089,32 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             'timestamp': datetime.now(timezone.utc).isoformat(),
         })
 
+    # v1.12.0 (P5): persist the per-tick throttle snapshot for the
+    # dashboard - delivered vs budget this tick, whether the stalled
+    # queue was truncated by the budget (storm visibility), plus resume
+    # and wedge drain usage. Unknown top-level keys round-trip through
+    # load/save, so no state.py schema change is needed.
+    _stalled_delivered = summary['nudged'] - pre_drain_nudged
+    state['throttle'] = {
+     'nudges_this_tick': summary['nudges_this_tick'],
+     'budget': max_nudges_per_tick,
+     'capped': bool(
+      nudge_queue_len
+      and (
+       max_nudges_per_tick <= 0
+       or (
+        summary['nudges_this_tick'] >= max_nudges_per_tick
+        and nudge_queue_len > _stalled_delivered
+       )
+      )
+     ),
+     'stalled_queued': nudge_queue_len,
+     'stalled_nudged': _stalled_delivered,
+     'resume_nudged': summary['resumed'],
+     'wedge_nudged': summary['wedge_nudged'],
+     'wedge_restarts': summary['wedge_restarts'],
+     'wedge_budget': max(1, max_nudges_per_tick),
+     'timestamp': datetime.now(timezone.utc).isoformat(),
+    }
     state_mod.save_state(state)
     return summary

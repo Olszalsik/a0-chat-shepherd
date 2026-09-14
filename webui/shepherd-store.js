@@ -179,6 +179,17 @@ export const store = createStore("chatShepherdStore", {
   return '🎯 ' + e.hit_rate + '% nudge hit-rate (' + e.effective + '/' + e.sent + ')';
   },
   
+  throttleLabel() {
+   const t = (this.data && this.data.throttle) || null;
+   if (!t || typeof t.nudges_this_tick === 'undefined') return '';
+   const base = '⚡ ' + t.nudges_this_tick + '/' + t.budget + ' nudges this tick';
+   return t.capped ? base + ' — capped' : base;
+   },
+  throttleCapped() {
+   const t = (this.data && this.data.throttle) || null;
+   return !!(t && t.capped);
+   },
+
   iconFor(status) {
     const custom = (this.data && this.data.config && this.data.config.icons) || {};
     const fallback = DEFAULT_ICONS[status];
