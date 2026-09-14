@@ -69,6 +69,14 @@ def _set_status(result: str, detail: str = '', reloaded=None) -> None:
     snap['last_detail'] = detail
     snap['reloaded'] = list(reloaded or [])
     _STATUS = snap
+    if result in ('reloaded', 'failed', 'compile_error', 'primed'):
+        # v1.9.0: mirror notable reload events into the plugin debug log
+        try:
+            mon = sys.modules.get('usr.plugins.chat_shepherd.helpers.monitor')
+            if mon is not None and hasattr(mon, '_debug_log'):
+                mon._debug_log('hot_reload', result + ' ' + (detail or '') + ' [' + ', '.join(reloaded or []) + ']')
+        except Exception:
+            pass
 
 
 def _snapshot(mod) -> dict:
