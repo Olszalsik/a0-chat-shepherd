@@ -780,6 +780,47 @@ def main():
         print('TEST12E_REASON_TAGS_OK')
 
 
+        # ============ TEST 13 - config integrity (v1.11.0 P5/P6.1) ============
+        from usr.plugins.chat_shepherd import hooks as cs_hooks
+        from usr.plugins.chat_shepherd.helpers import config_defaults as cfg_defaults
+
+        # --- 13a: partial sanitize leaves unmentioned keys alone (P6.1a guard);
+        # bool strings coerce properly; unknown override keys are dropped
+        base13 = dict(cfg_defaults.DEFAULTS)
+        out13 = cfg_defaults.apply_overrides(
+            base13,
+            {'stall_minutes': 7, 'wedge_liveness_probe': 'false', 'not_a_key': 'x'},
+        )
+        assert out13['stall_minutes'] == 7, out13
+        assert out13['wedge_liveness_probe'] is False, out13
+        assert out13['goal_gate_enabled'] is True, ('P6.1a regression: partial save dropped goal_gate_enabled', out13)
+        assert out13['hot_reload_enabled'] is True, out13
+        assert out13['notify_after_minutes'] == 30, out13
+        assert 'not_a_key' not in out13, out13
+        print('TEST13A_PARTIAL_SAVE_OK')
+
+        # --- 13b: get_plugin_config hook merges defaults UNDER config.json,
+        # preserves unknown keys and merges icons per status
+        disk13 = {'enabled': False, 'future_key': 1, 'icons': {'running': 'X'}}
+        merged13 = cs_hooks.get_plugin_config(default=disk13)
+        assert merged13['enabled'] is False, merged13
+        assert merged13['stall_minutes'] == 5, merged13
+        assert merged13['future_key'] == 1, ('unknown key erased', merged13)
+        assert merged13['icons']['running'] == 'X', merged13['icons']
+        assert merged13['icons']['paused'] == cfg_defaults.DEFAULTS['icons']['paused'], merged13['icons']
+        assert merged13['icons']['interrupted'] == cfg_defaults.DEFAULTS['icons']['interrupted'], merged13['icons']
+        print('TEST13B_HOOK_MERGE_OK')
+
+        # --- 13c: save hook preserves unknown disk keys on save (P6.1b)
+        orig_read = cs_hooks._read_persisted
+        cs_hooks._read_persisted = lambda project_name='', agent_profile='': {'legacy_key': 'v', 'stall_minutes': 5}
+        try:
+            saved13 = cs_hooks.save_plugin_config(settings={'stall_minutes': 7})
+        finally:
+            cs_hooks._read_persisted = orig_read
+        assert saved13['stall_minutes'] == 7, saved13
+        assert saved13['legacy_key'] == 'v', ('P6.1b regression: unknown key erased on save', saved13)
+        print('TEST13C_SAVE_PRESERVE_OK')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file
