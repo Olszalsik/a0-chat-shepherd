@@ -78,3 +78,6 @@ WEDGE_NUDGE_TEXT = (
 WEDGE_NUDGE_AFTER_MIN = 10
 WEDGE_MAX_REMEDIATIONS = 2
 WEDGE_REMEDIATION_COOLDOWN_MIN = 10
+ # v1.10.0: liveness probe classifies wedges (hung call vs spinning
+ # dead loop) via the log mutation counter; off = legacy ladder.
+WEDGE_LIVENESS_PROBE = True

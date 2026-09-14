@@ -691,6 +691,95 @@ def main():
             sys.modules.pop(mod_name, None)
             hotreload._fail_until = 0.0
 
+
+        # ============ TEST 12: wedge liveness probe (v1.10.0) ============
+        probe_cfg = dict(wedge_cfg, wedge_liveness_probe=True)
+
+        def liveness_state(frozen_ago_min, wedge_count=0, wedge_ago_min=0,
+                           prev_updates=-1):
+            d = wedge_state(frozen_ago_min, wedge_count, wedge_ago_min)
+            d[FAKE_CHAT_A]['last_updates_len'] = prev_updates
+            return d
+
+        def live_ctx(cid, n_updates):
+            ctx = FakeCtx(cid, ['user', 'tool'], idle_minutes=30, running=True)
+            ctx.log.updates = list(range(n_updates))
+            return ctx
+
+        # --- 12a: spinning (entries frozen, mutations advancing) -> no
+        # Tier-1 continue (it can never drain a dead loop), budget intact
+        write_state(fresh_tick, chats=liveness_state(12, prev_updates=3))
+        ctx_sp = live_ctx(FAKE_CHAT_A, 4)
+        FakeAgentContext._all = [ctx_sp]
+        s12a = monitor.tick(probe_cfg)
+        assert s12a['wedged'] == 1 and s12a['wedge_spinning'] == 1, s12a
+        assert s12a['wedge_nudged'] == 0 and s12a['wedge_restarts'] == 0, s12a
+        assert len(ctx_sp.communicated) == 0, 'spinning wedge got a continue nudge'
+        st12a = read_state()
+        ea12a = st12a['chats'][FAKE_CHAT_A]
+        assert ea12a['liveness'] == 'spinning', ea12a
+        assert ea12a['wedge_nudge_count'] == 0, ('budget burned on a dead loop', ea12a)
+        assert 'spinning dead loop' in ea12a['last_classification'], ea12a
+        print('TEST12A_SPIN_SKIP_OK')
+
+        # --- 12b: hung (entries + mutations both frozen) -> classic Tier 1
+        write_state(fresh_tick, chats=liveness_state(12, prev_updates=3))
+        ctx_h = live_ctx(FAKE_CHAT_A, 3)
+        FakeAgentContext._all = [ctx_h]
+        s12b = monitor.tick(probe_cfg)
+        assert s12b['wedged'] == 1 and s12b['wedge_spinning'] == 0, s12b
+        assert s12b['wedge_nudged'] == 1, s12b
+        assert len(ctx_h.communicated) == 1, ctx_h.communicated
+        st12b = read_state()
+        ea12b = st12b['chats'][FAKE_CHAT_A]
+        assert ea12b['liveness'] == 'hung', ea12b
+        assert ea12b['wedge_nudge_count'] == 1, ea12b
+        print('TEST12B_HUNG_CLASSIC_OK')
+
+        # --- 12c: spinning + soft_restart on -> immediate kill, no Tier-1
+        probe_sr_cfg = dict(probe_cfg, wedge_soft_restart=True)
+        write_state(fresh_tick, chats=liveness_state(12, prev_updates=3))
+        ctx_k = live_ctx(FAKE_CHAT_A, 4)
+        FakeAgentContext._all = [ctx_k]
+        s12c = monitor.tick(probe_sr_cfg)
+        assert s12c['wedge_restarts'] == 1 and s12c['wedge_nudged'] == 0, s12c
+        assert ctx_k.nudge_calls == 1, ctx_k.nudge_calls
+        st12c = read_state()
+        assert any(
+            h.get('action') == 'wedge_soft_restart'
+            and h.get('liveness') == 'spinning'
+            for h in st12c['history']
+        ), st12c['history']
+        print('TEST12C_SPIN_KILL_OK')
+
+        # --- 12d: probe off -> legacy ladder even with mutations advancing
+        legacy_cfg = dict(wedge_cfg, wedge_liveness_probe=False)
+        write_state(fresh_tick, chats=liveness_state(12, prev_updates=3))
+        ctx_l = live_ctx(FAKE_CHAT_A, 4)
+        FakeAgentContext._all = [ctx_l]
+        s12d = monitor.tick(legacy_cfg)
+        assert s12d['wedge_nudged'] == 1 and s12d['wedge_spinning'] == 0, s12d
+        assert len(ctx_l.communicated) == 1, 'legacy ladder broken'
+        st12d = read_state()
+        assert st12d['chats'][FAKE_CHAT_A]['liveness'] == '', st12d['chats'][FAKE_CHAT_A]
+        print('TEST12D_PROBE_OFF_LEGACY_OK')
+
+        # --- 12e: classify_chat tags the reason from the stamped verdict
+        status12, reason12 = monitor.classify_chat(
+            FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30, running=True),
+            FAKE_CHAT_A, probe_cfg, {'liveness': 'spinning'}, 12.0,
+        )
+        assert status12 == constants.STATUS_INTERVENTION, (status12, reason12)
+        assert 'spinning dead loop' in reason12, reason12
+        status12h, reason12h = monitor.classify_chat(
+            FakeCtx(FAKE_CHAT_B, ['user', 'tool'], idle_minutes=30, running=True),
+            FAKE_CHAT_B, probe_cfg, {'liveness': 'hung'}, 12.0,
+        )
+        assert status12h == constants.STATUS_INTERVENTION, (status12h, reason12h)
+        assert 'hung call' in reason12h, reason12h
+        print('TEST12E_REASON_TAGS_OK')
+
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

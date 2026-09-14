@@ -40,6 +40,7 @@ _DEFAULTS: dict[str, Any] = {
     "wedge_max_remediations": 2,
     "wedge_remediation_cooldown_minutes": 10,
     "wedge_soft_restart": False,
+    "wedge_liveness_probe": True,
     "webhook_url": "",
     "webhook_allow_private": False,
     "telegram_bot_token": "",
@@ -167,6 +168,8 @@ class Config(ApiHandler):
             current["wedge_soft_restart"] = _coerce_bool(
                 readable["wedge_soft_restart"]
             )
+        if "wedge_liveness_probe" in readable:
+            current["wedge_liveness_probe"] = bool(readable["wedge_liveness_probe"])
         if "stall_minutes" in readable:
             current["stall_minutes"] = _coerce_int(
                 readable["stall_minutes"], current["stall_minutes"], 1, 240

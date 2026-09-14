@@ -147,6 +147,7 @@ class Status(ApiHandler):
             c['wedge_nudge_count'] = src.get('wedge_nudge_count', 0)
             c['wedge_nudges_sent'] = src.get('wedge_nudges_sent', 0)
             c['wedge_nudges_effective'] = src.get('wedge_nudges_effective', 0)
+            c['liveness'] = src.get('liveness', '')
         _total_sent = sum(c['nudges_sent'] for c in chat_list)
         _total_eff = sum(c['nudges_effective'] for c in chat_list)
         effectiveness = {
@@ -180,6 +181,7 @@ class Status(ApiHandler):
                     'wedge_remediation_cooldown_minutes', 10
                 ),
                 'wedge_soft_restart': bool(cfg.get('wedge_soft_restart', False)),
+                'wedge_liveness_probe': bool(cfg.get('wedge_liveness_probe', True)),
                 'icons': icons,
                 'poll_seconds': poll_seconds,
                 'hot_reload_enabled': bool(cfg.get('hot_reload_enabled', True)),

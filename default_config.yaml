@@ -34,6 +34,9 @@ wedge_nudge_after_minutes: 10
 wedge_max_remediations: 2
 wedge_remediation_cooldown_minutes: 10
 wedge_soft_restart: false
+# v1.10.0 liveness probe: classify wedges via the log mutation counter
+# (hung call vs spinning dead loop). Off restores the legacy ladder.
+wedge_liveness_probe: true
 # R3 external alert channels (optional, off by default). webhook_url
 # receives a JSON POST per alert; Telegram uses a bot token + chat id.
 # Private/LAN webhook targets require webhook_allow_private: true.

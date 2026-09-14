@@ -87,6 +87,9 @@ def get_chat(state: dict, chat_id: str) -> dict[str, Any]:
             # P3 wedge detection: log length at last tick + when it froze.
             'last_log_len': -1,
             'log_len_since': '',
+ # v1.10.0 liveness probe: log mutation counter + wedge verdict.
+ 'last_updates_len': -1,
+ 'liveness': '',
             # R2 nudge-effectiveness counters (lifetime per chat).
             'nudges_sent': 0,
             'nudges_effective': 0,

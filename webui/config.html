@@ -149,6 +149,10 @@ Chat Shepherd
 <input type="checkbox" x-model="cfg.wedge_soft_restart" />
 <strong>Kill the hung task if auto-continue fails</strong>
 </label>
+<label style='display: block; margin: 4px 0;'>
+<input type='checkbox' x-model='cfg.wedge_liveness_probe' />
+<strong>Classify wedges: hung call vs spinning dead loop</strong>
+</label>
 <small class="hint">A running chat that stops producing log output is "wedged". After the grace period it gets an automatic "continue" (the same nudge that fixes it manually). When remediations are exhausted and this toggle is on, the final attempt kills the hung task and re-sends the framework nudge — this loses the hung call's partial result. Max remediations 0 disables wedge auto-recovery.</small>
 </div>
 
@@ -260,6 +264,7 @@ wedge_nudge_after_minutes: 10,
 wedge_max_remediations: 2,
 wedge_remediation_cooldown_minutes: 10,
 wedge_soft_restart: false,
+wedge_liveness_probe: true,
 webhook_url: '',
 webhook_allow_private: false,
 telegram_bot_token: '',
@@ -350,6 +355,7 @@ wedge_nudge_after_minutes: this.cfg.wedge_nudge_after_minutes,
 wedge_max_remediations: this.cfg.wedge_max_remediations,
 wedge_remediation_cooldown_minutes: this.cfg.wedge_remediation_cooldown_minutes,
 wedge_soft_restart: this.cfg.wedge_soft_restart,
+wedge_liveness_probe: !!this.cfg.wedge_liveness_probe,
 webhook_url: (this.cfg.webhook_url || '').trim(),
 webhook_allow_private: !!this.cfg.webhook_allow_private,
 telegram_bot_token: (this.cfg.telegram_bot_token || '').trim(),

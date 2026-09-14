@@ -25,6 +25,7 @@ from usr.plugins.chat_shepherd.helpers.constants import (
     WEDGE_NUDGE_TEXT,
     WEDGE_NUDGE_AFTER_MIN,
     WEDGE_MAX_REMEDIATIONS,
+    WEDGE_LIVENESS_PROBE,
     WEDGE_REMEDIATION_COOLDOWN_MIN,
     PLUGIN_NAME,
     MAX_TRACKED_CHATS,
@@ -115,6 +116,16 @@ def _log_len(context: AgentContext) -> int:
     try:
         with context.log._lock:
             return len(context.log.logs)
+    except Exception:
+        return -1
+
+def _log_updates(context: AgentContext) -> int:
+    # v1.10.0 liveness probe: mutation counter of the log next to the
+    # entry count. Entries frozen + mutations advancing = spinning
+    # dead loop; both frozen = hung call. -1 = unknown (legacy path).
+    try:
+        with context.log._lock:
+            return len(context.log.updates)
     except Exception:
         return -1
 
@@ -424,6 +435,13 @@ def classify_chat(
             reason = (
                 f'Agent appears wedged: running but log frozen for {frozen_minutes:.0f}m'
             )
+            # v1.10.0 liveness probe: refine the classification when the
+            # probe has a verdict (stamped by tick(); empty = unknown).
+            live = str(prev_entry.get('liveness', ''))
+            if live == 'spinning':
+                reason += ' (liveness: spinning dead loop, only a task kill drains it)'
+            elif live == 'hung':
+                reason += ' (liveness: hung call)'
             wedge_count = int(prev_entry.get('wedge_nudge_count', 0) or 0)
             max_remediations = max(0, min(5, int(cfg.get(
                 'wedge_max_remediations', WEDGE_MAX_REMEDIATIONS
@@ -646,6 +664,9 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
         'wedge_remediation_cooldown_minutes', WEDGE_REMEDIATION_COOLDOWN_MIN
     ))
     wedge_soft_restart = bool(cfg.get('wedge_soft_restart', False))
+    # v1.10.0 liveness probe: classify wedges as hung (classic) vs
+    # spinning dead loop via the log mutation counter. Off = legacy.
+    wedge_probe = bool(cfg.get('wedge_liveness_probe', WEDGE_LIVENESS_PROBE))
 
     # P1: only real UI chats are tracked. Contexts without a persisted
     # usr/chats/<id> directory (ad-hoc message_async ids) are invisible here.
@@ -673,6 +694,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
         'wedged': 0,
         'wedge_nudged': 0,
         'wedge_restarts': 0,
+        'wedge_spinning': 0,
         'error': 0,
         'awaiting': 0,
         'idle': 0,
@@ -703,7 +725,13 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
         # frozen clock; any growth resets it.
         cur_log_len = _log_len(ctx)
         prev_log_len = prev.get('last_log_len', -1)
+        # v1.10.0 liveness probe: read the log mutation counter next
+        # to the entry count. Entries frozen + mutations advancing =
+        # spinning dead loop; both frozen = hung call. O(1) reads
+        # under the same lock; unknown counter = legacy behavior.
+        cur_updates = _log_updates(ctx) if wedge_probe else -1
         frozen_minutes = 0.0
+        liveness = ''
         if (
             ctx.is_running()
             and cur_log_len >= 0
@@ -716,9 +744,21 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
                 frozen_minutes = 0.0
             else:
                 frozen_minutes = _minutes_since(frozen_since)
+                prev_updates = prev.get('last_updates_len', -1)
+                try:
+                    prev_updates = int(prev_updates)
+                except (TypeError, ValueError):
+                    prev_updates = -1
+                if cur_updates >= 0 and prev_updates >= 0:
+                    if cur_updates > prev_updates:
+                        liveness = 'spinning'
+                    elif cur_updates == prev_updates:
+                        liveness = 'hung'
+                prev['liveness'] = liveness
         else:
             prev['log_len_since'] = ''
-            # v1.2.0: the log grew again (or the task stopped) — a pending
+            prev['liveness'] = ''
+            # v1.2.0: the log grew again (or the task stopped) - a pending
             # wedge remediation either worked or is moot; credit it if recent.
             _record_wedge_outcome(state, chat_id, now_iso)
 
@@ -753,6 +793,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             last_classification=reason,
             last_log_type=_last_log_type(ctx) if ctx else '',
             last_log_len=cur_log_len,
+            last_updates_len=cur_updates,
             last_ticked=now_iso,
         )
         if new_status != STATUS_INTERVENTION:
@@ -800,6 +841,8 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             summary['intervention'] += 1
             if 'log frozen' in reason:
                 summary['wedged'] += 1
+                if prev.get('liveness', '') == 'spinning':
+                    summary['wedge_spinning'] += 1
                 # v1.2.0 remediation ladder: USER chats frozen past the grace
                 # period get an automatic "continue" (Tier 1), with the
                 # framework's ctx.nudge() (kill + fw.msg_nudge.md) available
@@ -932,6 +975,35 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
             prev = state_mod.get_chat(state, chat_id)
             attempt = prev.get('wedge_nudge_count', 0) + 1
             final_attempt = attempt >= wedge_max_remediations
+            # v1.10.0 liveness probe: a spinning dead loop never reaches a
+            # safe point, so a continue intervention can never drain it and
+            # would only burn budget. With the kill toggle on, go straight
+            # to the task kill; without it the chat stays intervention for
+            # a human without spending the episode budget.
+            if prev.get('liveness', '') == 'spinning':
+                if wedge_soft_restart and wedge_max_remediations > 0:
+                    try:
+                        ctx.nudge()
+                        summary['wedge_restarts'] += 1
+                        entry['wedge_nudge_count'] = attempt
+                        entry['wedge_nudges_sent'] = prev.get('wedge_nudges_sent', 0) + 1
+                        entry['last_wedge_nudge_at'] = now_iso
+                        entry['status'] = STATUS_INTERVENTION
+                        entry['last_classification'] = (
+                            f'Wedged (spinning dead loop): killed task'
+                            f' (attempt {attempt}/{wedge_max_remediations})'
+                        )
+                        state_mod.append_history(state, {
+                            'chat_id': chat_id,
+                            'action': 'wedge_soft_restart',
+                            'wedge_nudge_count': attempt,
+                            'liveness': 'spinning',
+                            'frozen_minutes': round(frozen_minutes, 1),
+                            'timestamp': now_iso,
+                        })
+                    except Exception as e:
+                        _debug_log('wedge_restart_fail', chat_id + ' ' + repr(e))
+                continue
             action = 'wedge_auto_continue'
             if final_attempt and wedge_soft_restart:
                 # Tier 2: kill_process() is a non-blocking future.cancel()
