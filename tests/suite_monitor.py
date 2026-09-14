@@ -5,8 +5,15 @@ import threading
 import types
 from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, '/a0')
-os.chdir('/a0')
+# P6.2: portable bootstrap - derive the repo root from __file__
+# (tests/ lives at <root>/usr/plugins/chat_shepherd/tests/) instead of
+# hardcoding /a0, so the suite also runs off-Docker (Windows-verified).
+_REPO_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..',
+))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+os.chdir(_REPO_ROOT)
 
 from usr.plugins.chat_shepherd.helpers import constants, monitor
 from usr.plugins.chat_shepherd.helpers import state as state_mod
