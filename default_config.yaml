@@ -37,6 +37,16 @@ wedge_soft_restart: false
 # v1.10.0 liveness probe: classify wedges via the log mutation counter
 # (hung call vs spinning dead loop). Off restores the legacy ladder.
 wedge_liveness_probe: true
+# R4 adaptive thresholds: opt-in feedback loop. When enabled, accumulated
+# nudge/wedge remediation outcomes tune the three timing thresholds
+# (nudge_cooldown_minutes, wedge_nudge_after_minutes,
+# wedge_remediation_cooldown_minutes) as a runtime-only overlay: learned
+# values live in plugin state, the persisted config is never overwritten,
+# out-of-band configured values are pinned, Tier-2 and budgets untouched.
+adaptive_thresholds: false
+adaptive_interval_minutes: 60
+adaptive_min_samples: 10
+adaptive_step_pct: 10
 # R3 external alert channels (optional, off by default). webhook_url
 # receives a JSON POST per alert; Telegram uses a bot token + chat id.
 # Private/LAN webhook targets require webhook_allow_private: true.

@@ -157,6 +157,29 @@ Chat Shepherd
 </div>
 
 <div class='cs-card'>
+<h4>Adaptive thresholds (experimental)</h4>
+<label style='display: block; margin: 4px 0;'>
+<input type='checkbox' x-model='cfg.adaptive_thresholds' />
+<strong>Learn timing thresholds from nudge / wedge outcomes</strong>
+</label>
+<div class="cs-row">
+<div>
+<label>Evaluation interval (minutes)</label>
+<input type="number" min="15" max="1440" x-model.number="cfg.adaptive_interval_minutes" />
+</div>
+<div>
+<label>Minimum samples per window</label>
+<input type="number" min="5" max="100" x-model.number="cfg.adaptive_min_samples" />
+</div>
+<div>
+<label>Max step per evaluation (% of value)</label>
+<input type="number" min="5" max="25" x-model.number="cfg.adaptive_step_pct" />
+</div>
+</div>
+<small class='hint'>Opt-in: with enough fresh outcomes, nudge cooldown and wedge timing relax when remediations mostly work (≥70%) or back off when they mostly fail (<40%). Runtime-only overlay — your configured values are never overwritten; manual changes re-seed the baseline; learned values live in the plugin state and never leave the safety band.</small>
+</div>
+
+<div class='cs-card'>
 <h4>External alerts (optional)</h4>
 <input type='text' x-model='cfg.webhook_url' placeholder='https://hooks.example.com/...' style='width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:inherit;font-size:12px;box-sizing:border-box;' />
 <label style='display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12px;'>
@@ -265,6 +288,10 @@ wedge_max_remediations: 2,
 wedge_remediation_cooldown_minutes: 10,
 wedge_soft_restart: false,
 wedge_liveness_probe: true,
+adaptive_thresholds: false,
+adaptive_interval_minutes: 60,
+adaptive_min_samples: 10,
+adaptive_step_pct: 10,
 webhook_url: '',
 webhook_allow_private: false,
 telegram_bot_token: '',
@@ -292,13 +319,10 @@ await this.refresh();
 },
 
 async api(path, body) {
-const r = await fetch('/api/plugins/chat_shepherd' + path, {
-method: 'POST',
-headers: { 'content-type': 'application/json' },
-body: JSON.stringify(body || {}),
-});
-const txt = await r.text();
-try { return JSON.parse(txt); } catch (e) { return { ok: false, error: txt }; }
+// P6.3: framework callJsonApi via lazy dynamic import (inline script cannot top-level import);
+// CSRF token, Origin and credentials handled centrally.
+const { callJsonApi } = await import('/js/api.js');
+try { return await callJsonApi("/api/plugins/chat_shepherd" + path, body || {}); } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
 },
 
 setMsg(msg, ok) {
@@ -356,6 +380,10 @@ wedge_max_remediations: this.cfg.wedge_max_remediations,
 wedge_remediation_cooldown_minutes: this.cfg.wedge_remediation_cooldown_minutes,
 wedge_soft_restart: this.cfg.wedge_soft_restart,
 wedge_liveness_probe: !!this.cfg.wedge_liveness_probe,
+adaptive_thresholds: !!this.cfg.adaptive_thresholds,
+adaptive_interval_minutes: Number(this.cfg.adaptive_interval_minutes) || 60,
+adaptive_min_samples: Number(this.cfg.adaptive_min_samples) || 10,
+adaptive_step_pct: Number(this.cfg.adaptive_step_pct) || 10,
 webhook_url: (this.cfg.webhook_url || '').trim(),
 webhook_allow_private: !!this.cfg.webhook_allow_private,
 telegram_bot_token: (this.cfg.telegram_bot_token || '').trim(),

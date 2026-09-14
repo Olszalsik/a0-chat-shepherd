@@ -32,6 +32,10 @@ DEFAULTS: dict[str, Any] = {
     "wedge_remediation_cooldown_minutes": 10,
     "wedge_soft_restart": False,
     "wedge_liveness_probe": True,
+    "adaptive_thresholds": False,
+    "adaptive_interval_minutes": 60,
+    "adaptive_min_samples": 10,
+    "adaptive_step_pct": 10,
     "webhook_url": "",
     "webhook_allow_private": False,
     "telegram_bot_token": "",
@@ -139,6 +143,29 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
         current["wedge_soft_restart"] = coerce_bool(readable["wedge_soft_restart"])
     if "wedge_liveness_probe" in readable:
         current["wedge_liveness_probe"] = coerce_bool(readable["wedge_liveness_probe"])
+    if "adaptive_thresholds" in readable:
+        current["adaptive_thresholds"] = coerce_bool(readable["adaptive_thresholds"])
+    if "adaptive_interval_minutes" in readable:
+        current["adaptive_interval_minutes"] = coerce_int(
+            readable["adaptive_interval_minutes"],
+            current["adaptive_interval_minutes"],
+            15,
+            1440,
+        )
+    if "adaptive_min_samples" in readable:
+        current["adaptive_min_samples"] = coerce_int(
+            readable["adaptive_min_samples"],
+            current["adaptive_min_samples"],
+            5,
+            100,
+        )
+    if "adaptive_step_pct" in readable:
+        current["adaptive_step_pct"] = coerce_int(
+            readable["adaptive_step_pct"],
+            current["adaptive_step_pct"],
+            5,
+            25,
+        )
     if "stall_minutes" in readable:
         current["stall_minutes"] = coerce_int(
             readable["stall_minutes"], current["stall_minutes"], 1, 240

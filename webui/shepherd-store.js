@@ -1,4 +1,5 @@
 import { createStore } from "/js/AlpineStore.js";
+import { callJsonApi } from "/js/api.js";
 
 const API = "/api/plugins/chat_shepherd";
 
@@ -29,17 +30,12 @@ const COLORS = {
 };
 
 async function callApi(path, body) {
-  const resp = await fetch(API + path, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body || {}),
-  });
-  const txt = await resp.text();
-  try {
-    return JSON.parse(txt);
-  } catch (e) {
-    return { success: false, ok: false, error: txt };
-  }
+ // P6.3: framework callJsonApi - CSRF token, Origin and credentials handled centrally.
+ try {
+ return await callJsonApi("/api/plugins/chat_shepherd" + path, body || {});
+ } catch (e) {
+ return { success: false, ok: false, error: String((e && e.message) || e) };
+ }
 }
 
 export const store = createStore("chatShepherdStore", {

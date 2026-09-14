@@ -5,10 +5,11 @@ from typing import Any
 from helpers.api import ApiHandler, Request, Response
 from helpers import plugins
 
-from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME
+from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN, PLUGIN_NAME
 from usr.plugins.chat_shepherd.helpers.state import load_state
 from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers import hotreload
+from usr.plugins.chat_shepherd.helpers import adaptive
 
 DEFAULT_ICONS: dict[str, str] = {
     'running': '🏃',
@@ -38,6 +39,21 @@ def _resolve_icons(cfg: dict[str, Any]) -> dict[str, str]:
             if key in icons:
                 icons[key] = str(value)[:16]
     return icons
+
+
+def _is_tracked_chat(chat_id: str) -> bool:
+    # P6.4: the exact predicate tick() applies - framework id pattern
+    # (8 alphanumerics) plus a persisted usr/chats/<id> transcript dir.
+    if not CHAT_ID_PATTERN.match(chat_id or ''):
+        return False
+    try:
+        return monitor._has_chat_dir(chat_id)
+    except Exception:
+        return False
+
+
+def _tracked_contexts(raw: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {cid: info for cid, info in raw.items() if _is_tracked_chat(cid)}
 
 
 def _serialize_context(ctx: Any) -> dict[str, Any]:
@@ -164,6 +180,23 @@ class Status(ApiHandler):
             'wedge_sent': sum(c['wedge_nudges_sent'] for c in chat_list),
             'wedge_effective': sum(c['wedge_nudges_effective'] for c in chat_list),
         }
+        # R4: adaptive-threshold learning reflection (learned overlay).
+        try:
+         _ad = state.get('adaptive')
+         _ad = _ad if isinstance(_ad, dict) else {}
+         _learned = _ad.get('learned')
+         if cfg.get('adaptive_thresholds', False):
+          _vals = adaptive.effective_values(cfg, _learned)
+         else:
+          _vals = adaptive.configured_values(cfg)
+         effectiveness['adaptive'] = {
+          'enabled': bool(cfg.get('adaptive_thresholds', False)),
+          'values': _vals,
+          'last_eval': _ad.get('last_eval', ''),
+          'window_start': _ad.get('window_start', ''),
+         }
+        except Exception:
+         pass
         counts: dict[str, int] = {}
         for c in chat_list:
             counts[c['status']] = counts.get(c['status'], 0) + 1
@@ -211,6 +244,10 @@ class Status(ApiHandler):
                 'icons': icons,
                 'poll_seconds': poll_seconds,
                 'hot_reload_enabled': bool(cfg.get('hot_reload_enabled', True)),
+                'adaptive_thresholds': bool(cfg.get('adaptive_thresholds', False)),
+                'adaptive_interval_minutes': cfg.get('adaptive_interval_minutes', 60),
+                'adaptive_min_samples': cfg.get('adaptive_min_samples', 10),
+                'adaptive_step_pct': cfg.get('adaptive_step_pct', 10),
             },
             'last_tick': state.get('last_tick', ''),
     'hot_reload': hotreload.status(),

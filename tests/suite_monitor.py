@@ -866,6 +866,184 @@ def main():
         assert _th14b['stalled_nudged'] == 1, _th14b
         assert _th14b['capped'] is True, _th14b
         print('TEST14B_THROTTLE_CAPPED_OK')
+
+        # ============ TEST 15 - adaptive thresholds (v1.12.0 R4) ============
+        from usr.plugins.chat_shepherd.helpers import adaptive as adaptive_mod
+
+        def _adaptive_cfg(**over):
+            c = {
+                'adaptive_thresholds': True,
+                'adaptive_interval_minutes': 60,
+                'adaptive_min_samples': 10,
+                'adaptive_step_pct': 10,
+                'nudge_cooldown_minutes': 10,
+                'wedge_nudge_after_minutes': 10,
+                'wedge_remediation_cooldown_minutes': 10,
+            }
+            c.update(over)
+            return c
+
+        def _journal_actions(action, count, minutes_ago=0):
+            ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+            for _ in range(count):
+                state_mod.append_journal({
+                    'chat_id': FAKE_CHAT_A,
+                    'action': action,
+                    'timestamp': ts,
+                })
+
+        # --- 15a: off by default - evaluate() inert, tick tags 'off'
+        write_state(now_iso)
+        r15a = adaptive_mod.evaluate({}, {'enabled': True})
+        assert r15a['enabled'] is False and r15a.get('reason') == 'disabled', r15a
+        FakeAgentContext._all = [FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)]
+        cfg15a = dict(cfg)
+        cfg15a['adaptive_thresholds'] = False
+        s15a = monitor.tick(cfg15a)
+        assert s15a['adaptive'] == 'off', s15a
+        print('TEST15A_DISABLED_OK')
+
+        # --- 15b: first run seeds the baseline from configured values
+        write_state(now_iso)
+        st15b = {}
+        cfg15b = _adaptive_cfg()
+        r15b = adaptive_mod.evaluate(st15b, cfg15b)
+        assert r15b['reason'] == 'reseeded', r15b
+        assert st15b['adaptive']['learned']['nudge_cooldown_minutes'] == 10.0, st15b
+        assert st15b['adaptive']['learned']['wedge_nudge_after_minutes'] == 10.0, st15b
+        assert st15b['adaptive']['last_eval'] == '', st15b
+        print('TEST15B_SEED_OK')
+
+        # --- 15c: journal window counts only fresh outcomes; relax moves
+        # the wedge knobs and the nudge family independently
+        write_state(now_iso)
+        st15c = {}
+        cfg15c = _adaptive_cfg()
+        assert adaptive_mod.evaluate(st15c, cfg15c)['reason'] == 'reseeded'
+        _journal_actions('wedge_auto_continue', 5, minutes_ago=180)  # stale
+        _journal_actions('wedge_auto_continue', 12)
+        _journal_actions('wedge_nudge_effective', 9)
+        _journal_actions('auto_nudge', 10)
+        _journal_actions('nudge_effective', 8)
+        rates15 = adaptive_mod.window_rates(st15c['adaptive']['window_start'])
+        assert rates15['wedge'] == {'sent': 12, 'effective': 9}, rates15
+        assert rates15['nudge'] == {'sent': 10, 'effective': 8}, rates15
+        r15c = adaptive_mod.evaluate(st15c, cfg15c)
+        assert r15c['evaluated'] is True and r15c['changed'] is True, r15c
+        d15c = r15c['decisions']
+        assert d15c['wedge']['reason'] == 'relax' and d15c['wedge']['rate'] == 0.75, d15c
+        assert d15c['nudge']['reason'] == 'relax' and d15c['nudge']['rate'] == 0.8, d15c
+        learned15 = st15c['adaptive']['learned']
+        assert learned15['wedge_nudge_after_minutes'] == 9.0, learned15
+        assert learned15['wedge_remediation_cooldown_minutes'] == 9.0, learned15
+        assert learned15['nudge_cooldown_minutes'] == 9.0, learned15
+        assert any(h.get('action') == 'adaptive_adjusted' for h in st15c['history']), st15c['history']
+        r15c2 = adaptive_mod.evaluate(st15c, cfg15c)
+        assert r15c2['reason'] == 'not_due', r15c2
+        print('TEST15C_WINDOW_RELAX_OK')
+
+        # --- 15d: tick() applies the learned overlay - a chat frozen for
+        # 9.5m wedges at the learned 9.0 grace (configured 10 would not fire)
+        write_state(now_iso, chats={
+            FAKE_CHAT_A: {
+                'status': 'running', 'nudge_count': 0, 'last_nudge_at': '',
+                'last_log_len': 2,
+                'log_len_since': (
+                    datetime.now(timezone.utc) - timedelta(minutes=9.5)
+                ).isoformat(),
+                'last_updates_len': -1, 'liveness': '',
+                'wedge_nudge_count': 0, 'wedge_nudges_sent': 0,
+                'wedge_nudges_effective': 0, 'last_wedge_nudge_at': '',
+            },
+        })
+        st15d = json.loads(files.read_file(files.get_abs_path(TEST_STATE)))
+        st15d['adaptive'] = {
+            'seed': {
+                'nudge_cooldown_minutes': 10.0,
+                'wedge_nudge_after_minutes': 10.0,
+                'wedge_remediation_cooldown_minutes': 10.0,
+            },
+            'learned': {
+                'nudge_cooldown_minutes': 10.0,
+                'wedge_nudge_after_minutes': 9.0,
+                'wedge_remediation_cooldown_minutes': 10.0,
+            },
+            'window_start': (
+                datetime.now(timezone.utc) - timedelta(hours=2)
+            ).isoformat(),
+            'last_eval': '',
+        }
+        files.write_file(TEST_STATE, json.dumps(st15d))
+        _truncate_journal()
+        _journal_actions('wedge_auto_continue', 6)
+        _journal_actions('wedge_nudge_effective', 6)
+        cfg15d = {
+            'enabled': True, 'watch_all': True,
+            'stall_minutes': 5, 'max_auto_nudges': 3,
+            'max_nudges_per_tick': 5, 'nudge_cooldown_minutes': 10,
+            'notify_on_intervention': False,
+            'wedge_nudge_after_minutes': 10,
+            'wedge_max_remediations': 2,
+            'wedge_remediation_cooldown_minutes': 10,
+            'wedge_soft_restart': False,
+            'wedge_liveness_probe': True,
+            'adaptive_thresholds': True,
+            'adaptive_interval_minutes': 60,
+            'adaptive_min_samples': 5,
+            'adaptive_step_pct': 10,
+        }
+        ctx15d = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=1, running=True)
+        FakeAgentContext._all = [ctx15d]
+        s15d = monitor.tick(cfg15d)
+        assert s15d['adaptive'] == 'relax', s15d
+        assert s15d['wedge_nudged'] == 1, s15d
+        assert len(ctx15d.communicated) == 1, ctx15d.communicated
+        st15d2 = read_state()
+        assert st15d2['adaptive']['learned']['wedge_nudge_after_minutes'] == 8.0, st15d2['adaptive']
+        print('TEST15D_TICK_OVERLAY_OK')
+
+        # --- 15e: low remediation success tightens the wedge grace
+        write_state(now_iso)
+        st15e = {}
+        cfg15e = _adaptive_cfg()
+        adaptive_mod.evaluate(st15e, cfg15e)
+        _journal_actions('wedge_auto_continue', 12)
+        _journal_actions('wedge_nudge_effective', 3)
+        r15e = adaptive_mod.evaluate(st15e, cfg15e)
+        d15e = r15e['decisions']['wedge']
+        assert d15e['reason'] == 'tighten' and d15e['rate'] == 0.25, d15e
+        assert st15e['adaptive']['learned']['wedge_nudge_after_minutes'] == 11.0, st15e
+        print('TEST15E_TIGHTEN_OK')
+
+        # --- 15f: a manual settings change re-seeds (settings always win)
+        r15f = adaptive_mod.evaluate(st15e, _adaptive_cfg(nudge_cooldown_minutes=12))
+        assert r15f['reason'] == 'reseeded', r15f
+        assert st15e['adaptive']['learned']['nudge_cooldown_minutes'] == 12.0, st15e
+        assert st15e['adaptive']['seed']['nudge_cooldown_minutes'] == 12.0, st15e
+        print('TEST15F_RESEED_OK')
+
+        # --- 15g: an out-of-band configured knob is pinned, never learned
+        write_state(now_iso)
+        st15g = {}
+        cfg15g = _adaptive_cfg(wedge_remediation_cooldown_minutes=240)
+        adaptive_mod.evaluate(st15g, cfg15g)
+        _journal_actions('wedge_auto_continue', 12)
+        _journal_actions('wedge_nudge_effective', 9)
+        r15g = adaptive_mod.evaluate(st15g, cfg15g)
+        d15g = r15g['decisions']['wedge']
+        assert d15g['reason'] == 'relax', d15g
+        assert 'wedge_remediation_cooldown_minutes' in d15g['pinned'], d15g
+        # learned dict is seeded from configured values, so the pinned knob
+        # still holds the out-of-band 240 there - but it is never stepped
+        # and never applied at runtime (effective keeps the user setting)
+        assert st15g['adaptive']['learned']['wedge_remediation_cooldown_minutes'] == 240.0, st15g
+        assert st15g['adaptive']['learned']['wedge_nudge_after_minutes'] == 9.0, st15g
+        eff15 = adaptive_mod.effective_values(cfg15g, st15g['adaptive']['learned'])
+        assert eff15['wedge_remediation_cooldown_minutes'] == 240.0, eff15
+        assert eff15['wedge_nudge_after_minutes'] == 9.0, eff15
+        assert adaptive_mod.effective_values(cfg15g, None) == adaptive_mod.configured_values(cfg15g)
+        print('TEST15G_PINNED_KNOB_OK')
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

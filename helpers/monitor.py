@@ -39,6 +39,7 @@ from usr.plugins.chat_shepherd.helpers.constants import (
     NUDGE_EFFECTIVE_WINDOW_MIN,
 )
 from usr.plugins.chat_shepherd.helpers import state as state_mod
+from usr.plugins.chat_shepherd.helpers import adaptive as adaptive_mod
 
 # The job loop ticks roughly every 60s; a last_tick gap far beyond one
 # tick interval means the server process (or at least the job loop) was
@@ -668,6 +669,28 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
     # spinning dead loop via the log mutation counter. Off = legacy.
     wedge_probe = bool(cfg.get('wedge_liveness_probe', WEDGE_LIVENESS_PROBE))
 
+    # R4 adaptive thresholds: opt-in learning overlay. evaluate() updates
+    # the learned values (persisted under state['adaptive']) at most every
+    # adaptive_interval_minutes using journal-windowed outcome rates; a
+    # manual settings change re-seeds the baseline on the next tick.
+    # effective_values() applies the learned values as a runtime-only
+    # overlay: the persisted config is never written, and configured
+    # knobs outside the learnable band stay pinned.
+    adaptive_tag = 'off'
+    if bool(cfg.get('adaptive_thresholds', False)):
+        try:
+            info = adaptive_mod.evaluate(state, cfg)
+            overlay = adaptive_mod.effective_values(
+                cfg, (state.get('adaptive') or {}).get('learned')
+            )
+            nudge_cooldown = float(overlay['nudge_cooldown_minutes'])
+            wedge_nudge_after = float(overlay['wedge_nudge_after_minutes'])
+            wedge_cooldown = float(overlay['wedge_remediation_cooldown_minutes'])
+            adaptive_tag = str(info.get('reason') or 'evaluated')
+        except Exception as e:
+            _debug_log('adaptive_fail', repr(e))
+            adaptive_tag = 'error'
+
     # P1: only real UI chats are tracked. Contexts without a persisted
     # usr/chats/<id> directory (ad-hoc message_async ids) are invisible here.
     watch_all = bool(cfg.get('watch_all', True))
@@ -706,6 +729,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
         'goal_gate_nudged': 0,
         'pruned': 0,
     }
+    summary['adaptive'] = adaptive_tag
 
     # P2: stalled chats that are cooldown-eligible, collected for the
     # post-loop throttle pass (never nudged inline in this loop).
