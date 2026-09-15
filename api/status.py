@@ -255,6 +255,7 @@ class Status(ApiHandler):
                 'adaptive_min_samples': cfg.get('adaptive_min_samples', 10),
                 'adaptive_step_pct': cfg.get('adaptive_step_pct', 10),
                 'supervised_mode': bool(cfg.get('supervised_mode', False)),
+                'save_state_interval_seconds': _to_int(cfg.get('save_state_interval_seconds', 120)),
             },
             'last_tick': state.get('last_tick', ''),
     'hot_reload': hotreload.status(),

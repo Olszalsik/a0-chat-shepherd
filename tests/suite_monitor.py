@@ -1242,6 +1242,60 @@ def main():
             _draftmod17._get_context = _orig17
         FakeAgentContext._all = []
         print('TEST17F_DRAFT_API_OK')
+        # ================= TEST 18: state save durability gate (v1.17.0) =================
+        import time as _time18
+        _orig_save18 = state_mod.save_state
+        _saves18 = []
+        state_mod.save_state = lambda st: _saves18.append(st)
+        try:
+            _cfg18 = {'enabled': True, 'watch_all': True, 'stall_minutes': 5, 'max_auto_nudges': 3, 'max_nudges_per_tick': 5, 'nudge_cooldown_minutes': 0, 'notify_on_intervention': False, 'save_state_interval_seconds': 120}
+            # 18a: quiet tick inside the interval skips the write
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={})
+            FakeAgentContext._all = []
+            state_mod._state_last_save = _time18.monotonic()
+            _saves18.clear()
+            _s18a = monitor.tick(_cfg18)
+            assert len(_saves18) == 0, 'quiet tick must skip the save'
+            assert _s18a.get('state_save_skipped') is True, _s18a
+            assert read_state().get('throttle', {}).get('state_save_skipped') is None, (
+                'skipped tick must not persist a throttle snapshot'
+            )
+            print('TEST18A_QUIET_SKIP_OK')
+            # 18b: eventful tick saves immediately despite fresh _state_last_save
+            _saves18.clear()
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+                FAKE_CHAT_A: {
+                    'status': 'running',
+                    'nudge_count': 0,
+                    'last_nudge_at': (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat(),
+                },
+            })
+            _ctx18 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+            FakeAgentContext._all = [_ctx18]
+            _s18b = monitor.tick(_cfg18)
+            assert (_s18b.get('nudged', 0) + _s18b.get('resumed', 0)) >= 1, _s18b
+            assert len(_saves18) == 1, 'eventful tick must save immediately'
+            assert _s18b.get('state_save_skipped') is False, _s18b
+            print('TEST18B_EVENTFUL_FORCE_OK')
+            # 18c: interval 0 = legacy write-every-tick on a quiet tick
+            _saves18.clear()
+            FakeAgentContext._all = []
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={})
+            _s18c = monitor.tick(dict(_cfg18, save_state_interval_seconds=0))
+            assert len(_saves18) == 1, 'interval 0 must always save'
+            assert _s18c.get('state_save_skipped') is False, _s18c
+            print('TEST18C_INTERVAL_ZERO_OK')
+            # 18d: quiet tick saves once the interval has elapsed
+            _saves18.clear()
+            state_mod._state_last_save = _time18.monotonic() - 9999.0
+            _s18d = monitor.tick(_cfg18)
+            assert len(_saves18) == 1, 'due quiet tick must save'
+            assert _s18d.get('state_save_skipped') is False, _s18d
+            print('TEST18D_DUE_SAVE_OK')
+        finally:
+            state_mod.save_state = _orig_save18
+        FakeAgentContext._all = []
+        print('TEST18_DURABILITY_OK')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

@@ -17,6 +17,7 @@ DEFAULTS: dict[str, Any] = {
     "max_nudges_per_tick": 1,
     "nudge_cooldown_minutes": 10,
     "poll_seconds": 5,
+    "save_state_interval_seconds": 120,
     "hot_reload_enabled": True,
     "allowed_chat_ids": [],
     "intervention_after_failed_nudges": True,
@@ -191,6 +192,13 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
     if "poll_seconds" in readable:
         current["poll_seconds"] = coerce_int(
             readable["poll_seconds"], current["poll_seconds"], 2, 120
+        )
+    if "save_state_interval_seconds" in readable:
+        current["save_state_interval_seconds"] = coerce_int(
+            readable["save_state_interval_seconds"],
+            current["save_state_interval_seconds"],
+            0,
+            180,
         )
     if "wedge_nudge_after_minutes" in readable:
         current["wedge_nudge_after_minutes"] = coerce_int(

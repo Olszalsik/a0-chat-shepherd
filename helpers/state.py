@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import time
 
 import threading
 from datetime import datetime, timezone
@@ -56,6 +58,8 @@ def load_state() -> dict[str, Any]:
             _seed_journal(legacy)
     # v1.6.0: history of record is the append-only journal (newest first).
     state['history'] = read_journal(JOURNAL_READ_LIMIT)
+    global _last_saved_sig
+    _last_saved_sig = state_signature(state)
     return state
 
 
@@ -69,6 +73,53 @@ def save_state(state: dict[str, Any]) -> None:
     tmp_rel = STATE_FILE + '.tmp'
     files.write_file(tmp_rel, json.dumps(payload, ensure_ascii=False, indent=2))
     os.replace(files.get_abs_path(tmp_rel), files.get_abs_path(STATE_FILE))
+    global _state_last_save, _last_saved_sig
+    _state_last_save = time.monotonic()
+    _last_saved_sig = state_signature(payload)
+
+
+def state_signature(state: dict[str, Any]) -> str:
+    """v1.17.0: stable fingerprint of the durable payload save_state
+    writes. Volatile per-tick bookkeeping is excluded (per-chat
+    last_ticked, top-level last_tick, the throttle snapshot); every
+    other change - status, counters, cooldown/wedge bookkeeping,
+    drafts, adaptive overlay - changes the signature and forces an
+    immediate save. Serialization errors return a unique sentinel so
+    the caller treats the state as changed (fail-safe to writing)."""
+    try:
+        chats = {}
+        for cid, entry in (state.get('chats') or {}).items():
+            if isinstance(entry, dict):
+                chats[cid] = {k: v for k, v in entry.items() if k != 'last_ticked'}
+            else:
+                chats[cid] = entry
+        basis = {
+            'chats': chats,
+            'drafts': state.get('drafts') if isinstance(state.get('drafts'), list) else [],
+            'adaptive': state.get('adaptive'),
+        }
+        blob = json.dumps(basis, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+    except Exception:
+        return 'err:%d' % time.time_ns()
+
+
+def last_saved_signature() -> str:
+    return _last_saved_sig
+
+
+def save_due(min_interval_seconds: float) -> bool:
+    """v1.17.0 durability gate: True when a full state.json write should
+    happen now. interval <= 0 always reports due, and a freshly
+    re-executed module (hot reload resets _state_last_save to 0.0)
+    also reports due - fail-safe to writing."""
+    try:
+        interval = float(min_interval_seconds or 0)
+    except Exception:
+        interval = 0.0
+    if interval <= 0:
+        return True
+    return (time.monotonic() - _state_last_save) >= interval
 
 
 def get_chat(state: dict, chat_id: str) -> dict[str, Any]:
@@ -127,6 +178,8 @@ def append_history(state: dict, item: dict[str, Any]) -> None:
 
 # v1.6.0: append-only history journal -------------------------------
 _journal_lock = threading.RLock()
+_state_last_save = 0.0  # v1.17.0: monotonic ts of the last full state.json write
+_last_saved_sig = ''  # v1.17.0: signature of the last written durable payload
 
 def _journal_abs() -> str:
     return files.get_abs_path(JOURNAL_FILE)

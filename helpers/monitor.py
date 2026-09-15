@@ -1162,5 +1162,32 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
      'wedge_budget': max(1, max_nudges_per_tick),
      'timestamp': datetime.now(timezone.utc).isoformat(),
     }
-    state_mod.save_state(state)
+    # v1.17.0 durability: skip the full state.json rewrite when nothing
+    # semantic changed. The save fires when the interval elapsed
+    # (periodic flush of volatile dashboard bookkeeping) OR the durable
+    # payload signature (chats minus volatile last_ticked, drafts,
+    # adaptive overlay) differs from the last written one, so every
+    # meaningful state transition persists immediately.
+    # save_state_interval_seconds=0 restores legacy write-every-tick.
+    # state.py gates fail safe: any error there forces a write.
+    _save_interval = 120.0
+    try:
+        _save_interval = float(cfg.get('save_state_interval_seconds', 120) or 0)
+    except Exception:
+        _save_interval = 120.0
+    if _save_interval < 0:
+        _save_interval = 0.0
+    _do_save = state_mod.save_due(_save_interval)
+    if not _do_save:
+        try:
+            _do_save = (
+                state_mod.state_signature(state)
+                != state_mod.last_saved_signature()
+            )
+        except Exception:
+            _do_save = True
+    state['throttle']['state_save_skipped'] = not _do_save
+    summary['state_save_skipped'] = not _do_save
+    if _do_save:
+        state_mod.save_state(state)
     return summary

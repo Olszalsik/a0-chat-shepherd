@@ -52,6 +52,11 @@ adaptive_step_pct: 10
 # the situation) is queued on the dashboard for human review; send or dismiss
 # it there. Wedge remediation and the goal gate stay automatic.
 supervised_mode: false
+# v1.17.0 durability: minimum seconds between full state.json rewrites
+# for quiet ticks (0 = legacy write every tick, max 180 to stay safely
+# inside the 5-minute restart-detection gap). Eventful ticks - nudges,
+# drafts, wedge actions, interventions, prunes, errors - always save now.
+save_state_interval_seconds: 120
 # R3 external alert channels (optional, off by default). webhook_url
 # receives a JSON POST per alert; Telegram uses a bot token + chat id.
 # Private/LAN webhook targets require webhook_allow_private: true.

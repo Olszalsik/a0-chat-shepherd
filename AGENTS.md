@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.16.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
+**Version:** 1.17.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
 
 ## Purpose
 
@@ -46,7 +46,7 @@ Agent monitoring: a `job_loop` extension ticks periodically, classifies every li
 - Wedge detection compares only the log ENTRY count; a long legitimate tool call that emits no log entries for `stall_minutes` can false-positive as `intervention`. With the v1.2.0 ladder this now sends an auto-continue after `wedge_nudge_after_minutes` (harmless — the intervention flag drains when the call returns) and a task-kill only with `wedge_soft_restart: true`. Since v1.10.0 the probe also reads the log mutation counter, so in-place item mutations (streaming output, progress writes) separate an actively-mutating call from a fully hung one; a healthy long streaming call can classify `spinning`, which is remediation-free by default (the immediate kill requires `wedge_soft_restart: true`).
 - `watch_all: false` skips contexts with an empty log (`_log_len <= 0`); the per-chat watch list (`allowed_chat_ids`) is implemented and enforced in `tick()` (`monitor.py:652-661`, sanitizer + settings UI wired — confirmed in the 2026-09-14 review).
 - Graceful reload (v1.9.0) covers the helpers/tick path only: `api/*` handlers keep their from-import bindings until the next plugin refresh, so endpoint changes need a refresh or restart; the `hot_reload` block in `/status` shows the last reload result.
-- **State read-modify-write race** (2026-09-14 review): `load_state()` → mutate → `save_state()` runs unlocked from the JobLoop tick AND the nudge/resolve API handlers; a manual action landing mid-tick can lose the tick's counter updates (last writer wins). The journal has `_journal_lock`, `state.json` does not (roadmap P7).
+- **State read-modify-write race** (2026-09-14 review): `load_state()` → mutate → `save_state()` runs unlocked from the JobLoop tick AND the nudge/resolve API handlers; a manual action landing mid-tick can lose the tick's counter updates (last writer wins). The journal has `_journal_lock`, `state.json` does not (roadmap P7). Note (v1.17.0): the save gate narrows the exposure window on quiet ticks but does not close this race - still roadmap P7.
 - **`/status` bypasses the real-chats predicate** (2026-09-14 review): it classifies every live `AgentContext`, so throwaway script contexts (`verify-*`, `ctx-hook-1`) reach the sidebar/dashboard even though `tick()` never tracks them (roadmap P6.4).
 - **Test harness is Docker-bound** (2026-09-14 review): `tests/test_monitor.py` hardcodes `/a0` and is script-shaped, so `pytest` cannot collect it off-Docker and a bare repo-root `pytest` hits it as a collection side effect (roadmap P6.2).
 
@@ -113,6 +113,17 @@ Context: the plugin was being built by an agent whose chat died in the three 9p 
 - Dashboard: 📈 aggregate badge (`aggregatesLabel()` in `shepherd-store.js`) beside the 🎯 / ⚡ badges, hidden while the window is empty.
 - Tests: TEST16A-C (compute semantics incl. out-of-window and malformed entries, degenerate inputs, /status integration block); suite ALL_TESTS_PASSED on two clean runs. **Runtime note:** inside the A0 Docker container the suite must run with the framework runtime (`/opt/venv-a0/bin/python`) — TEST16C exercises the `/status` handler, whose `get_plugin_config` lazily imports framework `projects.py` → `pathspec`, which only exists in that runtime.
 - Reconciliation: two concurrent sessions converged on R4 (coordination block in the roadmap); the adopted nested-schema module was kept and the retired flat-schema consumers (suite TEST16, store getter, stray main.html badge) were migrated.
+
+### v1.17.0 — State save durability (2026-09-15, R4)
+
+The monitor re-wrote the whole `state.json` on every tick even when nothing changed.
+
+- **`save_state_interval_seconds`** (config, 0-180, default 120; 0 = legacy write-every-tick): quiet ticks skip the full-file rewrite until the interval elapses; the periodic flush keeps dashboard bookkeeping (throttle snapshot, `last_tick`) fresh well inside the 5-minute restart-detection gap (worst-case disk staleness 240s < 300s).
+- **Content-signature gate** (new `state.state_signature()` / `state.save_due()` / `state.last_saved_signature()`): a save is forced immediately whenever the durable payload changes — chats (minus volatile per-chat `last_ticked`), drafts, adaptive overlay. Every meaningful transition (nudge counters, wedge bookkeeping, status changes) persists at once; only truly unchanged ticks skip the write. The signature is history-independent, so `load_state` and `save_state` compute consistent baselines; all gates fail safe to writing.
+- **Observability**: `throttle.state_save_skipped` and `summary['state_save_skipped']` report the per-tick decision.
+- Wiring: `config_defaults` (default + 0-180 clamp), `default_config.yaml`, `/status` snapshot, settings field + hint, suite TEST18A-18D (quiet skip, eventful force, interval-0 legacy, due save via counting `save_state` stub).
+
+**Ownership:** `state.py` (signature + gate + load/save baseline), `monitor.py` (end-of-tick gate), `config_defaults.py`, `default_config.yaml`, `api/status.py`, `webui/config.html`, `tests/suite_monitor.py` (TEST18).
 
 ### v1.16.0 — Supervised resume drafts (2026-09-15, R4)
 
