@@ -1044,6 +1044,63 @@ def main():
         assert adaptive_mod.effective_values(cfg15g, None) == adaptive_mod.configured_values(cfg15g)
         print('TEST15G_PINNED_KNOB_OK')
 
+        # --- 16: R4 dashboard aggregates (v1.15.0, adopted nested schema)
+        import asyncio as _aio16
+        from usr.plugins.chat_shepherd.helpers import aggregates as _agg16
+        from usr.plugins.chat_shepherd.api.status import Status as _CSStatus16
+        _h16 = _CSStatus16(None, None)
+        _now16 = datetime(2026, 9, 15, 12, 0, 0, tzinfo=timezone.utc)
+        _h16a = [
+            {'chat_id': FAKE_CHAT_A, 'action': 'auto_nudge', 'timestamp': '2026-09-15T08:00:00+00:00'},
+            {'chat_id': FAKE_CHAT_A, 'action': 'manual_nudge', 'timestamp': '2026-09-15T09:30:00+00:00'},
+            {'chat_id': FAKE_CHAT_B, 'action': 'auto_nudge', 'timestamp': '2026-09-14T23:10:00+00:00'},
+            {'chat_id': FAKE_CHAT_A, 'action': 'nudge_effective', 'minutes_after_nudge': 2.0, 'timestamp': '2026-09-15T08:03:00+00:00'},
+            {'chat_id': FAKE_CHAT_A, 'action': 'nudge_effective', 'minutes_after_nudge': 4.0, 'timestamp': '2026-09-15T09:34:00+00:00'},
+            {'chat_id': FAKE_CHAT_B, 'action': 'wedge_auto_continue', 'timestamp': '2026-09-13T10:00:00+00:00'},
+            {'chat_id': FAKE_CHAT_B, 'action': 'wedge_soft_restart', 'timestamp': '2026-09-13T10:20:00+00:00'},
+            {'chat_id': FAKE_CHAT_B, 'action': 'wedge_nudge_effective', 'minutes_after_nudge': 1.5, 'timestamp': '2026-09-13T10:25:00+00:00'},
+            {'chat_id': FAKE_CHAT_A, 'action': 'auto_nudge', 'timestamp': '2026-08-01T10:00:00+00:00'},
+            {'chat_id': FAKE_CHAT_A, 'action': 'auto_nudge', 'timestamp': '2026-09-16T10:00:00+00:00'},
+            {'chat_id': FAKE_CHAT_A, 'action': 'restart_resume', 'timestamp': '2026-09-15T07:00:00+00:00'},
+            {'chat_id': FAKE_CHAT_A, 'action': 'nudge_effective', 'minutes_after_nudge': 'bogus', 'timestamp': '2026-09-15T06:30:00+00:00'},
+        ]
+        _a16 = _agg16.compute(_h16a, now=_now16)
+        assert _a16['window_days'] == 7, _a16
+        assert _a16['events_in_window'] == 10, _a16
+        assert _a16['stalls']['episodes'] == 2, _a16
+        assert _a16['stalls']['nudges_sent'] == 2, _a16
+        assert _a16['stalls']['recovered'] == 3, _a16
+        assert abs(_a16['stalls']['per_day'] - 1.0) < 0.1, _a16
+        assert _a16['resume']['stall']['samples'] == 2, _a16
+        assert _a16['resume']['stall']['mean_minutes'] == 3.0, _a16
+        assert _a16['resume']['stall']['median_minutes'] == 3.0, _a16
+        assert _a16['wedge']['attempts'] == 2, _a16
+        assert _a16['wedge']['resolved'] == 1, _a16
+        assert _a16['wedge']['success_rate_pct'] == 50, _a16
+        assert _a16['wedge']['continues'] == 1 and _a16['wedge']['soft_restarts'] == 1, _a16
+        assert _a16['resume']['wedge']['samples'] == 1, _a16
+        assert _a16['resume']['wedge']['mean_minutes'] == 1.5, _a16
+        print('TEST16A_COMPUTE_OK')
+        _a16b = _agg16.compute([], now=_now16)
+        assert _a16b['stalls']['episodes'] == 0 and _a16b['resume']['stall']['mean_minutes'] is None, _a16b
+        assert _a16b['wedge']['success_rate_pct'] is None, _a16b
+        _a16c = _agg16.compute('garbage', now=_now16)
+        assert _a16c['stalls']['episodes'] == 0, _a16c
+        _a16d = _agg16.compute(_h16a, now=_now16, window_days='bogus')
+        assert _a16d['window_days'] == 7, _a16d
+        print('TEST16B_DEGENERATE_OK')
+        write_state(datetime.now(timezone.utc).isoformat(), chats={})
+        _today16 = datetime.now(timezone.utc).isoformat()
+        state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'auto_nudge', 'timestamp': _today16})
+        state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'nudge_effective', 'minutes_after_nudge': 3.0, 'timestamp': _today16})
+        _r16 = _aio16.run(_h16.process({}, None))
+        assert _r16.get('success') is True, _r16
+        _agg16s = _r16.get('aggregates')
+        assert isinstance(_agg16s, dict) and _agg16s['stalls']['episodes'] == 1, _agg16s
+        assert _agg16s['resume']['stall']['mean_minutes'] == 3.0 and _agg16s['resume']['stall']['samples'] == 1, _agg16s
+        assert _agg16s['wedge']['success_rate_pct'] is None, _agg16s
+        assert _agg16s['window_days'] == 7, _agg16s
+        print('TEST16C_STATUS_BLOCK_OK')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

@@ -186,6 +186,20 @@ export const store = createStore("chatShepherdStore", {
    return !!(t && t.capped);
    },
 
+  aggregatesLabel() {
+  const a = (this.data && this.data.aggregates) || null;
+  if (!a || !a.events_in_window) return '';
+  const s = a.stalls || {}, r = (a.resume && a.resume.stall) || {}, w = a.wedge || {};
+  let label = '📈 ' + (s.episodes || 0) + ' stalls/7d';
+  if (r.mean_minutes !== null && r.mean_minutes !== undefined) {
+      label += ' · ' + r.mean_minutes + 'min avg resume';
+  }
+  if (w.success_rate_pct !== null && w.success_rate_pct !== undefined) {
+      label += ' · ' + w.success_rate_pct + '% wedge fixes';
+  }
+  return label;
+  },
+  
   iconFor(status) {
     const custom = (this.data && this.data.config && this.data.config.icons) || {};
     const fallback = DEFAULT_ICONS[status];

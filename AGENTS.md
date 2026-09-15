@@ -104,6 +104,14 @@ Context: the plugin was being built by an agent whose chat died in the three 9p 
 - v1.9.0: TEST11 covers the reload engine (prime/clean, live swap, compile-error backoff, exec-failure rollback, config gate, force); live check via the `hot_reload` block in `/status`.
 - 2026-09-14 external review: full suite `ALL_TESTS_PASSED` on the Windows host with only the P6.2 bootstrap fix applied to a scratch copy (TEST1-TEST11). Off-Docker `pytest` collection is blocked until P6.2 lands; P6.1/P6.3/P6.4 verified against framework source (`helpers/api.py`, `webui/js/api.js`, `helpers/plugins.py`, `plugins/_goal/tools/goal.py`).
 
+### v1.15.0 — Dashboard aggregates (2026-09-15, R4)
+
+- New `helpers/aggregates.py` (pure compute, never raises): fixed 7-day window over the journal; stall episodes clustered per chat (`EPISODE_GAP_MINUTES = 90` — ladder retries inside the gap count as one stall), span-normalized stalls/day, nudges sent vs recovered; time-to-resume mean + median from `minutes_after_nudge` (`nudge_effective` = stall resume, `wedge_nudge_effective` = wedge recovery); wedge remediation success rate crediting the latest unconsumed attempt of the same chat within `WEDGE_RESOLVE_MINUTES = 120`, plus continues / soft-restart counts.
+- Read-only integration: `/status` returns an `aggregates` block computed from the state journal mirror; no config keys, no state writes; hotreload watches the new module.
+- Dashboard: 📈 aggregate badge (`aggregatesLabel()` in `shepherd-store.js`) beside the 🎯 / ⚡ badges, hidden while the window is empty.
+- Tests: TEST16A-C (compute semantics incl. out-of-window and malformed entries, degenerate inputs, /status integration block); suite ALL_TESTS_PASSED on two clean runs. **Runtime note:** inside the A0 Docker container the suite must run with the framework runtime (`/opt/venv-a0/bin/python`) — TEST16C exercises the `/status` handler, whose `get_plugin_config` lazily imports framework `projects.py` → `pathspec`, which only exists in that runtime.
+- Reconciliation: two concurrent sessions converged on R4 (coordination block in the roadmap); the adopted nested-schema module was kept and the retired flat-schema consumers (suite TEST16, store getter, stray main.html badge) were migrated.
+
 ## See also
 
 - `plugin.yaml` — manifest; `default_config.yaml` — defaults incl. per-status `icons` map

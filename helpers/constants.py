@@ -18,6 +18,7 @@ CHAT_ID_PATTERN = re.compile(r'^[A-Za-z0-9]{8}$')
 # R2: a nudge counts as effective when the chat reaches running or
 # awaiting_user within this many minutes after the nudge.
 NUDGE_EFFECTIVE_WINDOW_MIN = 15
+AGGREGATES_WINDOW_DAYS = 7
 
 # v1.7.0 quiet bell: the intervention bell rings only after a chat has
 # persistently needed human help for NOTIFY_AFTER_MIN minutes; pages

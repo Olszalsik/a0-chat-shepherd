@@ -31,6 +31,7 @@ _DEFAULT_WATCH = [
     ('usr.plugins.chat_shepherd.helpers.constants', 'helpers/constants.py'),
     ('usr.plugins.chat_shepherd.helpers.state', 'helpers/state.py'),
     ('usr.plugins.chat_shepherd.helpers.adaptive', 'helpers/adaptive.py'),
+    ('usr.plugins.chat_shepherd.helpers.aggregates', 'helpers/aggregates.py'),
     ('usr.plugins.chat_shepherd.helpers.monitor', 'helpers/monitor.py'),
     ('usr.plugins.chat_shepherd.helpers.hotreload', 'helpers/hotreload.py'),
 ]

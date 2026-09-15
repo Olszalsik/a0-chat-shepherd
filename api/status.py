@@ -10,6 +10,7 @@ from usr.plugins.chat_shepherd.helpers.state import load_state
 from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers import hotreload
 from usr.plugins.chat_shepherd.helpers import adaptive
+from usr.plugins.chat_shepherd.helpers import aggregates
 
 DEFAULT_ICONS: dict[str, str] = {
     'running': '🏃',
@@ -197,6 +198,11 @@ class Status(ApiHandler):
          }
         except Exception:
          pass
+        # R4: dashboard aggregates (pure journal-tail math, no extra I/O).
+        try:
+            aggregates_block = aggregates.compute(state.get('history'))
+        except Exception:
+            aggregates_block = None
         counts: dict[str, int] = {}
         for c in chat_list:
             counts[c['status']] = counts.get(c['status'], 0) + 1
@@ -255,5 +261,6 @@ class Status(ApiHandler):
             'counts': counts,
             'effectiveness': effectiveness,
             'throttle': throttle,
+            'aggregates': aggregates_block,
             'history': state.get('history', [])[:20],
         }
