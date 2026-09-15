@@ -649,6 +649,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
     notify_after = float(cfg.get('notify_after_minutes', NOTIFY_AFTER_MIN))
     notify_rearm = float(cfg.get('notify_rearm_minutes', NOTIFY_REARM_MIN))
     notify_on_resume = bool(cfg.get('notify_on_resume', False))
+    supervised = bool(cfg.get('supervised_mode', False))
     # v1.8.0 goal completion gate (thresholds read inside the check).
     goal_gate_enabled = bool(cfg.get('goal_gate_enabled', True))
     # P2: global burst throttle — at most this many auto-nudges per tick,
@@ -725,6 +726,7 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
         'nudges_this_tick': 0,
         'interrupted': 0,
         'resumed': 0,
+        'drafted': 0,
         'notify_failures': 0,
         'goal_gate_nudged': 0,
         'pruned': 0,
@@ -915,12 +917,21 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
                         entry['intervention_notify_at'] = now_iso
         elif new_status == STATUS_INTERRUPTED:
             summary['interrupted'] += 1
-            nudge_count = entry.get('nudge_count', 0)
-            if nudge_count < max_nudges:
-                minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
-                resume_queue.append(
-                    (minutes_idle, chat_id, ctx, entry, now_iso, RESUME_TEXT)
-                )
+            if supervised:
+                # v1.16.0 supervised mode: queue an editable draft for
+                # human review instead of auto-resuming; nothing is
+                # sent and the nudge budget stays untouched.
+                if state_mod.add_draft(
+                    state, chat_id, 'restart_resume', reason=reason
+                ):
+                    summary['drafted'] += 1
+            else:
+                nudge_count = entry.get('nudge_count', 0)
+                if nudge_count < max_nudges:
+                    minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
+                    resume_queue.append(
+                        (minutes_idle, chat_id, ctx, entry, now_iso, RESUME_TEXT)
+                    )
         elif new_status == STATUS_IDLE:
             summary['idle'] += 1
 
@@ -964,11 +975,22 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
 
     pre_drain_nudged = summary['nudged']
     nudge_queue_len = len(nudge_queue)
-    if nudge_queue and max_nudges_per_tick > 0:
+    if nudge_queue and (supervised or max_nudges_per_tick > 0):
         nudge_queue.sort(key=lambda item: item[0], reverse=True)
         for minutes_idle, chat_id, ctx, entry, now_iso in nudge_queue:
-            if summary['nudges_this_tick'] >= max_nudges_per_tick:
+            if (
+                not supervised
+                and summary['nudges_this_tick'] >= max_nudges_per_tick
+            ):
                 break
+            if supervised:
+                # v1.16.0: draft instead of auto-send; no budget use.
+                if state_mod.add_draft(
+                    state, chat_id, 'stall_nudge',
+                    reason=str(entry.get('last_classification', '')),
+                ):
+                    summary['drafted'] += 1
+                continue
             if _nudge_context(ctx):
                 prev = state_mod.get_chat(state, chat_id)
                 entry['nudge_count'] = prev.get('nudge_count', 0) + 1

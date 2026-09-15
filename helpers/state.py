@@ -26,7 +26,7 @@ def _now_iso() -> str:
 
 
 def default_state() -> dict[str, Any]:
-    return {'chats': {}, 'history': [], 'last_tick': ''}
+    return {'chats': {}, 'history': [], 'drafts': [], 'last_tick': ''}
 
 
 
@@ -43,6 +43,8 @@ def load_state() -> dict[str, Any]:
         state.update(payload)
     if not isinstance(state.get('chats'), dict):
         state['chats'] = {}
+    if not isinstance(state.get('drafts'), list):
+        state['drafts'] = []
     # v1.6.0: one-time migration - seed the journal from legacy history.
     legacy = state.get('history')
     if isinstance(legacy, list) and legacy:
@@ -238,3 +240,61 @@ def cap_chats(state: dict, keep: int = MAX_TRACKED_CHATS) -> list[str]:
     for chat_id in doomed:
         chats.pop(chat_id, None)
     return sorted(doomed)
+
+
+
+# v1.16.0: supervised resume drafts (one editable draft per chat).
+DRAFT_MAX = 40
+DRAFT_REQUEUE_MIN = 30
+
+
+def _drafts_list(state: dict) -> list:
+    drafts = state.get('drafts')
+    return drafts if isinstance(drafts, list) else []
+
+
+def add_draft(state: dict, chat_id: str, kind: str, reason: str = '', text: str = '') -> bool:
+    from usr.plugins.chat_shepherd.helpers.resume_draft import draft_text, valid_kind
+
+    kind = valid_kind(kind)
+    if not kind or not chat_id:
+        return False
+    drafts = _drafts_list(state)
+    for d in drafts:
+        if isinstance(d, dict) and d.get('chat_id') == chat_id:
+            return False
+    entry = (state.get('chats') or {}).get(chat_id) or {}
+    dismissed = str(entry.get('draft_dismissed_at') or '')
+    if dismissed:
+        try:
+            ddt = datetime.fromisoformat(dismissed)
+            if ddt.tzinfo is None:
+                ddt = ddt.replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - ddt).total_seconds() / 60.0
+            if 0 <= age_min < DRAFT_REQUEUE_MIN:
+                return False
+        except Exception:
+            pass
+    if len(drafts) >= DRAFT_MAX:
+        return False
+    if not isinstance(state.get('drafts'), list):
+        state['drafts'] = []
+    import uuid
+    state['drafts'].append({
+        'id': uuid.uuid4().hex[:12],
+        'chat_id': chat_id,
+        'kind': kind,
+        'text': str(text or '').strip() or draft_text(kind, reason),
+        'reason': str(reason or ''),
+        'created_at': _now_iso(),
+    })
+    return True
+
+
+def remove_draft(state: dict, draft_id: str) -> bool:
+    drafts = _drafts_list(state)
+    keep = [d for d in drafts if not (isinstance(d, dict) and d.get('id') == draft_id)]
+    if len(keep) == len(drafts):
+        return False
+    state['drafts'] = keep
+    return True

@@ -180,6 +180,15 @@ Chat Shepherd
 </div>
 
 <div class='cs-card'>
+<h4>Supervised mode (experimental)</h4>
+<label style='display: block; margin: 4px 0;'>
+<input type='checkbox' x-model='cfg.supervised_mode' />
+<strong>Queue resume prompts as drafts for human review</strong>
+</label>
+<small class='hint'>When on, restart-resume and stalled-chat nudges are NOT sent automatically. Instead an editable draft message (tailored to the situation and the chat's classification reason) appears on the dashboard; you edit it and send it, or dismiss it. Dismissed chats are not re-drafted for 30 minutes. Wedge remediation and the goal-completion gate stay automatic.</small>
+</div>
+
+<div class='cs-card'>
 <h4>External alerts (optional)</h4>
 <input type='text' x-model='cfg.webhook_url' placeholder='https://hooks.example.com/...' style='width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:inherit;font-size:12px;box-sizing:border-box;' />
 <label style='display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12px;'>

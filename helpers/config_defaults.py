@@ -36,6 +36,7 @@ DEFAULTS: dict[str, Any] = {
     "adaptive_interval_minutes": 60,
     "adaptive_min_samples": 10,
     "adaptive_step_pct": 10,
+    "supervised_mode": False,
     "webhook_url": "",
     "webhook_allow_private": False,
     "telegram_bot_token": "",
@@ -145,6 +146,8 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
         current["wedge_liveness_probe"] = coerce_bool(readable["wedge_liveness_probe"])
     if "adaptive_thresholds" in readable:
         current["adaptive_thresholds"] = coerce_bool(readable["adaptive_thresholds"])
+    if "supervised_mode" in readable:
+        current["supervised_mode"] = coerce_bool(readable["supervised_mode"])
     if "adaptive_interval_minutes" in readable:
         current["adaptive_interval_minutes"] = coerce_int(
             readable["adaptive_interval_minutes"],

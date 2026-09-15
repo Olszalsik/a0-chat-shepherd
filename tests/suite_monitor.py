@@ -1101,6 +1101,147 @@ def main():
         assert _agg16s['wedge']['success_rate_pct'] is None, _agg16s
         assert _agg16s['window_days'] == 7, _agg16s
         print('TEST16C_STATUS_BLOCK_OK')
+
+        # ================= TEST 17: supervised resume drafts (v1.16.0) =================
+        import asyncio as _aio17
+        from usr.plugins.chat_shepherd.api.draft import Draft as _CSDraft17
+        from usr.plugins.chat_shepherd.api import draft as _draftmod17
+
+        _cfg17 = dict(cfg)
+        _cfg17['supervised_mode'] = True
+
+        # --- 17A: restart -> editable draft, nothing auto-sent ---
+        write_state((datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'running', 'nudge_count': 0, 'last_nudge_at': ''},
+        })
+        ctx_17a = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        FakeAgentContext._all = [ctx_17a]
+        s17a = monitor.tick(_cfg17)
+        assert s17a['interrupted'] == 1, s17a
+        assert s17a['resumed'] == 0, s17a
+        assert s17a['drafted'] == 1, s17a
+        assert s17a['nudges_this_tick'] == 0, s17a
+        assert len(ctx_17a.communicated) == 0, ctx_17a.communicated
+        st17a = read_state()
+        assert len(st17a.get('drafts', [])) == 1, st17a.get('drafts')
+        _d17a = st17a['drafts'][0]
+        assert _d17a['kind'] == 'restart_resume', _d17a
+        assert _d17a['chat_id'] == FAKE_CHAT_A, _d17a
+        assert _d17a['text'].startswith('[chat_shepherd] The Agent Zero server was restarted'), _d17a['text']
+        assert '(situation: Server restarted while chat was running' in _d17a['text'], _d17a['text']
+        assert st17a['chats'][FAKE_CHAT_A]['status'] == 'interrupted', st17a['chats'][FAKE_CHAT_A]
+        print('TEST17A_SUPERVISED_RESTART_DRAFT_OK')
+
+        # --- 17B: stall -> draft instead of auto-nudge ---
+        def _stall_setup17():
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+                FAKE_CHAT_A: {
+                    'status': 'stalled',
+                    'nudge_count': 0,
+                    'last_nudge_at': (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat(),
+                },
+            })
+
+        _stall_setup17()
+        ctx_17b = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        FakeAgentContext._all = [ctx_17b]
+        s17b = monitor.tick(_cfg17)
+        assert s17b['stalled'] == 1, s17b
+        assert s17b['nudged'] == 0, s17b
+        assert s17b['drafted'] == 1, s17b
+        assert len(ctx_17b.communicated) == 0, ctx_17b.communicated
+        st17b = read_state()
+        assert len(st17b.get('drafts', [])) == 1, st17b.get('drafts')
+        _d17b = st17b['drafts'][0]
+        assert _d17b['kind'] == 'stall_nudge', _d17b
+        assert _d17b['text'].startswith('[chat_shepherd] You stopped unexpectedly mid-task'), _d17b['text']
+        assert st17b['chats'][FAKE_CHAT_A]['status'] == 'stalled', st17b['chats'][FAKE_CHAT_A]
+        print('TEST17B_SUPERVISED_STALL_DRAFT_OK')
+
+        # --- 17C: supervised drafts ignore max_nudges_per_tick=0 ---
+        _stall_setup17()
+        ctx_17c = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        FakeAgentContext._all = [ctx_17c]
+        s17c = monitor.tick(dict(_cfg17, max_nudges_per_tick=0))
+        assert s17c['drafted'] == 1, s17c
+        assert len(ctx_17c.communicated) == 0, ctx_17c.communicated
+        print('TEST17C_SUPERVISED_BUDGET_ZERO_OK')
+
+        # --- 17D: supervised off -> legacy auto-send, no drafts ---
+        _stall_setup17()
+        ctx_17d = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        FakeAgentContext._all = [ctx_17d]
+        s17d = monitor.tick(cfg)
+        assert s17d['nudged'] == 1, s17d
+        assert s17d['drafted'] == 0, s17d
+        assert len(ctx_17d.communicated) == 1, ctx_17d.communicated
+        assert read_state().get('drafts', []) == []
+        print('TEST17D_SUPERVISED_OFF_OK')
+
+        # --- 17E: one draft per chat + dismiss requeue gate ---
+        _stall_setup17()
+        ctx_17e = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        FakeAgentContext._all = [ctx_17e]
+        assert monitor.tick(_cfg17)['drafted'] == 1
+        ctx_17e2 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        FakeAgentContext._all = [ctx_17e2]
+        assert monitor.tick(_cfg17)['drafted'] == 0, 'dedupe failed'
+        assert len(read_state().get('drafts', [])) == 1
+        st17e = read_state()
+        assert state_mod.remove_draft(st17e, st17e['drafts'][0]['id'])
+        state_mod.save_state(st17e)
+        _chats17e = read_state()['chats']
+        _chats17e[FAKE_CHAT_A]['draft_dismissed_at'] = datetime.now(timezone.utc).isoformat()
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats=_chats17e)
+        ctx_17e3 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        FakeAgentContext._all = [ctx_17e3]
+        assert monitor.tick(_cfg17)['drafted'] == 0, 'requeue gate failed'
+        _chats17e[FAKE_CHAT_A]['draft_dismissed_at'] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats=_chats17e)
+        ctx_17e4 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        FakeAgentContext._all = [ctx_17e4]
+        assert monitor.tick(_cfg17)['drafted'] == 1, 'requeue gate stuck closed'
+        print('TEST17E_DEDUPE_REQUEUE_OK')
+
+        # --- 17F: /draft API send + dismiss + unknown id ---
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 0, 'last_nudge_at': ''},
+        })
+        st17f = state_mod.load_state()
+        assert state_mod.add_draft(st17f, FAKE_CHAT_A, 'stall_nudge', reason='unit stall')
+        did17 = st17f['drafts'][0]['id']
+        state_mod.save_state(st17f)
+        ctx_17f = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=5)
+        _orig17 = _draftmod17._get_context
+        _draftmod17._get_context = lambda cid: ctx_17f
+        try:
+            _h17 = _CSDraft17(None, None)
+            _r17 = _aio17.run(_h17.process({'draft_id': did17, 'action': 'send', 'text': 'please resume carefully'}, None))
+            assert _r17.get('success') is True, _r17
+            assert len(ctx_17f.communicated) == 1, ctx_17f.communicated
+            assert 'please resume carefully' in str(ctx_17f.communicated[0])
+            st17f2 = read_state()
+            assert st17f2.get('drafts', []) == [], st17f2.get('drafts')
+            _e17f = st17f2['chats'][FAKE_CHAT_A]
+            assert _e17f['status'] == 'nudged', _e17f
+            assert _e17f['nudge_count'] == 1, _e17f
+            assert 'draft_sent' in [h.get('action') for h in st17f2.get('history', [])], st17f2.get('history')
+            st17f3 = state_mod.load_state()
+            assert state_mod.add_draft(st17f3, FAKE_CHAT_A, 'restart_resume', reason='r2')
+            did17b = st17f3['drafts'][0]['id']
+            state_mod.save_state(st17f3)
+            _r17b = _aio17.run(_h17.process({'draft_id': did17b, 'action': 'dismiss'}, None))
+            assert _r17b.get('success') is True, _r17b
+            st17f4 = read_state()
+            assert st17f4.get('drafts', []) == []
+            assert st17f4['chats'][FAKE_CHAT_A].get('draft_dismissed_at'), st17f4['chats'][FAKE_CHAT_A]
+            assert 'draft_dismissed' in [h.get('action') for h in st17f4.get('history', [])], st17f4.get('history')
+            _r17c = _aio17.run(_h17.process({'draft_id': 'nope123', 'action': 'send'}, None))
+            assert _r17c.get('success') is False, _r17c
+        finally:
+            _draftmod17._get_context = _orig17
+        FakeAgentContext._all = []
+        print('TEST17F_DRAFT_API_OK')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

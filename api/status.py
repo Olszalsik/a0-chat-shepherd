@@ -254,6 +254,7 @@ class Status(ApiHandler):
                 'adaptive_interval_minutes': cfg.get('adaptive_interval_minutes', 60),
                 'adaptive_min_samples': cfg.get('adaptive_min_samples', 10),
                 'adaptive_step_pct': cfg.get('adaptive_step_pct', 10),
+                'supervised_mode': bool(cfg.get('supervised_mode', False)),
             },
             'last_tick': state.get('last_tick', ''),
     'hot_reload': hotreload.status(),
@@ -262,5 +263,6 @@ class Status(ApiHandler):
             'effectiveness': effectiveness,
             'throttle': throttle,
             'aggregates': aggregates_block,
+            'drafts': state.get('drafts') if isinstance(state.get('drafts'), list) else [],
             'history': state.get('history', [])[:20],
         }

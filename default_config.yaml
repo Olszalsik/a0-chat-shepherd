@@ -47,6 +47,11 @@ adaptive_thresholds: false
 adaptive_interval_minutes: 60
 adaptive_min_samples: 10
 adaptive_step_pct: 10
+# v1.16.0 supervised mode: when on, restart-resume and stalled-chat nudges
+# are NOT sent automatically. Instead an editable draft message (tailored to
+# the situation) is queued on the dashboard for human review; send or dismiss
+# it there. Wedge remediation and the goal gate stay automatic.
+supervised_mode: false
 # R3 external alert channels (optional, off by default). webhook_url
 # receives a JSON POST per alert; Telegram uses a bot token + chat id.
 # Private/LAN webhook targets require webhook_allow_private: true.

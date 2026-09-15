@@ -44,6 +44,7 @@ export const store = createStore("chatShepherdStore", {
   statusFilter: '',
   timelineOpen: '',
   timelines: {},
+  draftEdits: {},
   pollTimer: null,
   pollInterval: 5000,
 
@@ -78,6 +79,7 @@ export const store = createStore("chatShepherdStore", {
       if (json && json.success) {
         this.data = json;
         this.error = "";
+      this.initDraftEdits();
       this.applyPollFromConfig();
       } else {
         this.error = (json && json.error) || "Status request failed";
@@ -115,6 +117,36 @@ export const store = createStore("chatShepherdStore", {
     } catch (e) {
       this.error = String(e);
     }
+  },
+
+  initDraftEdits() {
+      const ds = (this.data && this.data.drafts) || [];
+      for (const d of ds) {
+          if (!(d.id in this.draftEdits)) this.draftEdits[d.id] = d.text || '';
+      }
+  },
+
+  async draftSend(draftId) {
+      try {
+          const text = (this.draftEdits[draftId] || '').trim();
+          const json = await callApi("/draft", { draft_id: draftId, action: 'send', text });
+          if (json && json.success) delete this.draftEdits[draftId];
+          else this.error = (json && json.error) || 'Draft send failed';
+          this.fetchStatus();
+      } catch (e) {
+          this.error = String(e);
+      }
+  },
+
+  async draftDismiss(draftId) {
+      try {
+          const json = await callApi("/draft", { draft_id: draftId, action: 'dismiss' });
+          if (json && json.success) delete this.draftEdits[draftId];
+          else this.error = (json && json.error) || 'Draft dismiss failed';
+          this.fetchStatus();
+      } catch (e) {
+          this.error = String(e);
+      }
   },
 
   applyPollFromConfig() {
