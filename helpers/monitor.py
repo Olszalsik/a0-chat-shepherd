@@ -180,6 +180,18 @@ def _debug_log(kind: str, message: str) -> None:
         )
         with open(files.get_abs_path(rel), 'a', encoding='utf-8') as f:
             f.write(line)
+        # v1.17.1: keep only the newest 7 daily debug files
+        try:
+            import glob
+            import os
+            old = sorted(glob.glob(files.get_abs_path('usr/plugins/chat_shepherd/data/debug-*.log')))[:-7]
+            for pth in old:
+                try:
+                    os.remove(pth)
+                except OSError:
+                    pass
+        except Exception:
+            pass
     except Exception:
         pass
 

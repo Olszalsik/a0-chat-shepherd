@@ -138,3 +138,6 @@ The monitor re-wrote the whole `state.json` on every tick even when nothing chan
 
 - `plugin.yaml` — manifest; `default_config.yaml` — defaults incl. per-status `icons` map
 - Framework references: `helpers/plugins.py` (`get_plugin_config` fallback + hooks), `helpers/api.py` (ApiHandler dispatch), `helpers/notification.py` (intervention notify)
+## v1.17.1 (2026-09-15) — review pass: webui notifications + log retention
+
+Full plugin audit (manifest/structure/patterns/security): PASS with 2 fixes shipped. Dashboard fetch/nudge/resolve/dismiss/draft/history failures previously rendered a persistent inline error div — replaced by the framework notification system (toastFrontendError), inline template + .shepherd-error css removed, store error field dropped (7 call sites, 16-point patch, node --check green). Poll-failure toasts guard on _fetchFailed so a wedged backend toasts once, not every 5s. helpers/monitor.py _debug_log now prunes daily logs beyond the newest 7 (probe-verified: 9→7 fixtures). hooks.py gains uninstall() removing debug logs only — state.json + config.json survive for reinstall continuity (live smoke: logs removed, STATE_PRESERVED). Advisories unchanged: LICENSE absent (community-only blocker), P7 read-modify-write race open. Suite ALL_TESTS_PASSED (64 markers) on this tree; both modified modules import clean in the framework runtime.

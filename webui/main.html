@@ -28,8 +28,7 @@
     .shepherd-history h3 { font-size: 1rem; margin-bottom: 8px; }
     .shepherd-history-list { max-height: 200px; overflow-y: auto; }
     .shepherd-history-item { padding: 4px 8px; font-size: 0.8rem; border-bottom: 1px solid var(--border-color, #222); }
-    .shepherd-error { color: #f44336; padding: 8px; font-size: 0.85rem; }
-.shepherd-drafts { margin-bottom: 20px; border: 1px solid var(--border-color, #444); border-radius: 6px; padding: 12px; background: rgba(0,0,0,0.2); }
+    .shepherd-drafts { margin-bottom: 20px; border: 1px solid var(--border-color, #444); border-radius: 6px; padding: 12px; background: rgba(0,0,0,0.2); }
 .shepherd-drafts h3 { margin: 0 0 10px 0; font-size: 1rem; }
 .shepherd-draft { border-bottom: 1px solid #222; padding: 10px 0; }
 .shepherd-draft:last-child { border-bottom: none; }
@@ -53,10 +52,6 @@
           <h2>🐑 Chat Shepherd</h2>
           <button class="refresh-btn" @click="$store.chatShepherdStore.fetchStatus()">Refresh</button>
         </div>
-
-        <template x-if="$store.chatShepherdStore.error">
-          <div class="shepherd-error" x-text="$store.chatShepherdStore.error"></div>
-        </template>
 
         <template x-if="$store.chatShepherdStore.data">
           <div>

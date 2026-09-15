@@ -1,5 +1,6 @@
 import { createStore } from "/js/AlpineStore.js";
 import { callJsonApi } from "/js/api.js";
+import { toastFrontendError } from "/components/notifications/notification-store.js";
 
 const API = "/api/plugins/chat_shepherd";
 
@@ -40,7 +41,7 @@ async function callApi(path, body) {
 
 export const store = createStore("chatShepherdStore", {
   data: null,
-  error: "",
+  _fetchFailed: false,
   statusFilter: '',
   timelineOpen: '',
   timelines: {},
@@ -78,44 +79,44 @@ export const store = createStore("chatShepherdStore", {
       const json = await callApi("/status");
       if (json && json.success) {
         this.data = json;
-        this.error = "";
+      this._fetchFailed = false;
       this.initDraftEdits();
       this.applyPollFromConfig();
       } else {
-        this.error = (json && json.error) || "Status request failed";
+        if (!this._fetchFailed) toastFrontendError((json && json.error) || "Status request failed", "Chat Shepherd");
       }
     } catch (e) {
-      this.error = String(e);
+      if (!this._fetchFailed) toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
     }
   },
 
   async nudge(chatId) {
     try {
       const json = await callApi("/nudge", { chat_id: chatId });
-      if (!json || !json.success) this.error = (json && json.error) || "Nudge failed";
+      if (!json || !json.success) toastFrontendError((json && json.error) || "Nudge failed", "Chat Shepherd");
       this.fetchStatus();
     } catch (e) {
-      this.error = String(e);
+      toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
     }
   },
 
   async resolve(chatId) {
     try {
       const json = await callApi("/resolve", { chat_id: chatId, action: "resolve" });
-      if (!json || !json.success) this.error = (json && json.error) || "Resolve failed";
+      if (!json || !json.success) toastFrontendError((json && json.error) || "Resolve failed", "Chat Shepherd");
       this.fetchStatus();
     } catch (e) {
-      this.error = String(e);
+      toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
     }
   },
 
   async dismiss(chatId) {
     try {
       const json = await callApi("/resolve", { chat_id: chatId, action: "dismiss" });
-      if (!json || !json.success) this.error = (json && json.error) || "Dismiss failed";
+      if (!json || !json.success) toastFrontendError((json && json.error) || "Dismiss failed", "Chat Shepherd");
       this.fetchStatus();
     } catch (e) {
-      this.error = String(e);
+      toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
     }
   },
 
@@ -131,10 +132,10 @@ export const store = createStore("chatShepherdStore", {
           const text = (this.draftEdits[draftId] || '').trim();
           const json = await callApi("/draft", { draft_id: draftId, action: 'send', text });
           if (json && json.success) delete this.draftEdits[draftId];
-          else this.error = (json && json.error) || 'Draft send failed';
+          else toastFrontendError((json && json.error) || 'Draft send failed', "Chat Shepherd");
           this.fetchStatus();
       } catch (e) {
-          this.error = String(e);
+          toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
       }
   },
 
@@ -142,10 +143,10 @@ export const store = createStore("chatShepherdStore", {
       try {
           const json = await callApi("/draft", { draft_id: draftId, action: 'dismiss' });
           if (json && json.success) delete this.draftEdits[draftId];
-          else this.error = (json && json.error) || 'Draft dismiss failed';
+          else toastFrontendError((json && json.error) || 'Draft dismiss failed', "Chat Shepherd");
           this.fetchStatus();
       } catch (e) {
-          this.error = String(e);
+          toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
       }
   },
 
@@ -194,10 +195,10 @@ export const store = createStore("chatShepherdStore", {
         this.timelines[chatId] = json;
         this.timelineOpen = chatId;
       } else {
-        this.error = (json && json.error) || 'History failed';
+        toastFrontendError((json && json.error) || 'History failed', "Chat Shepherd");
       }
     } catch (e) {
-      this.error = String(e);
+      toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
     }
   },
 

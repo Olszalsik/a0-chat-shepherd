@@ -65,3 +65,20 @@ def save_plugin_config(settings=None, **kwargs):
         return out
     except Exception:
         return settings if isinstance(settings, dict) else {}
+
+def uninstall(**kwargs):
+    # v1.17.1: remove accumulated daily debug logs on plugin removal.
+    # state.json and config.json are deliberately kept so a
+    # reinstall resumes monitoring without losing history.
+    try:
+        import glob
+        import os
+        from helpers import files as _files
+        for pth in glob.glob(_files.get_abs_path('usr/plugins/chat_shepherd/data/debug-*.log')):
+            try:
+                os.remove(pth)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return {}
