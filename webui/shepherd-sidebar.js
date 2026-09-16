@@ -64,6 +64,8 @@
   setInterval(function () {
     var s = store();
     if (s && s.data) scheduleInject();
+  // Sidebar re-render replaced the list element -> re-scope the observer.
+  if (listEl && !document.contains(listEl)) attachObserver();
   }, POLL_MS);
 
   function scheduleInject() {
@@ -153,11 +155,42 @@
     }
   }
 
-  function startObserver() {
-    var target = document.querySelector(".chats-config-list") || document.body;
-    var obs = new MutationObserver(scheduleInject);
+  // P7 follow-up: scope the MutationObserver to .chats-config-list once
+  // found instead of document.body, so unrelated DOM changes anywhere in
+  // the UI stop re-triggering badge injection. Until the list renders we
+  // keep a temporary body fallback whose only job is to notice the list
+  // appearing (then re-scope) plus normal injection scheduling; the poll
+  // loop re-scopes when the list element is detached or replaced.
+  var obs = null;
+  var listEl = null;
+  
+  function findChatList() {
+   return document.querySelector(".chats-config-list");
+  }
+  
+  function attachObserver() {
+   if (obs) obs.disconnect();
+   var target = findChatList();
+   if (target) {
+    listEl = target;
+    obs = new MutationObserver(scheduleInject);
     obs.observe(target, { childList: true, subtree: true });
-    scheduleInject();
+   } else {
+    listEl = null;
+    obs = new MutationObserver(function () {
+     if (findChatList()) {
+      attachObserver();
+      return;
+     }
+     scheduleInject();
+    });
+    obs.observe(document.body, { childList: true, subtree: true });
+   }
+   scheduleInject();
+  }
+  
+  function startObserver() {
+   attachObserver();
   }
 
   if (document.readyState === "loading") {
