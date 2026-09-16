@@ -1296,6 +1296,88 @@ def main():
             state_mod.save_state = _orig_save18
         FakeAgentContext._all = []
         print('TEST18_DURABILITY_OK')
+        # ================= TEST 19: serialized state RMW (v1.18.0) =================
+        import time as _time19
+        _orig_save19 = state_mod.save_state
+        _saves19 = []
+        state_mod.save_state = lambda st: _saves19.append(st)
+        try:
+            # 19a: transaction persists a durable change exactly once, returns its result
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+                FAKE_CHAT_A: {'status': 'running', 'nudge_count': 0, 'last_nudge_at': ''},
+            })
+            _saves19.clear()
+            def _txn19a(st):
+                state_mod.update_chat(st, FAKE_CHAT_A, status='nudged', nudge_count=1)
+                return {'ok': 1}
+            _r19a = state_mod.state_transaction_apply(_txn19a)
+            assert _r19a == {'ok': 1}, _r19a
+            assert len(_saves19) == 1, _saves19
+            _saved19a = _saves19[0]['chats'][FAKE_CHAT_A]
+            assert _saved19a['nudge_count'] == 1 and _saved19a['status'] == 'nudged', _saved19a
+            print('TEST19A_TXN_SAVE_OK')
+
+            # 19b: mutation-free transaction stays write-free (early-return paths)
+            _saves19.clear()
+            def _txn19b(st):
+                return {'peek': True}
+            assert state_mod.state_transaction_apply(_txn19b) == {'peek': True}
+            assert len(_saves19) == 0, 'no-durable-change txn must not save'
+            print('TEST19B_NOCHANGE_WRITEFREE_OK')
+
+            # 19c: exception inside apply_fn -> propagates, nothing saved, no partial state
+            _saves19.clear()
+            def _txn19c(st):
+                state_mod.update_chat(st, FAKE_CHAT_A, nudge_count=99)
+                raise RuntimeError('boom19')
+            _raised19 = False
+            try:
+                state_mod.state_transaction_apply(_txn19c)
+            except RuntimeError:
+                _raised19 = True
+            assert _raised19, 'exception must propagate'
+            assert _saves19 == [], 'failed txn must not save'
+            print('TEST19C_EXCEPTION_ATOMIC_OK')
+
+            # 19d: handler transaction blocks while the state lock is held, then completes
+            _saves19.clear()
+            _seen19 = []
+            def _txn19d(st):
+                _seen19.append('inside')
+                return {'ok': True}
+            with state_mod.state_lock():
+                _th19 = threading.Thread(target=lambda: state_mod.state_transaction_apply(_txn19d))
+                _th19.daemon = True
+                _th19.start()
+                _time19.sleep(0.3)
+                assert _seen19 == [], 'txn must block while the tick lock is held'
+            _th19.join(timeout=5)
+            assert _seen19 == ['inside'], _seen19
+            print('TEST19D_LOCK_SERIALIZES_OK')
+
+            # 19e: the whole tick holds the lock, so handler txns cannot interleave
+            FakeAgentContext._all = []
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={})
+            _saves19.clear()
+            _tick_done19 = []
+            _cfg19 = {'enabled': True, 'watch_all': True, 'stall_minutes': 5, 'max_auto_nudges': 3, 'max_nudges_per_tick': 5, 'nudge_cooldown_minutes': 0, 'notify_on_intervention': False}
+            def _run_tick19():
+                monitor.tick(_cfg19)
+                _tick_done19.append(True)
+            with state_mod.state_lock():
+                _th19b = threading.Thread(target=_run_tick19)
+                _th19b.daemon = True
+                _th19b.start()
+                _time19.sleep(0.4)
+                assert _tick_done19 == [], 'tick must hold the state lock for its whole RMW'
+            _th19b.join(timeout=5)
+            assert _tick_done19 == [True], _tick_done19
+            print('TEST19E_TICK_HOLDS_LOCK_OK')
+        finally:
+            state_mod.save_state = _orig_save19
+            FakeAgentContext._all = []
+            print('TEST19_SERIALIZATION_OK')
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

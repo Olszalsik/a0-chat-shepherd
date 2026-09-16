@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+
 from typing import Any
 
 from helpers.api import ApiHandler, Request, Response
 from helpers import plugins
 
 from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME, NUDGE_TEXT
-from usr.plugins.chat_shepherd.helpers.state import load_state, save_state, get_chat, update_chat, append_history
+from usr.plugins.chat_shepherd.helpers import state as state_mod
+from usr.plugins.chat_shepherd.helpers.state import get_chat, update_chat, append_history
 from datetime import datetime, timezone
 
 
@@ -34,28 +37,30 @@ class Nudge(ApiHandler):
         except Exception as e:
             return {'success': False, 'error': f'Nudge failed: {e}'}
 
-        now_iso = datetime.now(timezone.utc).isoformat()
-        state = load_state()
-        entry = get_chat(state, chat_id)
-        new_count = entry.get('nudge_count', 0) + 1
-        update_chat(state, chat_id,
-        nudges_sent=entry.get('nudges_sent', 0) + 1,
-            nudge_count=new_count,
-            last_nudge_at=now_iso,
-            status='nudged',
-            last_classification=f'Manual nudge (attempt {new_count})',
-        )
-        append_history(state, {
-            'chat_id': chat_id,
-            'action': 'manual_nudge',
-            'nudge_count': new_count,
-            'timestamp': now_iso,
-        })
-        save_state(state)
+        def _apply(st: dict) -> dict:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            entry = get_chat(st, chat_id)
+            new_count = entry.get('nudge_count', 0) + 1
+            update_chat(st, chat_id,
+                nudges_sent=entry.get('nudges_sent', 0) + 1,
+                nudge_count=new_count,
+                last_nudge_at=now_iso,
+                status='nudged',
+                last_classification=f'Manual nudge (attempt {new_count})',
+            )
+            append_history(st, {
+                'chat_id': chat_id,
+                'action': 'manual_nudge',
+                'nudge_count': new_count,
+                'timestamp': now_iso,
+            })
+            return {
+                'success': True,
+                'chat_id': chat_id,
+                'nudge_count': new_count,
+                'message': 'Nudge sent successfully',
+            }
 
-        return {
-            'success': True,
-            'chat_id': chat_id,
-            'nudge_count': new_count,
-            'message': 'Nudge sent successfully',
-        }
+        # v1.18.0 (P7): serialized RMW under the shared state lock; the
+        # communicate() above stays outside (audited cross-thread contract).
+        return await asyncio.to_thread(state_mod.state_transaction_apply, _apply)

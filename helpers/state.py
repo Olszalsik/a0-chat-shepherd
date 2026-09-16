@@ -108,6 +108,37 @@ def last_saved_signature() -> str:
     return _last_saved_sig
 
 
+# v1.18.0 (P7): serialized read-modify-write. The tick and the API
+# handlers each ran load_state -> mutate -> save_state unlocked, so
+# a manual action landing mid-tick could lose tick updates. One
+# module RLock serializes them; the name ends in lock so hotreload
+# lock preservation keeps one object across re-exec.
+_state_lock = threading.RLock()
+
+def state_lock():
+    # Reentrant state RMW lock; use directly as a context manager.
+    return _state_lock
+
+def state_transaction_apply(apply_fn):
+    # Run apply_fn(fresh_state) under the state lock; persist only on
+    # durable-signature change (early returns stay write-free). Sync
+    # by design: async handlers call it via asyncio.to_thread so the
+    # event loop never blocks on the tick lock hold. Exceptions
+    # propagate WITHOUT saving - partial mutations are discarded.
+    with _state_lock:
+        state = load_state()
+        sig_before = state_signature(state)
+        result = apply_fn(state)
+        changed = True
+        try:
+            changed = state_signature(state) != sig_before
+        except Exception:
+            pass
+        if changed:
+            save_state(state)
+        return result
+
+
 def save_due(min_interval_seconds: float) -> bool:
     """v1.17.0 durability gate: True when a full state.json write should
     happen now. interval <= 0 always reports due, and a freshly

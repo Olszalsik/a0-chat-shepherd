@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.17.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
+**Version:** 1.18.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
 
 ## Purpose
 
@@ -46,7 +46,7 @@ Agent monitoring: a `job_loop` extension ticks periodically, classifies every li
 - Wedge detection compares only the log ENTRY count; a long legitimate tool call that emits no log entries for `stall_minutes` can false-positive as `intervention`. With the v1.2.0 ladder this now sends an auto-continue after `wedge_nudge_after_minutes` (harmless — the intervention flag drains when the call returns) and a task-kill only with `wedge_soft_restart: true`. Since v1.10.0 the probe also reads the log mutation counter, so in-place item mutations (streaming output, progress writes) separate an actively-mutating call from a fully hung one; a healthy long streaming call can classify `spinning`, which is remediation-free by default (the immediate kill requires `wedge_soft_restart: true`).
 - `watch_all: false` skips contexts with an empty log (`_log_len <= 0`); the per-chat watch list (`allowed_chat_ids`) is implemented and enforced in `tick()` (`monitor.py:652-661`, sanitizer + settings UI wired — confirmed in the 2026-09-14 review).
 - Graceful reload (v1.9.0) covers the helpers/tick path only: `api/*` handlers keep their from-import bindings until the next plugin refresh, so endpoint changes need a refresh or restart; the `hot_reload` block in `/status` shows the last reload result.
-- **State read-modify-write race** (2026-09-14 review): `load_state()` → mutate → `save_state()` runs unlocked from the JobLoop tick AND the nudge/resolve API handlers; a manual action landing mid-tick can lose the tick's counter updates (last writer wins). The journal has `_journal_lock`, `state.json` does not (roadmap P7). Note (v1.17.0): the save gate narrows the exposure window on quiet ticks but does not close this race - still roadmap P7.
+- **State read-modify-write race** (2026-09-14 review): `load_state()` → mutate → `save_state()` runs unlocked from the JobLoop tick AND the nudge/resolve API handlers; a manual action landing mid-tick can lose the tick's counter updates (last writer wins). The journal has `_journal_lock`, `state.json` does not (roadmap P7). Note (v1.17.0): the save gate narrows the exposure window on quiet ticks but does not close this race - still roadmap P7. **RESOLVED 2026-09-16 (v1.18.0):** module-level `state._state_lock` (RLock, hot-reload-preserved) + `state.state_transaction_apply()` — the apply-fn runs on the locked snapshot, saves exactly once on durable change (v1.17.0 signature gate), stays write-free on no-change, and propagates exceptions without partial saves; the monitor tick holds the lock for its whole RMW (`_tick_impl` wrapper) and the nudge/resolve/draft handlers transact on a worker thread with `communicate()` outside the lock. TEST19A-E.
 - **`/status` bypasses the real-chats predicate** (2026-09-14 review): it classifies every live `AgentContext`, so throwaway script contexts (`verify-*`, `ctx-hook-1`) reach the sidebar/dashboard even though `tick()` never tracks them (roadmap P6.4).
 - **Test harness is Docker-bound** (2026-09-14 review): `tests/test_monitor.py` hardcodes `/a0` and is script-shaped, so `pytest` cannot collect it off-Docker and a bare repo-root `pytest` hits it as a collection side effect (roadmap P6.2).
 
@@ -90,7 +90,7 @@ Context: the plugin was being built by an agent whose chat died in the three 9p 
 
 ### P7 — review follow-ups: robustness + convention debt (after P6)
 
-- State read-modify-write lock: wrap mutate+save sequences (tick, `api/nudge.py`, `api/resolve.py`) in a module-level `RLock` so JobLoop ticks and API handlers can't drop each other's updates; `hotreload._preserve_locks` already keeps `*lock*` module attributes alive across reloads.
+- State read-modify-write lock: wrap mutate+save sequences (tick, `api/nudge.py`, `api/resolve.py`) in a module-level `RLock` so JobLoop ticks and API handlers can't drop each other's updates; `hotreload._preserve_locks` already keeps `*lock*` module attributes alive across reloads. **DONE v1.18.0 (2026-09-16):** shipped as `state.state_lock()` / `state.state_transaction_apply()`; tick wrapped via `_tick_impl`; nudge/resolve/draft handlers transact (draft.py included beyond the original list); the cosmetic resolve.py:36 misindent retired by the rewrite.
 - Inline error boxes → A0 notification toasts (`toastFrontendError` etc. from `notification-store.js`): `config.html` `setMsg`/`.cs-msg`, `main.html` `.shepherd-error`, `store.error`. Required by the plugin UI contract (`plugins/AGENTS.md`: no inline success/error boxes).
 - `shepherd-sidebar.js`: scope the MutationObserver to `.chats-config-list` once found instead of `document.body` with `subtree: true` (every DOM change currently re-triggers badge injection).
 - `api/nudge.py`: don't auto-create state entries for untracked contexts — validate with the real-chats predicate; today the next tick prunes them but the history entries linger.
@@ -113,6 +113,15 @@ Context: the plugin was being built by an agent whose chat died in the three 9p 
 - Dashboard: 📈 aggregate badge (`aggregatesLabel()` in `shepherd-store.js`) beside the 🎯 / ⚡ badges, hidden while the window is empty.
 - Tests: TEST16A-C (compute semantics incl. out-of-window and malformed entries, degenerate inputs, /status integration block); suite ALL_TESTS_PASSED on two clean runs. **Runtime note:** inside the A0 Docker container the suite must run with the framework runtime (`/opt/venv-a0/bin/python`) — TEST16C exercises the `/status` handler, whose `get_plugin_config` lazily imports framework `projects.py` → `pathspec`, which only exists in that runtime.
 - Reconciliation: two concurrent sessions converged on R4 (coordination block in the roadmap); the adopted nested-schema module was kept and the retired flat-schema consumers (suite TEST16, store getter, stray main.html badge) were migrated.
+
+### v1.18.0 — State RMW serialization (2026-09-16, P7)
+
+The last open review race: `load_state()` -> mutate -> `save_state()` ran unlocked from the JobLoop tick and the API handlers; a manual action landing mid-tick could lose the tick's counter updates (last writer wins).
+
+- **`state._state_lock`** (module RLock; hot-reload-preserved via the existing `*lock*` rule) + **`state.state_lock()`** context manager + **`state.state_transaction_apply(apply_fn)`**: the apply-fn mutates the locked snapshot; a durable change saves exactly once (through the v1.17.0 signature gate), mutation-free apply-fns stay write-free, and exceptions propagate without saving partial state.
+- **Monitor**: `tick()` is now a thin wrapper that holds the state lock for its whole read-modify-write and delegates to `_tick_impl(cfg)` — a handler transaction arriving mid-tick blocks until the tick releases (TEST19E) instead of racing it.
+- **Handlers**: `api/nudge.py`, `api/resolve.py`, `api/draft.py` run their counter/journal mutations through `state_transaction_apply` on a worker thread (`asyncio.to_thread`); `communicate()`/`AgentContext` access stays OUTSIDE the lock (audited cross-thread contract from v1.16.0); `draft.py` re-verifies the draft inside the transaction so a dismiss/send racing a re-queue acts on the fresh snapshot, and unknown-chat/no-change paths never write.
+- Tests +5 (TEST19A save-once transaction, 19B write-free no-change, 19C exception atomicity, 19D handler txn blocks while the lock is held, 19E the whole tick holds the lock) = 70 markers `ALL_TESTS_PASSED` on two clean runs under `/opt/venv`.
 
 ### v1.17.0 — State save durability (2026-09-15, R4)
 

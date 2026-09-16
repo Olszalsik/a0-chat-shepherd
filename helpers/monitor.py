@@ -639,6 +639,12 @@ def _goal_gate_check(
 
 
 def tick(cfg: dict[str, Any]) -> dict[str, Any]:
+    # v1.18.0 (P7): whole-tick RMW holds the shared state lock so API
+    # transactions cannot interleave; _tick_impl logic is unchanged.
+    with state_mod.state_lock():
+        return _tick_impl(cfg)
+
+def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     if not cfg.get('enabled', False):
         return {'skipped': True, 'reason': 'disabled'}
 
