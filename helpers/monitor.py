@@ -396,14 +396,13 @@ def _post_json(url: str, payload: dict, timeout: float = 5.0) -> bool:
     resp = requests.post(url, json=payload, timeout=timeout)
     return 200 <= resp.status_code < 300
 
-def _dispatch_external(cfg: dict, kind: str, message: str, priority: str = 'normal', sync: bool = False) -> None:
-    # R3: fan the alert out to optional external channels (generic
-    # webhook + Telegram). URL validation happens on the calling
-    # (tick) thread because it is cheap; the actual POST runs in a
-    # daemon thread so the event-loop tick never blocks. sync=True
-    # is for tests only.
+
+def _external_jobs(cfg: dict, kind: str, message: str, priority: str = 'normal') -> list[tuple[str, str, dict]]:
+    # v1.19.0: job-building seam extracted from _dispatch_external so the
+    # /test_notify endpoint reuses the exact job list the real fan-out
+    # sends (same SSRF validation + webhook_skip logging, same payloads).
     if not isinstance(cfg, dict):
-        return
+        return []
     jobs: list[tuple[str, str, dict]] = []
     webhook_url = str(cfg.get('webhook_url') or '').strip()
     if webhook_url and not bool(cfg.get('webhook_allow_private', False)):
@@ -431,28 +430,53 @@ def _dispatch_external(cfg: dict, kind: str, message: str, priority: str = 'norm
             'https://api.telegram.org/bot' + token + '/sendMessage',
             {'chat_id': tg_chat, 'text': '[Chat Shepherd/' + kind + '] ' + message},
         ))
+    return jobs
+
+
+def _post_jobs(jobs: list[tuple[str, str, dict]], message: str = '') -> dict[str, str | None]:
+    # v1.19.0: synchronous multi-channel post returning per-channel results
+    # (None = delivered, string = error). Failure logging matches the
+    # original fan-out loop exactly (channel + '_fail' kinds, ' :: ' + msg).
+    results: dict[str, str | None] = {}
+    for channel, url, payload in jobs:
+        try:
+            if not _post_json(url, payload):
+                results[channel] = 'non-2xx response'
+                _debug_log(channel + '_fail', 'non-2xx :: ' + message)
+            else:
+                results[channel] = None
+        except Exception as e:
+            results[channel] = repr(e)
+            _debug_log(channel + '_fail', repr(e) + ' :: ' + message)
+    return results
+
+
+def _dispatch_external(cfg: dict, kind: str, message: str, priority: str = 'normal', sync: bool = False) -> None:
+    # R3: fan the alert out to optional external channels (generic
+    # webhook + Telegram). URL validation happens on the calling
+    # (tick) thread because it is cheap; the actual POST runs in a
+    # daemon thread so the event-loop tick never blocks. sync=True
+    # is for tests only.
+    # v1.19.0: job building and posting live in _external_jobs /
+    # _post_jobs so the /test_notify endpoint shares this code path.
+    jobs = _external_jobs(cfg, kind, message, priority)
     if not jobs:
         return
 
     def _run() -> None:
-        for channel, url, payload in jobs:
-            try:
-                if not _post_json(url, payload):
-                    _debug_log(channel + '_fail', 'non-2xx :: ' + message)
-            except Exception as e:
-                _debug_log(channel + '_fail', repr(e) + ' :: ' + message)
+        _post_jobs(jobs, message)
 
     if sync:
         _run()
     else:
         threading.Thread(target=_run, daemon=True, name='chat_shepherd_alert').start()
 
-def _notify(kind: str, message: str, priority: str = 'normal', cfg: dict | None = None) -> bool:
-    # R2/R3: central notification helper. Returns True when the
-    # in-framework notification was accepted; failures are logged,
-    # never silently swallowed. R3: also fans out to optional
-    # external channels (webhook/Telegram) without blocking.
-    fw_ok = False
+
+def _notify_framework(kind: str, message: str, priority: str = 'normal') -> bool:
+    # v1.19.0: in-framework notification leg of _notify, lifted verbatim
+    # so the /test_notify endpoint can verify it in isolation. Returns
+    # True when NotificationManager accepted the notification; failures
+    # log notify_fail exactly like the original inline block.
     try:
         from helpers.notification import (
             NotificationManager,
@@ -470,9 +494,19 @@ def _notify(kind: str, message: str, priority: str = 'normal', cfg: dict | None 
         NotificationManager.send_notification(
             ntype, npri, message, title='Chat Shepherd'
         )
-        fw_ok = True
+        return True
     except Exception as e:
         _debug_log('notify_fail', repr(e) + ' :: ' + message)
+        return False
+
+
+def _notify(kind: str, message: str, priority: str = 'normal', cfg: dict | None = None) -> bool:
+    # R2/R3: central notification helper. Returns True when the
+    # in-framework notification was accepted; failures are logged,
+    # never silently swallowed. R3: also fans out to optional
+    # external channels (webhook/Telegram) without blocking.
+    # v1.19.0: the framework leg moved verbatim to _notify_framework.
+    fw_ok = _notify_framework(kind, message, priority)
     try:
         if cfg is None:
             from helpers import plugins as _plugins

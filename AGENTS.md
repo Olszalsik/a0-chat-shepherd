@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.18.5 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
+**Version:** 1.19.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
 
 ## Purpose
 
@@ -179,6 +179,13 @@ Durable coverage added 2026-09-17 (TEST21A-C in `tests/suite_monitor.py`): 21a �
 - `helpers/monitor.py`: the private non-rotating `data/nudge_debug.log` (naive local timestamps, no pruning) is retired — `_nudge_context` logs failures through the shared `_debug_log` (`auto_nudge_fail` kind, UTC stamps, newest-7 daily rotation) AND journals an `auto_nudge_fail` history row (`chat_id`, `error`) so delivery failures are visible in the dashboard timeline, not only a side file. `_nudge_context` gained a `chat_id` keyword; all four auto-nudge call sites (goal gate, restart-resume, stall ladder, wedge Tier-1) pass it — previously a delivery failure left NO journal trace on any path. `hooks.uninstall()` removes the legacy file alongside the daily debug logs.
 - Tests: TEST24A (forced UserMessage failure: False return, journaled row with chat_id + error, `auto_nudge_fail` line in the shared daily log, no legacy file created) + TEST24B (wedge Tier-1 with a raising communicate: no crash, `wedge_nudged` 0, failure row journaled) + TEST24C (uninstall removes a planted legacy file; pre-existing daily logs restored byte-identical).
 - P7 bookkeeping folded in: sidebar bullet stamped RESOLVED (f7f6c54, work shipped 2026-09-16), cosmetic resolve.py bullet stamped RESOLVED (v1.18.0 rewrite, byte-verified), toasts bullet updated (dashboard scope done v1.17.1; config.html save-status line remains as save-button feedback).
+
+### v1.19.0 — External-channel verification (2026-09-17, R3 closeout)
+
+- `helpers/monitor.py`: `_dispatch_external` split into test-reusable seams — `_external_jobs()` (channel job building incl. the SSRF `webhook_skip` validation) and `_post_jobs()` (synchronous fan-out returning per-channel None=delivered / error-string results, keeping the exact `webhook_fail` / `telegram_fail` debug kinds); the framework leg of `_notify()` lifted verbatim into `_notify_framework()`. `_notify` / `_dispatch_external` remain thin wrappers — tick-path behavior and the TEST5/TEST6D contracts are unchanged.
+- New `api/test_notify.py`: `POST /api/plugins/chat_shepherd/test_notify` `{channel: framework|webhook|telegram|all}` verifies the SAVED plugin config through the same code path the real fan-out uses (framework leg via `_notify_framework`; network legs via `_external_jobs` + `_post_jobs` on `asyncio.to_thread`, never the event loop). Unconfigured channels reject with an actionable error (single-channel) or land in `details` (all); SSRF-rejected URLs are reported instead of silently skipped; `telegram_bot_token` is redacted from returned error strings; every tested channel journals a `notify_test` row.
+- WebUI (`config.html`): Test all channels / Test webhook / Test Telegram buttons under the alert-channels card, wired through `callJsonApi` via the page `api()` helper with a `notifyTesting` busy gate; results render in the existing save-status line (per the documented config.html inline-status residue).
+- Tests +5 (TEST25A framework-leg success/failure independence; TEST25B `_external_jobs`/`_post_jobs` payload parity + non-2xx / raise / `webhook_skip` paths; TEST25C1-C3 endpoint all-legs + journal row, secret redaction, unconfigured/unknown-channel negatives) = 92 markers ALL_TESTS_PASSED on two clean runs under /opt/venv-a0. api/* handlers activate on plugin refresh/restart per the v1.9.0 caveat — run one refresh before the Test buttons go live on a running server.
 
 ### v1.16.0 — Supervised resume drafts (2026-09-15, R4)
 

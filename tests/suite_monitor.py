@@ -1633,6 +1633,121 @@ def main():
                 with open(_pth24, 'wb') as _f24:
                     _f24.write(_bytes24)
 
+        # --- TEST 25: external-channel verification (v1.19.0) ---
+        # 25a: _notify_framework leg succeeds and fails independently of dispatch.
+        from helpers import notification as _cs_notif25
+        from helpers import network as _cs_net25
+        from helpers import plugins as _cs_plugins25
+        from usr.plugins.chat_shepherd.api.test_notify import TestNotify as _TestNotify25
+        _orig_send25 = _cs_notif25.NotificationManager.send_notification
+        _orig_dbg25 = monitor._debug_log
+        try:
+            _sent25 = []
+            _cs_notif25.NotificationManager.send_notification = lambda *a, **k: _sent25.append(k) or True
+            assert monitor._notify_framework('info', 'leg test') is True
+            assert _sent25, 'fw send_notification not called'
+            dbg25 = []
+            monitor._debug_log = lambda kind, msg: dbg25.append((kind, msg)) or None
+            def _boom_send25(*a, **k):
+                raise RuntimeError('fw leg down')
+            _cs_notif25.NotificationManager.send_notification = _boom_send25
+            assert monitor._notify_framework('info', 'leg test') is False
+            assert any(k == 'notify_fail' and 'fw leg down' in m for k, m in dbg25), dbg25
+            print('TEST25A_FW_LEG_OK')
+        finally:
+            _cs_notif25.NotificationManager.send_notification = _orig_send25
+            monitor._debug_log = _orig_dbg25
+
+        # 25b: _external_jobs + _post_jobs seams (payload parity + structured results).
+        _orig_dbg25b = monitor._debug_log
+        _orig_post25b = monitor._post_json
+        _orig_res25b = _cs_net25.resolve_host_ips
+        try:
+            dbg25b = []
+            monitor._debug_log = lambda kind, msg: dbg25b.append((kind, msg)) or None
+            def _fake_res25b(*a, **k):
+                host = str(a[0]) if a else ''
+                import ipaddress
+                return (ipaddress.ip_address('93.184.216.34'),) if 'example.com' in host else (ipaddress.ip_address('127.0.0.1'),)
+            _cs_net25.resolve_host_ips = _fake_res25b
+            posted25b = []
+            monitor._post_json = lambda url, payload, timeout=5.0: posted25b.append((url, payload)) or True
+            jobs25 = monitor._external_jobs({'webhook_url': 'https://hooks.example.com/x'}, 'warning', 'm', 'high')
+            assert len(jobs25) == 1 and jobs25[0][0] == 'webhook', jobs25
+            assert jobs25[0][2]['kind'] == 'warning' and jobs25[0][2]['priority'] == 'high', jobs25
+            res25 = monitor._post_jobs(jobs25, 'm')
+            assert res25 == {'webhook': None}, res25
+            assert len(posted25b) == 1, posted25b
+            monitor._post_json = lambda url, payload, timeout=5.0: False
+            res25 = monitor._post_jobs(monitor._external_jobs({'webhook_url': 'https://hooks.example.com/x'}, 'info', 'm'), 'm')
+            assert res25 == {'webhook': 'non-2xx response'}, res25
+            assert any(k == 'webhook_fail' for k, _ in dbg25b), dbg25b
+            def _raise25b(url, payload, timeout=5.0):
+                raise RuntimeError('boom25b')
+            monitor._post_json = _raise25b
+            res25 = monitor._post_jobs(monitor._external_jobs({'webhook_url': 'https://hooks.example.com/x'}, 'info', 'm'), 'm')
+            assert 'boom25b' in (res25['webhook'] or ''), res25
+            dbg25b.clear()
+            jobs25 = monitor._external_jobs({'webhook_url': 'http://127.0.0.1:9/x'}, 'info', 'm')
+            assert jobs25 == [], jobs25
+            assert any(k == 'webhook_skip' for k, _ in dbg25b), dbg25b
+            print('TEST25B_POST_JOBS_SEAMS_OK')
+        finally:
+            monitor._debug_log = _orig_dbg25b
+            monitor._post_json = _orig_post25b
+            _cs_net25.resolve_host_ips = _orig_res25b
+
+        # 25c: /test_notify endpoint - all legs, journal rows, redaction, negatives.
+        import asyncio as _aio25
+        _orig_cfg25 = _cs_plugins25.get_plugin_config
+        _orig_fw25 = monitor._notify_framework
+        _orig_post25 = monitor._post_json
+        _orig_res25 = _cs_net25.resolve_host_ips
+        _truncate_journal()
+        try:
+            def _fake_res25c(*a, **k):
+                host = str(a[0]) if a else ''
+                import ipaddress
+                return (ipaddress.ip_address('93.184.216.34'),) if 'example.com' in host else (ipaddress.ip_address('127.0.0.1'),)
+            _cs_net25.resolve_host_ips = _fake_res25c
+            _cs_plugins25.get_plugin_config = lambda name: {
+                'webhook_url': 'https://hooks.example.com/probe',
+                'telegram_bot_token': 'SECRETTOK25',
+                'telegram_chat_id': '42',
+            }
+            _h25 = _TestNotify25(None, None)
+            monitor._notify_framework = lambda kind, message, priority='normal': True
+            monitor._post_json = lambda url, payload, timeout=5.0: True
+            _r25 = _aio25.run(_h25.process({'channel': 'all'}, None))
+            assert _r25.get('success') is True and _r25.get('ok') is True, _r25
+            assert _r25['results'] == {'framework': None, 'webhook': None, 'telegram': None}, _r25
+            assert _r25.get('details') == {}, _r25
+            _st25 = read_state()
+            assert any(h.get('action') == 'notify_test' for h in _st25.get('history', [])), _st25.get('history', [])[-3:]
+            print('TEST25C1_ENDPOINT_ALL_OK')
+            def _leak25(url, payload, timeout=5.0):
+                raise RuntimeError('connect failed for botSECRETTOK25/sendMessage')
+            monitor._post_json = _leak25
+            _r25 = _aio25.run(_h25.process({'channel': 'telegram'}, None))
+            assert _r25.get('ok') is False, _r25
+            _err25 = _r25['results']['telegram'] or ''
+            assert 'SECRETTOK25' not in _err25 and '***' in _err25, _r25
+            print('TEST25C2_REDACTION_OK')
+            monitor._notify_framework = lambda kind, message, priority='normal': False
+            _r25 = _aio25.run(_h25.process({'channel': 'framework'}, None))
+            assert _r25.get('ok') is False and _r25['results']['framework'], _r25
+            _cs_plugins25.get_plugin_config = lambda name: {}
+            _r25 = _aio25.run(_h25.process({'channel': 'webhook'}, None))
+            assert _r25.get('success') is False and 'webhook_url' in (_r25.get('error') or ''), _r25
+            _r25 = _aio25.run(_h25.process({'channel': 'bogus'}, None))
+            assert _r25.get('success') is False and 'Unknown channel' in (_r25.get('error') or ''), _r25
+            print('TEST25C3_ENDPOINT_NEGATIVES_OK')
+        finally:
+            _cs_plugins25.get_plugin_config = _orig_cfg25
+            monitor._notify_framework = _orig_fw25
+            monitor._post_json = _orig_post25
+            _cs_net25.resolve_host_ips = _orig_res25
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file
