@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from typing import Any
 
 from helpers.api import ApiHandler, Request, Response
@@ -75,6 +77,17 @@ def _serialize_context(ctx: Any) -> dict[str, Any]:
 
 class Status(ApiHandler):
     async def process(self, input: dict, request: Request) -> dict | Response:
+        # v1.18.1: everything in _snapshot_sync is BLOCKING work —
+        # state.json + journal reads, per-chat stat probes, context log
+        # locks. It used to run directly on the request event loop while
+        # every open tab polls it every poll_seconds, so one slow stat
+        # (bounded files.exists can block up to 5s on a degraded Docker
+        # 9p mount) froze the whole loop — which surfaced in the browser
+        # as "CSRF token request timed out" (the CSRF fetch deadline is
+        # also 5s). Offload to a worker thread; response shape unchanged.
+        return await asyncio.to_thread(self._snapshot_sync)
+
+    def _snapshot_sync(self) -> dict | Response:
         cfg = plugins.get_plugin_config(PLUGIN_NAME) or {}
         state = load_state()
         icons = _resolve_icons(cfg)

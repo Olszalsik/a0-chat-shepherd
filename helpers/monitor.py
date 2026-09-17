@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import json
 import re
 from datetime import datetime, timezone
@@ -77,15 +78,61 @@ def _minutes_since(dt: datetime | None) -> float:
     return (_now() - dt).total_seconds() / 60.0
 
 
+# v1.18.1: fs-probe caches. tick() and every /status poll stat-probed one
+# path per tracked chat (usr/chats/<id> + error.txt) through files.exists,
+# whose bounded stat can block the calling thread up to 5s on a degraded
+# Docker 9p mount. With ~100 tracked chats that was 200+ blocked stats per
+# poll. One scandir of usr/chats (parent mtime+size keyed, short TTL) and a
+# short-TTL error.txt cache cut that to a couple of syscalls per poll.
+_CHAT_DIR_BASE = 'usr/chats'
+_chat_listing_cache: dict[str, tuple[tuple[int, int], float, frozenset]] = {}
+_CHAT_LISTING_TTL_S = 2.0
+_error_file_cache: dict[str, tuple[float, bool]] = {}
+_ERROR_FILE_TTL_S = 3.0
+
+
+def _chat_dir_ids() -> frozenset[str] | None:
+    # Ids of the persisted chat dirs under usr/chats, from ONE scandir.
+    # Returns None when the listing cannot be produced (caller falls back
+    # to the per-path bounded stat, the v1.1.0 behavior).
+    base = files.get_abs_path(_CHAT_DIR_BASE)
+    now = time.monotonic()
+    try:
+        st = os.stat(base)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    cached = _chat_listing_cache.get(base)
+    if cached and cached[0] == key and (now - cached[1]) < _CHAT_LISTING_TTL_S:
+        return cached[2]
+    try:
+        with os.scandir(base) as it:
+            ids = frozenset(e.name for e in it if e.is_dir())
+    except OSError:
+        return None
+    _chat_listing_cache[base] = (key, now, ids)
+    return ids
+
+
 def _check_error_file(chat_id: str) -> bool:
+    # Short-TTL cached error.txt probe (see the fs-probe cache note above).
+    key = chat_id or ''
+    now = time.monotonic()
+    cached = _error_file_cache.get(key)
+    if cached and (now - cached[0]) < _ERROR_FILE_TTL_S:
+        return cached[1]
+    result = False
     try:
         chat_dir = files.get_abs_path(f'usr/chats/{chat_id}')
         if not chat_dir:
-            return False
-        error_path = os.path.join(chat_dir, 'error.txt')
-        return files.exists(error_path)
+            result = False
+        else:
+            error_path = os.path.join(chat_dir, 'error.txt')
+            result = files.exists(error_path)
     except Exception:
-        return False
+        result = False
+    _error_file_cache[key] = (now, result)
+    return result
 
 
 def _last_log_type(context: AgentContext) -> str:
@@ -98,6 +145,97 @@ def _last_log_type(context: AgentContext) -> str:
     except Exception:
         pass
     return ''
+
+
+def _last_log_fatal(context: AgentContext) -> bool:
+    # v1.18.1: True when the chat's recent log tail shows it stopped for a
+    # reason a blind auto-nudge must not paper over — an error entry, or a
+    # security-termination warning (e.g. the infection check logs
+    # "Infection check: TERMINATED" before raising HandledException, which
+    # the framework logs NOTHING for). Auto-nudging such a chat restarts
+    # the very behavior that got it killed and churns safety checks.
+    # Scans backwards until the first user/response item (a fresh human
+    # turn or a completed response resets the verdict).
+    # v1.18.2 fix (terminate-loop, part 2): this log-window scan alone is
+    # NOT durable — a chat_shepherd nudge injects a `user` log item and
+    # pushes the TERMINATED warning out of the window, re-arming the very
+    # nudges the guard exists to prevent. Callers now ALSO persist a
+    # `terminated_at` stamp in the state entry (see tick()) and suppress
+    # stall nudges for TERMINATION_NUDGE_COOLDOWN_MIN after it; a fresh
+    # human turn clears the stamp.
+    try:
+        with context.log._lock:
+            logs = list(context.log.logs)
+        for item in reversed(logs[-5:]):
+            ltype = str(getattr(item, 'type', '') or '')
+            if ltype == 'user' and '[chat_shepherd]' not in str(
+                getattr(item, 'content', '') or ''
+            ):
+                return False
+            if ltype == 'response':
+                return False
+            if ltype == 'error':
+                return True
+            if ltype == 'warning' and 'terminated' in str(
+                getattr(item, 'heading', '') or ''
+            ).lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# v1.18.2 fix (terminate-loop, part 2): after a chat stops on a
+# security termination / error, auto-nudges stay suppressed for this
+# long (state-persisted, survives restarts). A fresh human message
+# clears the suppression early — a human returning to the chat is an
+# explicit signal to let it run again.
+TERMINATION_NUDGE_COOLDOWN_MIN = 30.0
+
+
+def _scan_log_for_termination(context: AgentContext) -> tuple[bool, bool]:
+    """Scan the log tail for a security termination / error stop.
+
+    Returns (found, fresh_human_turn):
+    - found: the tail shows a TERMINATED warning or an error entry with no
+      completed response / user turn after it.
+    - fresh_human_turn: a user or response item appears after the fatal
+      item, meaning the chat already moved on (clears the suppression).
+    Unlike _last_log_fatal this is a full-tail scan (not just 5 items) so
+    the stamp is stamped once, durably, even if later log items hide it.
+    """
+    try:
+        with context.log._lock:
+            logs = list(context.log.logs)
+        found = False
+        for item in reversed(logs):
+            ltype = str(getattr(item, 'type', '') or '')
+            if ltype == 'user' and '[chat_shepherd]' not in str(
+                getattr(item, 'content', '') or ''
+            ):
+                # A human turn newer than any fatal item = the chat moved
+                # on; older than a found fatal item = pre-termination
+                # history, stop scanning.
+                return found, not found
+            if ltype == 'response':
+                return found, not found
+            if ltype == 'error':
+                found = True
+            elif ltype == 'warning' and 'terminated' in str(
+                getattr(item, 'heading', '') or ''
+            ).lower():
+                found = True
+        return found, False
+    except Exception:
+        return False, False
+
+
+def _termination_cooldown_active(prev_entry: dict[str, Any]) -> bool:
+    """True while the persisted termination suppression is still in force."""
+    terminated_at = _parse_dt(prev_entry.get('terminated_at', ''))
+    if terminated_at is None:
+        return False
+    return _minutes_since(terminated_at) < TERMINATION_NUDGE_COOLDOWN_MIN
 
 
 def _last_entry_type(context: AgentContext) -> str:
@@ -134,18 +272,22 @@ def _log_updates(context: AgentContext) -> int:
 def _has_chat_dir(chat_id: str) -> bool:
     """P1: a real UI chat persists its transcript under usr/chats/<id>.
 
-    Two guards, both cheap and 9p-bounded:
+    Two guards, both cheap:
     1. the id must match the framework's pattern (AgentContext.generate_id
        always yields exactly 8 alphanumerics) — script-created throwaway
        contexts ("verify-1788992102", "ctx-hook-1") pass an explicit id= and
        never match, even though message_async DOES persist their chat dir;
-    2. the usr/chats/<id> directory must exist (ad-hoc contexts that never
-       persist are invisible here). files.exists is the 9p-bounded guard, so
-       this never wedges the JobLoop thread on a lost stat.
+    2. the usr/chats/<id> directory must exist. v1.18.1: resolved from one
+       cached scandir of usr/chats instead of one bounded stat per chat per
+       call; falls back to the per-path files.exists probe when the listing
+       is unavailable.
     """
     try:
         if not CHAT_ID_PATTERN.match(chat_id or ''):
             return False
+        ids = _chat_dir_ids()
+        if ids is not None:
+            return chat_id in ids
         return bool(files.exists(files.get_abs_path(f'usr/chats/{chat_id}')))
     except Exception:
         return False
@@ -436,6 +578,21 @@ def classify_chat(
         return STATUS_PAUSED, 'Context is paused'
 
     if context.is_running():
+        # v1.18.2 fix (terminate-loop, part 1): an in-flight infection check
+        # blocks tool execution in `gate()` and freezes the agent's log for
+        # the whole analysis (up to a full main-model clarification loop).
+        # That freeze used to be misread as a stall/wedge and auto-nudged,
+        # which restarted the very behavior the check was evaluating and
+        # produced repeated "Infection check: TERMINATED" cascades. While
+        # the check's progress string is live, the chat is RUNNING — never
+        # stalled, never wedged, never nudged.
+        try:
+            _progress = str(getattr(context.log, 'progress', '') or '')
+        except Exception:
+            _progress = ''
+        if _progress.startswith('Infection check:') and 'passed' not in _progress:
+            return STATUS_RUNNING, f'Safety check in progress ({_progress})'
+
         # P3 (v1.1.0), superseded in v1.2.0: frozen != stalled. A running
         # context whose log stopped growing for stall_minutes is wedged and
         # classified as intervention — but it is no longer left for a human
@@ -472,6 +629,24 @@ def classify_chat(
 
     if _check_error_file(chat_id):
         return STATUS_ERROR, 'Chat has error.txt'
+
+    # v1.18.1: a chat that stopped on an error or a security termination
+    # (e.g. infection check) is an error, not a stall — auto-nudging it
+    # back to life just reproduces the termination.
+    if _last_log_fatal(context):
+        return (
+            STATUS_ERROR,
+            'Chat stopped by an error or security termination (no auto-nudge)',
+        )
+    # v1.18.2 fix (terminate-loop, part 2): the durable state stamp keeps
+    # the error verdict alive even when later log items (e.g. chat_shepherd
+    # nudges) bury the fatal entry. Cleared by a fresh human turn in tick().
+    if _termination_cooldown_active(prev_entry):
+        return (
+            STATUS_ERROR,
+            'Recent security termination/error; nudges suppressed for '
+            f'{int(TERMINATION_NUDGE_COOLDOWN_MIN)}m',
+        )
 
     last_log_type = _last_log_type(context)
     last_msg_dt = _parse_dt(getattr(context, 'last_message', ''))
@@ -808,6 +983,19 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
 
         new_status, reason = classify_chat(ctx, chat_id, cfg, prev, frozen_minutes)
 
+        # v1.18.2 fix (terminate-loop, part 2): persist the termination
+        # stamp durably in state. A full-tail scan catches a TERMINATED
+        # warning / error stop even when later items (shepherd nudges,
+        # progress entries) bury it; a fresh human turn (shepherd nudges
+        # excluded) clears the suppression early. The stamp gates both
+        # nudge queues below for TERMINATION_NUDGE_COOLDOWN_MIN minutes.
+        _term_found, _term_fresh_human = _scan_log_for_termination(ctx)
+        if _term_found:
+            prev['terminated_at'] = now_iso
+        elif _term_fresh_human:
+            prev['terminated_at'] = ''
+        _term_cooldown_active = _termination_cooldown_active(prev)
+
         # Restart recovery: chat was active before the restart, is
         # restored-but-idle now, and its log does not end with a completed
         # response => it was interrupted mid-task. USER contexts only -
@@ -878,7 +1066,11 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
             cooldown_ok = _minutes_since(last_nudge_dt) >= nudge_cooldown
             minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
             nudge_count = prev.get('nudge_count', 0)
-            if cooldown_ok and nudge_count < max_nudges:
+            if (
+                cooldown_ok
+                and not _term_cooldown_active
+                and nudge_count < max_nudges
+            ):
                 # Oldest stall first; final ordering happens post-loop.
                 nudge_queue.append((minutes_idle, chat_id, ctx, entry, now_iso))
         elif new_status == STATUS_INTERVENTION:
@@ -900,6 +1092,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                     wedge_max_remediations > 0
                     and wedge_count < wedge_max_remediations
                     and wedge_cooldown_ok
+                    and not _term_cooldown_active
                     and frozen_minutes >= wedge_nudge_after
                     and getattr(ctx, 'type', None) == AgentContextType.USER
                 ):
@@ -1125,6 +1318,14 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
 
     for chat_id, entry in list(state.get('chats', {}).items()):
         if entry.get('status') in (STATUS_RUNNING, STATUS_AWAITING_USER, STATUS_PAUSED):
+            # v1.18.2 fix (terminate-loop, part 3): a recent termination
+            # stamp means the last "running" interval ended in a security
+            # termination / error stop — resetting the nudge budget now
+            # would let the next stall cycle nudge→terminate forever
+            # (max_auto_nudges never actually capped anything). The budget
+            # stays consumed until the stamp expires or a human returns.
+            if _termination_cooldown_active(entry):
+                continue
             entry['nudge_count'] = 0
             entry['last_nudge_at'] = ''
             # v1.2.0: wedge budget clears on recovery (crediting already

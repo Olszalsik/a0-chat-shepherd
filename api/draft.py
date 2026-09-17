@@ -56,7 +56,8 @@ class Draft(ApiHandler):
 
         # Lock-free peek for cheap early returns only; the transaction
         # below re-finds the draft on a fresh locked snapshot.
-        peek = state_mod.load_state()
+        # v1.18.1: sync file reads stay off the request event loop.
+        peek = await asyncio.to_thread(state_mod.load_state)
         draft = None
         for d in peek.get('drafts', []):
             if isinstance(d, dict) and d.get('id') == draft_id:

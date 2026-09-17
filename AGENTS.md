@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.18.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
+**Version:** 1.18.2 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
 
 ## Purpose
 
@@ -41,7 +41,7 @@ Agent monitoring: a `job_loop` extension ticks periodically, classifies every li
 
 ## Known limitations (flagged, not fixed)
 
-- `tick()` runs synchronously on the JobLoop thread (blocking `state.json` I/O + log scans). Small files today; offload via `asyncio.to_thread` if chats/history grow. A 9p wedge here freezes only shepherding, not chats — and `files.exists` is now globally bounded.
+- `tick()` runs synchronously on the JobLoop thread (blocking `state.json` I/O + log scans). A 9p wedge here freezes only shepherding, not chats — and `files.exists` is now globally bounded. v1.18.1 moved the equivalent work OUT of the request path: `/status` and `/draft` offload via `asyncio.to_thread`, and the per-chat stat probes + journal parse are cached — the request event loop is no longer a shepherd bottleneck. Remaining user-triggered endpoints (`config`, `export`, `history`) still read files inline; they are rare and small.
 - No root `hooks.py` (no `get_plugin_config` deep-merge hook, no uninstall state cleanup) — see Local Contracts.
 - Wedge detection compares only the log ENTRY count; a long legitimate tool call that emits no log entries for `stall_minutes` can false-positive as `intervention`. With the v1.2.0 ladder this now sends an auto-continue after `wedge_nudge_after_minutes` (harmless — the intervention flag drains when the call returns) and a task-kill only with `wedge_soft_restart: true`. Since v1.10.0 the probe also reads the log mutation counter, so in-place item mutations (streaming output, progress writes) separate an actively-mutating call from a fully hung one; a healthy long streaming call can classify `spinning`, which is remediation-free by default (the immediate kill requires `wedge_soft_restart: true`).
 - `watch_all: false` skips contexts with an empty log (`_log_len <= 0`); the per-chat watch list (`allowed_chat_ids`) is implemented and enforced in `tick()` (`monitor.py:652-661`, sanitizer + settings UI wired — confirmed in the 2026-09-14 review).
@@ -133,6 +133,36 @@ The monitor re-wrote the whole `state.json` on every tick even when nothing chan
 - Wiring: `config_defaults` (default + 0-180 clamp), `default_config.yaml`, `/status` snapshot, settings field + hint, suite TEST18A-18D (quiet skip, eventful force, interval-0 legacy, due save via counting `save_state` stub).
 
 **Ownership:** `state.py` (signature + gate + load/save baseline), `monitor.py` (end-of-tick gate), `config_defaults.py`, `default_config.yaml`, `api/status.py`, `webui/config.html`, `tests/suite_monitor.py` (TEST18).
+
+### v1.18.1 — Event-loop declog + fatal-stop guard (2026-09-16)
+
+Live-instance symptoms: browser-side "CSRF token request timed out" warnings plus repeated "Infection check: TERMINATED" chat terminations. Root causes found in this plugin:
+
+- **`/status` blocked the request event loop.** Async API handlers run on the main uvicorn loop; the Status handler (polled every `poll_seconds` per open tab) ran `load_state()` (state.json + full journal re-read/parse) and one bounded stat per tracked chat (`_has_chat_dir`, `_check_error_file` — up to 5s each on a degraded Docker 9p mount) inline. One slow stat stalled ALL HTTP handling, and the browser's CSRF fetch deadline is also 5s (`webui/js/api.js` `CSRF_TIMEOUT_MS`) — hence "CSRF token request timed out" whenever a poll landed on a degraded mount. Fix: the snapshot body moved to `Status._snapshot_sync`, executed via `asyncio.to_thread` (response shape unchanged); `api/draft.py`'s lock-free peek follows the same rule.
+- **Per-poll stat storms removed.** New `monitor._chat_dir_ids()` lists `usr/chats` with ONE scandir (parent mtime+size keyed, 2s freshness TTL) and `_has_chat_dir` consults it (per-path bounded-stat fallback preserved); `_check_error_file` results are TTL-cached (3s); `state.read_journal()` gained an (mtime_ns, size)-keyed parse cache. Ticks and polls no longer spawn ~200 bounded stats each.
+- **Terminate→nudge loop broken.** `_infection_check` terminates chats via `HandledException`, which the framework logs NOWHERE (no error log item, no error.txt — see `extensions/python/_functions/agent/Agent/handle_exception/end/_90_handle_critical_exception.py`), so shepherd classified those dead chats `stalled` and auto-nudged them back to life, reproducing the termination (and burning utility-model safety checks) until the nudge budget exhausted. New `monitor._last_log_fatal()` scans the log tail backwards until the first user/response item: `error` entries or `warning` items whose heading contains "terminated" now classify `STATUS_ERROR` (❌, human decision, no auto-nudge); the next user message or a fresh response clears it naturally.
+- Tests +7 (TEST20A-20G): fatal error log, TERMINATED warning, plain warning non-fatal, response clears, tick does not nudge a fatally-stopped chat, dir-listing cache consistency, journal-cache append invalidation. Full suite `ALL_TESTS_PASSED` on the Windows host.
+- **Pre-existing TEST15E failure fixed (test bug, not code):** the adaptive fixture `_journal_actions` timestamped fresh entries with `datetime.now()`, which on Windows is quantized (~15.6ms ticks) — a batch can land on the SAME clock tick as the adaptive `window_start`, and `window_rates`' deliberate `ts <= window_start → skip` boundary then dropped the whole batch (intermittent `wedge sent=0/effective=3 → insufficient_samples`). Fixture timestamps now carry a +1s shift so they sit strictly inside the window; production boundary semantics unchanged.
+
+**Ownership:** `api/status.py` (to_thread split), `api/draft.py`, `helpers/monitor.py` (`_chat_dir_ids`, `_last_log_fatal`, classify gate, fs-probe caches), `helpers/state.py` (`_journal_read_cache`), `plugin.yaml`, `tests/suite_monitor.py` (TEST20).
+
+### v1.18.2 — Durable terminate-suppression + budget-hold (2026-09-17)
+
+Live-instance follow-up to v1.18.1: the terminate→nudge loop persisted because BOTH v1.18.1 guards were fragile. `_last_log_fatal()` scans only the last 5 log items and resets on any user/response item — a shepherd nudge injects a `user` log item and pushes the TERMINATED warning out of the window, re-arming the very nudges the guard exists to prevent. And the end-of-tick recovery loop reset `nudge_count` whenever a chat reached running/awaiting/paused, so every nudge→terminate cycle reset the budget: `max_auto_nudges` never actually capped anything (state journal showed nudge #1 "effective" → terminate → nudge #1 again, forever).
+
+Three fixes in `helpers/monitor.py` (all inline-commented "v1.18.2 fix"):
+
+- **Part 1 — in-flight safety check is never a stall/wedge.** `classify_chat()` returns `STATUS_RUNNING` ("Safety check in progress …") while `context.log.progress` starts with `Infection check:` (and is not "passed"). The checker's `gate()` freezes the log for the whole analysis (up to a main-model clarification loop); that freeze used to be misread as stalled/wedged and auto-nudged mid-check.
+- **Part 2 — durable suppression stamp.** New `_scan_log_for_termination()` full-tail scan (TERMINATED-heading warnings and error items, newest→oldest) stamps `terminated_at` into the state entry — surviving restarts — and clears it on a fresh human turn. Shepherd's own nudges (`[chat_shepherd]`-prefixed user items) are TRANSPARENT to both this scan and `_last_log_fatal()` (they no longer count as a fresh human turn). While the stamp is younger than `TERMINATION_NUDGE_COOLDOWN_MIN` (30 min), `classify_chat()` returns ERROR ("nudges suppressed") and both the stalled-nudge and wedge queues are gated off.
+- **Part 3 — budget hold across a terminate episode.** The recovery-loop `nudge_count` reset is skipped while a termination stamp is active, so a nudge→terminate cycle consumes the budget instead of resetting it.
+
+Companion fix (same incident, other side): `plugins/_infection_check` v1.1.0 degenerate-verdict guard — the checker was terminating chats on bare 12-char `<terminate/>` verdicts from free-fallback utility endpoints; it now re-checks unreliable verdicts with the main model and requires its agreement for any terminate.
+
+Live verification (2026-09-17 11:2x UTC, after the 11:20 restart): 0 auto-nudges in the journal since the fixes; 37 stamped chats all `error` status, 0 healthy chats stamped, 60 chats with cleared stamps; restart sweep found 0 interrupted chats. Suite: 12-case ad-hoc guard matrix + full suite `ALL_TESTS_PASSED` (incl. TEST20A-20G v1.18.1 contracts).
+
+Durable coverage added 2026-09-17 (TEST21A-C in `tests/suite_monitor.py`): 21a — an in-flight infection check (`log.progress`) classifies RUNNING while the same frozen running chat without the gate wedges (part 1); 21b — the `terminated_at` stamp is persisted and nudges stay suppressed across ticks even when the TERMINATED warning is buried under shepherd-nudge user items (part 2); 21c — the nudge budget is NOT reset while a stamp is active while a clean paused chat still resets (part 3). FakeCtx gained a `progress` field for the gate. Two clean full-suite passes on this tree (80 markers, RC=0).
+
+**Ownership:** `helpers/monitor.py` (classify gate, `_scan_log_for_termination`, `_termination_cooldown_active`, `TERMINATION_NUDGE_COOLDOWN_MIN`, stamp/clear in tick, queue gates, budget-hold reset); `tests/suite_monitor.py` (TEST21).
 
 ### v1.16.0 — Supervised resume drafts (2026-09-15, R4)
 

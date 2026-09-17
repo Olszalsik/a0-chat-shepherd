@@ -209,6 +209,12 @@ def append_history(state: dict, item: dict[str, Any]) -> None:
 
 # v1.6.0: append-only history journal -------------------------------
 _journal_lock = threading.RLock()
+# v1.18.1: (mtime_ns, size)-keyed parse cache for read_journal(). The
+# /status endpoint polls the journal every poll_seconds per open tab;
+# re-reading + re-parsing the whole file each time is wasted I/O. Reset
+# harmlessly on hot-reload; keyed by absolute path so tests that swap
+# JOURNAL_FILE never see a foreign cache.
+_journal_read_cache: dict[str, tuple[tuple[int, int], list]] = {}
 _state_last_save = 0.0  # v1.17.0: monotonic ts of the last full state.json write
 _last_saved_sig = ''  # v1.17.0: signature of the last written durable payload
 
@@ -243,31 +249,48 @@ def append_journal(item) -> None:
 
 def read_journal(limit=200):
     items = []
+    parsed: list = []
     with _journal_lock:
         p = _journal_abs()
         # v1.6.0 fix: open directly - files.exists() stat cache can hold a
         # stale False for a freshly created journal, silently returning
         # empty history. FileNotFoundError simply means no journal yet.
         try:
-            with open(p, 'r', encoding='utf-8') as f:
-                raw = f.read()
+            st = os.stat(p)
+            stat_key = (st.st_mtime_ns, st.st_size)
         except FileNotFoundError:
+            _journal_read_cache.pop(p, None)
             return items
         except Exception as e:
-            print('[chat_shepherd] journal read failed: ' + repr(e))
+            print('[chat_shepherd] journal stat failed: ' + repr(e))
             return items
-    for ln in raw.splitlines():
-        ln = ln.strip()
-        if not ln:
-            continue
-        try:
-            obj = json.loads(ln)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            items.append(obj)
-    if limit and len(items) > limit:
-        items = items[-limit:]
+        # v1.18.1: reuse the parsed lines while the file stat is unchanged.
+        cached = _journal_read_cache.get(p)
+        if cached is not None and cached[0] == stat_key:
+            parsed = cached[1]
+        else:
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    raw = f.read()
+            except FileNotFoundError:
+                _journal_read_cache.pop(p, None)
+                return items
+            except Exception as e:
+                print('[chat_shepherd] journal read failed: ' + repr(e))
+                return items
+            for ln in raw.splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    obj = json.loads(ln)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    parsed.append(obj)
+            _journal_read_cache[p] = (stat_key, parsed)
+    items = parsed if (not limit or len(parsed) <= limit) else parsed[-limit:]
+    items = list(items)
     items.reverse()
     return items
 

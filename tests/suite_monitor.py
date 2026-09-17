@@ -34,11 +34,12 @@ def _truncate_journal():
 
 
 class FakeCtx:
-    def __init__(self, cid, log_types, idle_minutes, ctype=None, running=False):
+    def __init__(self, cid, log_types, idle_minutes, ctype=None, running=False, progress=''):
         self.id = cid
         self.log = types.SimpleNamespace(
             _lock=threading.Lock(),
             logs=[types.SimpleNamespace(type=t) for t in log_types],
+            progress=progress,
         )
         self.paused = False
         self.last_message = datetime.now(timezone.utc) - timedelta(minutes=idle_minutes)
@@ -884,7 +885,19 @@ def main():
             return c
 
         def _journal_actions(action, count, minutes_ago=0):
-            ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+            # v1.18.1: +1s nudge for fresh entries. Windows datetime.now()
+            # is quantized (~15.6ms ticks): a fresh fixture timestamp can
+            # land on the SAME clock tick as the adaptive window_start,
+            # and window_rates' deliberate `ts <= window_start → skip`
+            # boundary then silently drops the whole batch (TEST15E
+            # intermittently saw wedge sent=0/effective=3). Entries must
+            # sit strictly INSIDE the window; the +1s shift is invisible
+            # to the stale (minutes_ago) fixtures and to the rates math.
+            ts = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=1)
+                - timedelta(minutes=minutes_ago)
+            ).isoformat()
             for _ in range(count):
                 state_mod.append_journal({
                     'chat_id': FAKE_CHAT_A,
@@ -1377,6 +1390,116 @@ def main():
             state_mod.save_state = _orig_save19
             FakeAgentContext._all = []
             print('TEST19_SERIALIZATION_OK')
+
+        # ============ TEST 20 - v1.18.1 declog + fatal-stop guard ============
+        # 20a: last log item type 'error' classifies as error (no nudge)
+        ctx_e = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        ctx_e.log.logs.append(types.SimpleNamespace(type='error'))
+        status20a, reason20a = monitor.classify_chat(ctx_e, FAKE_CHAT_A, cfg, {}, 0.0)
+        assert status20a == constants.STATUS_ERROR, (status20a, reason20a)
+        print('TEST20A_ERROR_LOG_IS_FATAL_OK')
+
+        # 20b: infection-check style TERMINATED warning is fatal
+        ctx_t = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        ctx_t.log.logs.append(types.SimpleNamespace(
+            type='warning', heading='Infection check: TERMINATED'))
+        status20b, reason20b = monitor.classify_chat(ctx_t, FAKE_CHAT_A, cfg, {}, 0.0)
+        assert status20b == constants.STATUS_ERROR, (status20b, reason20b)
+        print('TEST20B_TERMINATED_WARNING_IS_FATAL_OK')
+
+        # 20c: a plain warning is NOT fatal (stalled classification unchanged)
+        ctx_w = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        ctx_w.log.logs.append(types.SimpleNamespace(type='warning', heading='just a note'))
+        status20c, _r20c = monitor.classify_chat(ctx_w, FAKE_CHAT_A, cfg, {}, 0.0)
+        assert status20c in (constants.STATUS_STALLED, constants.STATUS_INTERVENTION), status20c
+        print('TEST20C_PLAIN_WARNING_NOT_FATAL_OK')
+
+        # 20d: a fresh response after the error clears the fatal verdict
+        ctx_r = FakeCtx(FAKE_CHAT_A, ['user', 'tool', 'error'], idle_minutes=30)
+        ctx_r.log.logs.append(types.SimpleNamespace(type='response'))
+        status20d, _r20d = monitor.classify_chat(ctx_r, FAKE_CHAT_A, cfg, {}, 0.0)
+        assert status20d == constants.STATUS_AWAITING_USER, status20d
+        print('TEST20D_RESPONSE_CLEARS_FATAL_OK')
+
+        # 20e: the tick must NOT auto-nudge a fatally-stopped chat
+        write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 0, 'last_nudge_at': ''}})
+        ctx_n = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        ctx_n.log.logs.append(types.SimpleNamespace(type='error'))
+        FakeAgentContext._all = [ctx_n]
+        s20 = monitor.tick(dict(cfg, notify_on_intervention=False))
+        assert len(ctx_n.communicated) == 0, ctx_n.communicated
+        st20 = read_state()
+        assert st20['chats'][FAKE_CHAT_A]['status'] == 'error', st20['chats'][FAKE_CHAT_A]
+        print('TEST20E_NO_NUDGE_ON_FATAL_OK')
+
+        # 20f: chat-dir listing cache consistent with real dirs
+        ids20 = monitor._chat_dir_ids()
+        assert ids20 is not None and {FAKE_CHAT_A, FAKE_CHAT_B, FAKE_CHAT_C} <= set(ids20), ids20
+        assert monitor._has_chat_dir(FAKE_CHAT_A) is True
+        assert monitor._has_chat_dir('zzzzzzzz') is False
+        print('TEST20F_DIR_CACHE_OK')
+
+        # 20g: journal read cache sees appends (stat-key invalidation)
+        _jr1 = state_mod.read_journal()
+        state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'cache_probe', 'timestamp': now_iso})
+        _jr2 = state_mod.read_journal()
+        # A stale cached parse would not contain the freshly appended entry;
+        # the read cap may hide the length delta on busy journals.
+        assert _jr2 and _jr2[0]['action'] == 'cache_probe', _jr2[:1]
+        assert any(e.get('action') == 'cache_probe' for e in _jr2), 'probe entry invisible'
+        print('TEST20G_JOURNAL_CACHE_OK')
+
+        # ============ TEST 21 - v1.18.2 terminate-loop hardening ============
+        # 21a: an in-flight infection check (log.progress) is RUNNING, never
+        # stalled/wedged - the analysis freeze must not be nudged.
+        ctx_ic = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30, running=True, progress='Infection check: analyzing...')
+        s21a, r21a = monitor.classify_chat(ctx_ic, FAKE_CHAT_A, cfg, {}, 30.0)
+        assert s21a == constants.STATUS_RUNNING, (s21a, r21a)
+        assert 'Safety check in progress' in r21a, r21a
+        # control: same frozen running chat without the gate wedges
+        ctx_nc = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30, running=True, progress='')
+        s21a2, _r21a2 = monitor.classify_chat(ctx_nc, FAKE_CHAT_A, cfg, {}, 30.0)
+        assert s21a2 == constants.STATUS_INTERVENTION, (s21a2, _r21a2)
+        print('TEST21A_INFECTION_CHECK_RUNNING_OK')
+
+        # 21b: TERMINATED warning stamps terminated_at durably; nudges stay
+        # suppressed even when the warning is buried under shepherd-nudge items
+        write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 0, 'last_nudge_at': ''}})
+        ctx_b1 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        ctx_b1.log.logs.append(types.SimpleNamespace(type='warning', heading='Infection check: TERMINATED'))
+        ctx_b1.log.logs.append(types.SimpleNamespace(type='user', content='[chat_shepherd] nudge'))
+        FakeAgentContext._all = [ctx_b1]
+        monitor.tick(dict(cfg, notify_on_intervention=False))
+        st21b = read_state()
+        assert st21b['chats'][FAKE_CHAT_A].get('terminated_at'), st21b['chats'][FAKE_CHAT_A]
+        assert len(ctx_b1.communicated) == 0, ctx_b1.communicated
+        # second tick: warning buried beyond the 5-item fatal window; the
+        # persisted stamp keeps the verdict an error with no auto-nudge
+        ctx_b2 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+        ctx_b2.log.logs.append(types.SimpleNamespace(type='warning', heading='Infection check: TERMINATED'))
+        for _i in range(5):
+            ctx_b2.log.logs.append(types.SimpleNamespace(type='user', content='[chat_shepherd] nudge'))
+        FakeAgentContext._all = [ctx_b2]
+        monitor.tick(dict(cfg, notify_on_intervention=False))
+        assert len(ctx_b2.communicated) == 0, ctx_b2.communicated
+        st21b2 = read_state()
+        assert st21b2['chats'][FAKE_CHAT_A]['status'] == 'error', st21b2['chats'][FAKE_CHAT_A]
+        print('TEST21B_DURABLE_TERMINATION_STAMP_OK')
+
+        # 21c: the nudge budget is NOT reset while a termination stamp is active;
+        # a clean paused chat still resets normally
+        ctx_pa = FakeCtx(FAKE_CHAT_A, ['user', 'tool', 'tool'], idle_minutes=5)
+        ctx_pa.log.logs.append(types.SimpleNamespace(type='warning', heading='Infection check: TERMINATED'))
+        ctx_pa.paused = True
+        ctx_pb = FakeCtx(FAKE_CHAT_B, ['user', 'tool', 'response'], idle_minutes=5)
+        ctx_pb.paused = True
+        write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'paused', 'nudge_count': 3}, FAKE_CHAT_B: {'status': 'paused', 'nudge_count': 2}})
+        FakeAgentContext._all = [ctx_pa, ctx_pb]
+        monitor.tick(dict(cfg, notify_on_intervention=False))
+        st21c = read_state()
+        assert st21c['chats'][FAKE_CHAT_A]['nudge_count'] == 3, st21c['chats'][FAKE_CHAT_A]
+        assert st21c['chats'][FAKE_CHAT_B]['nudge_count'] == 0, st21c['chats'][FAKE_CHAT_B]
+        print('TEST21C_BUDGET_HOLD_OK')
 
         print('ALL_TESTS_PASSED')
     finally:
