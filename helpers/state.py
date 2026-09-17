@@ -247,7 +247,7 @@ def append_journal(item) -> None:
         except Exception as e:
             print('[chat_shepherd] journal append failed: ' + repr(e))
 
-def read_journal(limit=200):
+def read_journal(limit=200, chat_id=None):
     items = []
     parsed: list = []
     with _journal_lock:
@@ -289,7 +289,15 @@ def read_journal(limit=200):
                 if isinstance(obj, dict):
                     parsed.append(obj)
             _journal_read_cache[p] = (stat_key, parsed)
-    items = parsed if (not limit or len(parsed) <= limit) else parsed[-limit:]
+    # v1.18.4 (P7): chat_id filters per-chat AFTER the full parse (cache
+    # reuse unchanged) so per-chat reads trim the chat's own tail instead
+    # of the global tail cap - api/history.py keeps this chat's older
+    # entries on busy instances.
+    if chat_id:
+        selected = [obj for obj in parsed if obj.get('chat_id') == chat_id]
+    else:
+        selected = parsed
+    items = selected if (not limit or len(selected) <= limit) else selected[-limit:]
     items = list(items)
     items.reverse()
     return items

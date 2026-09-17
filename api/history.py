@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from helpers.api import ApiHandler, Request, Response
 
-from usr.plugins.chat_shepherd.helpers.state import load_state
+from usr.plugins.chat_shepherd.helpers.state import read_journal
 from usr.plugins.chat_shepherd.helpers import monitor
-
 
 class History(ApiHandler):
     # Per-chat timeline: this chat's entries from the shared monitor
     # history (newest first), plus its human-readable display name.
+    # v1.18.4 (P7): reads the journal with a chat_id filter directly -
+    # the old load_state() path trimmed the GLOBAL 200-entry mirror
+    # before filtering, so this chat's older entries silently vanished
+    # on busy instances.
     async def process(self, input: dict, request: Request) -> dict | Response:
         body = input or {}
         chat_id = str(body.get('chat_id', '')).strip()
@@ -19,11 +22,7 @@ class History(ApiHandler):
         except (TypeError, ValueError):
             limit = 30
         limit = max(1, min(50, limit))
-        state = load_state()
-        items = [
-            h for h in state.get('history', [])
-            if isinstance(h, dict) and h.get('chat_id') == chat_id
-        ][:limit]
+        items = read_journal(limit, chat_id=chat_id)
         try:
             name = monitor._chat_display_name(chat_id)
         except Exception:

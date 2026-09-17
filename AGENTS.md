@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.18.3 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
+**Version:** 1.18.4 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
 
 ## Purpose
 
@@ -94,7 +94,7 @@ Context: the plugin was being built by an agent whose chat died in the three 9p 
 - Inline error boxes → A0 notification toasts (`toastFrontendError` etc. from `notification-store.js`): `config.html` `setMsg`/`.cs-msg`, `main.html` `.shepherd-error`, `store.error`. Required by the plugin UI contract (`plugins/AGENTS.md`: no inline success/error boxes).
 - `shepherd-sidebar.js`: scope the MutationObserver to `.chats-config-list` once found instead of `document.body` with `subtree: true` (every DOM change currently re-triggers badge injection).
 - `api/nudge.py`: don't auto-create state entries for untracked contexts — validate with the real-chats predicate; today the next tick prunes them but the history entries linger. **RESOLVED 2026-09-17 (v1.18.3):** the handler gates on `monitor._has_chat_dir` (the exact tick predicate: 8-alnum framework id pattern + persisted `usr/chats/<id>` dir) and rejects untracked ids BEFORE `communicate()` and before the state RMW; the context lookup moved to a module-level `_get_context` seam (draft.py pattern); TEST22A-B. — validate with the real-chats predicate; today the next tick prunes them but the history entries linger.
-- `read_journal(chat_id=...)` filter so `api/history.py` per-chat timelines stop silently losing entries beyond the global 200-entry tail on busy instances.
+- `read_journal(chat_id=...)` filter so `api/history.py` per-chat timelines stop silently losing entries beyond the global 200-entry tail on busy instances. **RESOLVED 2026-09-17 (v1.18.4):** `state.read_journal()` gained a `chat_id` keyword that filters after the full parse (stat-keyed cache reuse unchanged) so per-chat reads trim the chat's own tail instead of the global 200-entry cap; `api/history.py` now calls the filtered read directly instead of the global `load_state()` mirror; TEST23A-B.
 - Consolidate `_nudge_context`'s private `nudge_debug.log` into `_debug_log` (separate non-rotating file with naive local timestamps today), and record failed auto-nudges in history so delivery failures are visible outside the log file.
 - Cosmetic: `api/resolve.py:36` misindented return.
 
@@ -168,6 +168,11 @@ Durable coverage added 2026-09-17 (TEST21A-C in `tests/suite_monitor.py`): 21a �
 
 - `api/nudge.py` no longer auto-creates state entries for untracked contexts: a manual nudge must pass the exact tick predicate (`monitor._has_chat_dir` = 8-alnum framework id pattern + persisted `usr/chats/<id>` transcript dir) and is rejected BEFORE `communicate()` and before `get_chat()` can auto-create the ghost entry. Old behavior: a nudge aimed at a script context (`verify-*`) wrote a `manual_nudge` history row + state entry that lingered until the next tick pruned them. Context lookup moved to a module-level `_get_context` seam (same test-patchable pattern as `api/draft.py`); the v1.18.0 serialized-RMW transaction and the communicate-outside-the-lock contract are unchanged.
 - Tests: TEST22A (untracked id rejected, zero communicate, no state entry, no journal row) + TEST22B (tracked chat still nudges: communicate + nudge_count bump + `manual_nudge` journal row).
+
+### v1.18.4 — read_journal chat_id filter (2026-09-17, P7)
+
+- `helpers/state.py`: `read_journal(limit=200, chat_id=None)` filters per-chat AFTER the full parse, so per-chat reads trim the chat's own tail instead of the global 200-entry cap; the stat-keyed parse cache (`_journal_read_cache`) and the positional `read_journal(limit)` callers (state mirror, suite) are unchanged. `api/history.py` now calls the filtered read directly instead of filtering the global `load_state()` mirror — per-chat timelines keep this chat's older entries on busy instances where 200 newer global entries previously buried them.
+- Tests: TEST23A (3 early chat-A entries buried under 205 chat-B entries — the per-chat read still returns all three newest-first while the global 10-tail stays chat-B-only) + TEST23B (the /history handler serves the buried entries).
 
 ### v1.16.0 — Supervised resume drafts (2026-09-15, R4)
 

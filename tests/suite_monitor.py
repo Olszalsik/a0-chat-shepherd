@@ -1540,6 +1540,30 @@ def main():
         finally:
             _nudgemod22._get_context = _orig22
 
+        # --- TEST 23: read_journal chat_id filter (v1.18.4, P7) ---
+        # 23a: per-chat reads trim the CHAT's own tail, not the global cap:
+        # 3 early chat-A entries buried under 205 chat-B entries (beyond the
+        # global 200 tail) are still returned, newest-first.
+        _truncate_journal()
+        for _i23 in range(1, 4):
+            state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'early_a_' + str(_i23), 'timestamp': datetime.now(timezone.utc).isoformat()})
+        for _i23 in range(205):
+            state_mod.append_journal({'chat_id': FAKE_CHAT_B, 'action': 'filler_b', 'timestamp': datetime.now(timezone.utc).isoformat()})
+        _per23 = state_mod.read_journal(limit=10, chat_id=FAKE_CHAT_A)
+        assert [h.get('action') for h in _per23] == ['early_a_3', 'early_a_2', 'early_a_1'], _per23
+        _tail23 = state_mod.read_journal(limit=10)
+        assert _tail23 and all(h.get('chat_id') == FAKE_CHAT_B for h in _tail23), _tail23
+        print('TEST23A_PERCHAT_TAIL_OK')
+
+        # 23b: /history serves this chat's older entries beyond the global tail.
+        import asyncio as _aio23
+        from usr.plugins.chat_shepherd.api.history import History as _CSHistory23
+        _h23 = _CSHistory23(None, None)
+        _r23 = _aio23.run(_h23.process({'chat_id': FAKE_CHAT_A, 'limit': 30}, None))
+        assert _r23.get('success') is True, _r23
+        assert [h.get('action') for h in _r23.get('history', [])] == ['early_a_3', 'early_a_2', 'early_a_1'], _r23
+        print('TEST23B_HISTORY_API_PERCHAT_OK')
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file
