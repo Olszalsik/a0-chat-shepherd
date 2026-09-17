@@ -534,7 +534,7 @@ def _record_wedge_outcome(state: dict, chat_id: str, now_iso: str) -> None:
     })
 
 
-def _nudge_context(context: AgentContext, text: str | None = None) -> bool:
+def _nudge_context(context: AgentContext, text: str | None = None, chat_id: str = '') -> bool:
     try:
         # P4 cross-thread contract (audited 2026-09-10): tick() runs on the
         # JobLoop EventLoopThread, but `context.communicate()` is safe to call
@@ -551,12 +551,18 @@ def _nudge_context(context: AgentContext, text: str | None = None) -> bool:
         context.communicate(msg)
         return True
     except Exception as e:
+        # v1.18.5 (P7): the private non-rotating nudge_debug.log is retired -
+        # failures flow through the shared kind-tagged rotating _debug_log
+        # AND a journal row so delivery failures are visible in the dashboard
+        # timeline, not only in a side file.
+        _debug_log('auto_nudge_fail', repr(e) + (' chat=' + chat_id if chat_id else ''))
         try:
-            import os
-            from datetime import datetime as _dt
-            dbg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'nudge_debug.log')
-            with open(dbg, 'a', encoding='utf-8') as f:
-                f.write(f"{_dt.now().isoformat()} auto_nudge error: {e!r}\n")
+            state_mod.append_journal({
+                'chat_id': chat_id or '',
+                'action': 'auto_nudge_fail',
+                'error': repr(e),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+            })
         except Exception:
             pass
         return False
@@ -787,7 +793,7 @@ def _goal_gate_check(
         return False
     objective = str(goal.get('objective', ''))[:GOAL_GATE_OBJECTIVE_MAX]
     if not _nudge_context(
-        ctx, GOAL_GATE_TEXT.replace('{objective}', objective)
+        ctx, GOAL_GATE_TEXT.replace('{objective}', objective), chat_id=chat_id
     ):
         return False
     entry['goal_gate_count'] = count + 1
@@ -1164,7 +1170,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
         for minutes_idle, chat_id, ctx, entry, now_iso, text in resume_queue:
             if summary['nudges_this_tick'] >= resume_budget:
                 break
-            if _nudge_context(ctx, text):
+            if _nudge_context(ctx, text, chat_id=chat_id):
                 prev = state_mod.get_chat(state, chat_id)
                 entry['nudge_count'] = prev.get('nudge_count', 0) + 1
                 entry['nudges_sent'] = entry.get('nudges_sent', 0) + 1
@@ -1202,7 +1208,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 ):
                     summary['drafted'] += 1
                 continue
-            if _nudge_context(ctx):
+            if _nudge_context(ctx, chat_id=chat_id):
                 prev = state_mod.get_chat(state, chat_id)
                 entry['nudge_count'] = prev.get('nudge_count', 0) + 1
                 entry['nudges_sent'] = entry.get('nudges_sent', 0) + 1
@@ -1277,7 +1283,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                     _debug_log('wedge_restart_fail', chat_id + ' ' + repr(e))
                     continue
             else:
-                if not _nudge_context(ctx, WEDGE_NUDGE_TEXT):
+                if not _nudge_context(ctx, WEDGE_NUDGE_TEXT, chat_id=chat_id):
                     continue
                 summary['wedge_nudged'] += 1
             entry['wedge_nudge_count'] = attempt

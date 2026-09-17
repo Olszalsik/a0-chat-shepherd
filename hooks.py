@@ -79,6 +79,13 @@ def uninstall(**kwargs):
                 os.remove(pth)
             except OSError:
                 pass
+        # v1.18.5 (P7): also remove the legacy nudge_debug.log from the
+        # pre-v1.18.5 private-file era.
+        for pth in glob.glob(_files.get_abs_path('usr/plugins/chat_shepherd/data/nudge_debug.log')):
+            try:
+                os.remove(pth)
+            except OSError:
+                pass
     except Exception:
         pass
     return {}

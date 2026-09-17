@@ -1564,6 +1564,75 @@ def main():
         assert [h.get('action') for h in _r23.get('history', [])] == ['early_a_3', 'early_a_2', 'early_a_1'], _r23
         print('TEST23B_HISTORY_API_PERCHAT_OK')
 
+        # --- TEST 24: nudge failure visibility (v1.18.5, P7 closeout) ---
+        # 24a: a failing communicate is journaled (auto_nudge_fail) + logged
+        # through the shared rotating debug log; the legacy nudge_debug.log
+        # file is never created.
+        _truncate_journal()
+        import agent as _agent_mod24
+        class _BoomUserMessage24:
+            def __init__(self, *a, **k):
+                raise RuntimeError('cs_nudge_fail_probe')
+        _orig_um24 = _agent_mod24.UserMessage
+        _data24 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(monitor.__file__))), 'data')
+        _legacy24 = os.path.join(_data24, 'nudge_debug.log')
+        try:
+            _agent_mod24.UserMessage = _BoomUserMessage24
+            _ctx24 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+            _ok24 = monitor._nudge_context(_ctx24, 'please resume', chat_id=FAKE_CHAT_A)
+            assert _ok24 is False, _ok24
+            _st24 = read_state()
+            assert any(
+                h.get('action') == 'auto_nudge_fail' and h.get('chat_id') == FAKE_CHAT_A
+                and 'cs_nudge_fail_probe' in h.get('error', '')
+                for h in _st24.get('history', [])
+            ), _st24.get('history', [])[:5]
+            _dbg24 = os.path.join(_data24, 'debug-' + datetime.now(timezone.utc).strftime('%Y-%m-%d') + '.log')
+            assert os.path.exists(_dbg24), _dbg24
+            assert 'auto_nudge_fail' in open(_dbg24, encoding='utf-8').read(), 'shared debug log missing failure kind'
+            assert not os.path.exists(_legacy24), 'legacy nudge_debug.log was recreated'
+            print('TEST24A_NUDGE_FAIL_JOURNALED_OK')
+            _agent_mod24.UserMessage = _orig_um24
+
+            # 24b: wedge Tier-1 with a raising communicate - no crash, failure
+            # row journaled with the chat id, wedge_nudged stays 0.
+            write_state(fresh_tick, chats=wedge_state(12))
+            _ctx24b = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30, running=True)
+            def _boom24b(_msg):
+                raise RuntimeError('cs_wedge_nudge_fail')
+            _ctx24b.communicate = _boom24b
+            FakeAgentContext._all = [_ctx24b]
+            _s24b = monitor.tick(wedge_cfg)
+            assert _s24b['wedged'] == 1 and _s24b['wedge_nudged'] == 0, _s24b
+            _st24b = read_state()
+            assert any(
+                h.get('action') == 'auto_nudge_fail' and h.get('chat_id') == FAKE_CHAT_A
+                and 'cs_wedge_nudge_fail' in h.get('error', '')
+                for h in _st24b.get('history', [])
+            ), _st24b.get('history', [])[:5]
+            print('TEST24B_WEDGE_FAIL_JOURNALED_OK')
+        finally:
+            _agent_mod24.UserMessage = _orig_um24
+
+        # 24c: hooks.uninstall removes the planted legacy file; pre-existing
+        # daily debug logs are restored byte-identical afterwards.
+        import glob as _glob24
+        from usr.plugins.chat_shepherd import hooks as _cs_hooks24
+        _saved24 = {}
+        for _pth24 in _glob24.glob(os.path.join(_data24, 'debug-*.log')):
+            with open(_pth24, 'rb') as _f24:
+                _saved24[_pth24] = _f24.read()
+        with open(_legacy24, 'w', encoding='utf-8') as _f24:
+            _f24.write('legacy probe')
+        try:
+            _cs_hooks24.uninstall()
+            assert not os.path.exists(_legacy24), 'legacy file survived uninstall'
+            print('TEST24C_HOOKS_LEGACY_CLEAN_OK')
+        finally:
+            for _pth24, _bytes24 in _saved24.items():
+                with open(_pth24, 'wb') as _f24:
+                    _f24.write(_bytes24)
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file
