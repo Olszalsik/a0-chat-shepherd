@@ -9,8 +9,27 @@ from helpers import plugins
 
 from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME, NUDGE_TEXT
 from usr.plugins.chat_shepherd.helpers import state as state_mod
+from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers.state import get_chat, update_chat, append_history
 from datetime import datetime, timezone
+
+
+def _get_context(chat_id: str):
+    # Module-level seam so tests can patch the framework lookup
+    # (same pattern as api/draft.py).
+    from agent import AgentContext
+
+    return AgentContext.get(chat_id)
+
+
+def _is_tracked_chat(chat_id: str) -> bool:
+    # v1.18.3 (P7): the exact predicate tick() applies - 8-alnum framework
+    # id pattern plus a persisted usr/chats/<id> transcript dir. Manual
+    # nudges may only target real UI chats, never script-created contexts.
+    try:
+        return monitor._has_chat_dir(chat_id)
+    except Exception:
+        return False
 
 
 class Nudge(ApiHandler):
@@ -21,13 +40,18 @@ class Nudge(ApiHandler):
         if not chat_id:
             return {'success': False, 'error': 'chat_id is required'}
 
+        if not _is_tracked_chat(chat_id):
+            # v1.18.3 (P7): reject BEFORE communicate() and before get_chat()
+            # can auto-create a ghost state entry for a context the monitor
+            # never tracks (e.g. script-created verify-* contexts).
+            return {'success': False, 'error': f'Chat {chat_id} is not a tracked chat'}
+
         try:
-            from agent import AgentContext
             from agent import UserMessage
         except Exception as e:
             return {'success': False, 'error': f'Import error: {e}'}
 
-        ctx = AgentContext.get(chat_id)
+        ctx = _get_context(chat_id)
         if ctx is None:
             return {'success': False, 'error': f'Context {chat_id} not found'}
 

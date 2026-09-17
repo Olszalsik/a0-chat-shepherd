@@ -1501,6 +1501,45 @@ def main():
         assert st21c['chats'][FAKE_CHAT_B]['nudge_count'] == 0, st21c['chats'][FAKE_CHAT_B]
         print('TEST21C_BUDGET_HOLD_OK')
 
+        # --- TEST 22: /nudge tracked-chat gate (v1.18.3, P7) ---
+        # 22a: an untracked context id is rejected BEFORE communicate() and
+        # before get_chat() can auto-create a ghost state entry.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 0, 'last_nudge_at': ''},
+        })
+        import asyncio as _aio22
+        from usr.plugins.chat_shepherd.api.nudge import Nudge as _CSNudge22
+        from usr.plugins.chat_shepherd.api import nudge as _nudgemod22
+        _ctx22 = FakeCtx('zzzzzzzz', ['user', 'tool'], idle_minutes=30)
+        _orig22 = _nudgemod22._get_context
+        _nudgemod22._get_context = lambda cid: _ctx22
+        try:
+            _h22 = _CSNudge22(None, None)
+            _r22 = _aio22.run(_h22.process({'chat_id': 'zzzzzzzz'}, None))
+            assert _r22.get('success') is False, _r22
+            assert 'not a tracked chat' in _r22.get('error', ''), _r22
+            assert len(_ctx22.communicated) == 0, _ctx22.communicated
+            _st22 = read_state()
+            assert 'zzzzzzzz' not in _st22['chats'], sorted(_st22['chats'])
+            assert not any(h.get('chat_id') == 'zzzzzzzz' for h in _st22.get('history', [])), _st22.get('history')
+            print('TEST22A_UNTRACKED_NUDGE_REJECTED_OK')
+
+            # 22b: a tracked chat still nudges through (communicate + state bump).
+            _ctx22b = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+            _nudgemod22._get_context = lambda cid: _ctx22b
+            _r22b = _aio22.run(_h22.process({'chat_id': FAKE_CHAT_A, 'text': 'resume please'}, None))
+            assert _r22b.get('success') is True, _r22b
+            assert len(_ctx22b.communicated) == 1, _ctx22b.communicated
+            assert 'resume please' in str(_ctx22b.communicated[0]), _ctx22b.communicated
+            _st22b = read_state()
+            _e22b = _st22b['chats'][FAKE_CHAT_A]
+            assert _e22b['nudge_count'] == 1, _e22b
+            assert _e22b['status'] == 'nudged', _e22b
+            assert 'manual_nudge' in [h.get('action') for h in _st22b.get('history', [])], _st22b.get('history')
+            print('TEST22B_TRACKED_NUDGE_OK')
+        finally:
+            _nudgemod22._get_context = _orig22
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

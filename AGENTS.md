@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.18.2 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
+**Version:** 1.18.3 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-14 external audit (findings → roadmap P6/P7)
 
 ## Purpose
 
@@ -93,7 +93,7 @@ Context: the plugin was being built by an agent whose chat died in the three 9p 
 - State read-modify-write lock: wrap mutate+save sequences (tick, `api/nudge.py`, `api/resolve.py`) in a module-level `RLock` so JobLoop ticks and API handlers can't drop each other's updates; `hotreload._preserve_locks` already keeps `*lock*` module attributes alive across reloads. **DONE v1.18.0 (2026-09-16):** shipped as `state.state_lock()` / `state.state_transaction_apply()`; tick wrapped via `_tick_impl`; nudge/resolve/draft handlers transact (draft.py included beyond the original list); the cosmetic resolve.py:36 misindent retired by the rewrite.
 - Inline error boxes → A0 notification toasts (`toastFrontendError` etc. from `notification-store.js`): `config.html` `setMsg`/`.cs-msg`, `main.html` `.shepherd-error`, `store.error`. Required by the plugin UI contract (`plugins/AGENTS.md`: no inline success/error boxes).
 - `shepherd-sidebar.js`: scope the MutationObserver to `.chats-config-list` once found instead of `document.body` with `subtree: true` (every DOM change currently re-triggers badge injection).
-- `api/nudge.py`: don't auto-create state entries for untracked contexts — validate with the real-chats predicate; today the next tick prunes them but the history entries linger.
+- `api/nudge.py`: don't auto-create state entries for untracked contexts — validate with the real-chats predicate; today the next tick prunes them but the history entries linger. **RESOLVED 2026-09-17 (v1.18.3):** the handler gates on `monitor._has_chat_dir` (the exact tick predicate: 8-alnum framework id pattern + persisted `usr/chats/<id>` dir) and rejects untracked ids BEFORE `communicate()` and before the state RMW; the context lookup moved to a module-level `_get_context` seam (draft.py pattern); TEST22A-B. — validate with the real-chats predicate; today the next tick prunes them but the history entries linger.
 - `read_journal(chat_id=...)` filter so `api/history.py` per-chat timelines stop silently losing entries beyond the global 200-entry tail on busy instances.
 - Consolidate `_nudge_context`'s private `nudge_debug.log` into `_debug_log` (separate non-rotating file with naive local timestamps today), and record failed auto-nudges in history so delivery failures are visible outside the log file.
 - Cosmetic: `api/resolve.py:36` misindented return.
@@ -163,6 +163,11 @@ Live verification (2026-09-17 11:2x UTC, after the 11:20 restart): 0 auto-nudges
 Durable coverage added 2026-09-17 (TEST21A-C in `tests/suite_monitor.py`): 21a — an in-flight infection check (`log.progress`) classifies RUNNING while the same frozen running chat without the gate wedges (part 1); 21b — the `terminated_at` stamp is persisted and nudges stay suppressed across ticks even when the TERMINATED warning is buried under shepherd-nudge user items (part 2); 21c — the nudge budget is NOT reset while a stamp is active while a clean paused chat still resets (part 3). FakeCtx gained a `progress` field for the gate. Two clean full-suite passes on this tree (80 markers, RC=0).
 
 **Ownership:** `helpers/monitor.py` (classify gate, `_scan_log_for_termination`, `_termination_cooldown_active`, `TERMINATION_NUDGE_COOLDOWN_MIN`, stamp/clear in tick, queue gates, budget-hold reset); `tests/suite_monitor.py` (TEST21).
+
+### v1.18.3 — Nudge tracked-chat gate (2026-09-17, P7)
+
+- `api/nudge.py` no longer auto-creates state entries for untracked contexts: a manual nudge must pass the exact tick predicate (`monitor._has_chat_dir` = 8-alnum framework id pattern + persisted `usr/chats/<id>` transcript dir) and is rejected BEFORE `communicate()` and before `get_chat()` can auto-create the ghost entry. Old behavior: a nudge aimed at a script context (`verify-*`) wrote a `manual_nudge` history row + state entry that lingered until the next tick pruned them. Context lookup moved to a module-level `_get_context` seam (same test-patchable pattern as `api/draft.py`); the v1.18.0 serialized-RMW transaction and the communicate-outside-the-lock contract are unchanged.
+- Tests: TEST22A (untracked id rejected, zero communicate, no state entry, no journal row) + TEST22B (tracked chat still nudges: communicate + nudge_count bump + `manual_nudge` journal row).
 
 ### v1.16.0 — Supervised resume drafts (2026-09-15, R4)
 
