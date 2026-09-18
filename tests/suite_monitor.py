@@ -1748,6 +1748,37 @@ def main():
             monitor._post_json = _orig_post25
             _cs_net25.resolve_host_ips = _orig_res25
 
+        # TEST26A/B: config.html toast migration (v1.19.1) - the inline
+        # status line is retired; framework toasts via lazy import must be
+        # wired with zero inline-box residue and a syntax-clean script block.
+        _cfgp26 = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'webui', 'config.html')
+        _cfg26 = open(_cfgp26, encoding='utf-8').read()
+        for _gone26 in ('setMsg', 'lastMsg', 'lastOk', 'lastErr', 'cs-msg', 'cs-err', 'cs-on'):
+         assert _gone26 not in _cfg26, 'config.html residue: ' + _gone26
+        for _want26 in ('async toast(msg, ok)', 'toastFrontendSuccess', 'toastFrontendError', 'notification-store.js'):
+         assert _want26 in _cfg26, 'config.html missing: ' + _want26
+        assert _cfg26.count('this.toast(') == 8, 'toast call sites: %d' % _cfg26.count('this.toast(')
+        assert 'Save settings' in _cfg26 and '@click="save()"' in _cfg26, 'save button lost'
+        print('TEST26A_TOAST_SEAM_OK')
+        import re as _re26, shutil as _sh26, subprocess as _sp26, tempfile as _tf26
+        _node26 = _sh26.which('node')
+        if _node26:
+         _m26 = _re26.search(r'<script>(.*)</script>', _cfg26, _re26.S)
+         assert _m26, 'config.html script block not found'
+         _f26 = _tf26.NamedTemporaryFile(mode='w', suffix='.js', delete=False, encoding='utf-8')
+         try:
+          _f26.write(_m26.group(1))
+          _f26.close()
+          _chk26 = _sp26.run([_node26, '--check', _f26.name], capture_output=True, text=True)
+          assert _chk26.returncode == 0, 'node --check failed: ' + _chk26.stderr[:400]
+         finally:
+          try:
+           os.unlink(_f26.name)
+          except Exception:
+           pass
+         print('TEST26B_NODE_CHECK_OK')
+        else:
+         print('TEST26B_SKIPPED_NO_NODE')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

@@ -10,9 +10,6 @@
 .cs-btn { padding: 6px 12px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.25); color: inherit; cursor: pointer; font-size: 12px; }
 .cs-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .cs-btn-primary { border-color: rgba(120,200,120,0.4); background: rgba(40,120,40,0.2); }
-.cs-msg { display: block; margin-top: 8px; opacity: 0.8; font-size: 11px; word-break: break-all; }
-.cs-on { color: #6c6; }
-.cs-err { color: #c66; }
 h4 { margin: 0 0 8px 0; }
 small.hint { opacity: 0.7; font-size: 11px; display: block; margin-top: 2px; }
 [x-cloak] { display: none !important; }
@@ -249,7 +246,6 @@ Chat Shepherd
 <button type="button" class="cs-btn cs-btn-primary" :disabled="busy" @click="save()">Save settings</button>
 <button type="button" class="cs-btn" :disabled="busy" @click="refresh()">Refresh</button>
 </div>
-<small x-show="lastMsg" x-text="lastMsg" class="cs-msg" :class="{ 'cs-err': !!lastErr, 'cs-on': !lastErr && lastOk }"></small>
 </div>
 
 </div>
@@ -259,9 +255,6 @@ Chat Shepherd
 function chatShepherdSettings() {
 return {
 busy: false,
-lastMsg: '',
-lastOk: false,
-lastErr: false,
 chatsCount: 0,
 interventionCount: 0,
 pickerField: '',
@@ -346,10 +339,18 @@ const { callJsonApi } = await import('/js/api.js');
 try { return await callJsonApi("/api/plugins/chat_shepherd" + path, body || {}); } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
 },
 
-setMsg(msg, ok) {
-this.lastMsg = msg;
-this.lastOk = !!ok;
-this.lastErr = !ok;
+async toast(msg, ok) {
+// v1.19.1: inline status line retired per the plugin UI contract
+// (no inline success/error boxes). Framework notification toasts via lazy
+// import; the backend-first toast stack is mounted in the hosting settings
+// document (config.html embeds as an x-component in the main WebUI).
+try {
+const ns = await import('/components/notifications/notification-store.js');
+const show = ok ? ns.toastFrontendSuccess : ns.toastFrontendError;
+await show(String(msg), 'Chat Shepherd');
+} catch (e) {
+console.log('chat_shepherd: toast unavailable: ' + ((e && e.message) || e));
+}
 },
 
 async refresh() {
@@ -363,7 +364,7 @@ if (k in this.cfg) this.cfg[k] = c.config[k];
 if (c.config.icons) this.cfg.icons = c.config.icons;
 this.cfg.allowed_chat_ids_text = (c.config.allowed_chat_ids || []).join(', ');
 }
-} catch (e) { this.setMsg('config: ' + e, false); }
+} catch (e) { this.toast('config: ' + e, false); }
 try {
 const s = await this.api('/status');
 if (s && s.success) {
@@ -377,32 +378,30 @@ this.busy = false;
 
 async testNotify(channel) {
 this.notifyTesting = channel;
-this.setMsg('testing ' + channel + '...', true);
 try {
 const r = await this.api('/test_notify', { channel: channel });
 if (r && r.success) {
 if (r.ok) {
-this.setMsg('test ok: ' + (r.tested || []).join(', '), true);
+this.toast('test ok: ' + (r.tested || []).join(', '), true);
 } else {
 const parts = [];
 const results = r.results || {};
 for (const k of Object.keys(results)) { if (results[k]) parts.push(k + ': ' + results[k]); }
 const details = r.details || {};
 for (const k of Object.keys(details)) { parts.push(k + ': ' + details[k]); }
-this.setMsg('test FAILED - ' + (parts.join('; ') || 'no channel tested'), false);
+this.toast('test FAILED - ' + (parts.join('; ') || 'no channel tested'), false);
 }
 } else {
-this.setMsg('test failed: ' + ((r && r.error) || 'unknown'), false);
+this.toast('test failed: ' + ((r && r.error) || 'unknown'), false);
 }
 } catch (e) {
-this.setMsg('test: ' + e, false);
+this.toast('test: ' + e, false);
 }
 this.notifyTesting = '';
 },
 
 async save() {
 this.busy = true;
-this.setMsg('saving...', true);
 try {
 const payload = {
 enabled: this.cfg.enabled,
@@ -450,12 +449,12 @@ this.cfg.webhook_allow_private = !!r.config.webhook_allow_private;
 this.cfg.telegram_bot_token = r.config.telegram_bot_token || '';
 this.cfg.telegram_chat_id = r.config.telegram_chat_id || '';
 }
-this.setMsg('saved: ' + ((r.updated || []).join(', ') || 'ok'), true);
+this.toast('saved: ' + ((r.updated || []).join(', ') || 'ok'), true);
 } else {
-this.setMsg('save failed: ' + ((r && r.error) || 'unknown'), false);
+this.toast('save failed: ' + ((r && r.error) || 'unknown'), false);
 }
 } catch (e) {
-this.setMsg('save: ' + e, false);
+this.toast('save: ' + e, false);
 }
 this.busy = false;
 },
