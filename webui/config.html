@@ -2,14 +2,23 @@
 <head>
 <title>Chat Shepherd Settings</title>
 <meta charset="utf-8" />
+<!--
+  chat_shepherd settings (v1.20.0): migrated to the framework plugin
+  settings contract (plugins/AGENTS.md) - values bind to config.* through
+  the $store.pluginSettingsPrototype scope the settings modal provides,
+  and the modal's own Save / Reset / scope selectors own persistence
+  (the save_plugin_config hook sanitizes). This file keeps only custom
+  widgets: the external-alert test buttons and the sidebar pictogram
+  picker. Errors/success use the A0 notification toasts, no inline boxes.
+-->
 <style>
 .cs-card { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 6px; margin-bottom: 12px; border: 1px solid rgba(255,255,255,0.08); }
 .cs-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
 .cs-row label { display: block; font-size: 12px; margin-bottom: 4px; }
-.cs-row input[type="number"] { padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: inherit; font-size: 12px; width: 90px; }
+.cs-row input[type="number"], .cs-input { padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: inherit; font-size: 12px; width: 90px; }
+.cs-input.wide { width: 100%; box-sizing: border-box; }
 .cs-btn { padding: 6px 12px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.25); color: inherit; cursor: pointer; font-size: 12px; }
 .cs-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.cs-btn-primary { border-color: rgba(120,200,120,0.4); background: rgba(40,120,40,0.2); }
 h4 { margin: 0 0 8px 0; }
 small.hint { opacity: 0.7; font-size: 11px; display: block; margin-top: 2px; }
 [x-cloak] { display: none !important; }
@@ -23,22 +32,60 @@ small.hint { opacity: 0.7; font-size: 11px; display: block; margin-top: 2px; }
 .cs-emoji-grid button { background: none; border: none; font-size: 17px; padding: 3px 0; border-radius: 4px; cursor: pointer; line-height: 1.35; }
 .cs-emoji-grid button:hover { background: rgba(255,255,255,0.14); }
 </style>
+<script>
+// External-alert test seam (v1.20.0). Classic script: the x-component
+// loader executes it after its external imports resolve, so the global
+// exists before any button is clickable. All plugin API calls go through
+// callJsonApi (CSRF/Origin/credentials handled centrally) and all
+// feedback goes through the A0 notification toasts.
+window.chatShepherdTestNotify = async function (channel) {
+  var GUARD = '__chatShepherdTestBusy';
+  if (window[GUARD]) return { ok: false, error: 'A test is already running' };
+  window[GUARD] = true;
+  try {
+    var apiMod = await import('/js/api.js');
+    var notify = await import('/components/notifications/notification-store.js');
+    var r;
+    try {
+      r = await apiMod.callJsonApi('/api/plugins/chat_shepherd/test_notify', { channel: channel });
+    } catch (e) {
+      r = { success: false, error: String((e && e.message) || e) };
+    }
+    if (r && r.success && r.ok) {
+      await notify.toastFrontendSuccess('Test ok: ' + ((r.tested || []).join(', ') || channel), 'Chat Shepherd');
+      return { ok: true };
+    }
+    var parts = [];
+    var results = (r && r.results) || {};
+    for (var k in results) { if (results[k]) parts.push(k + ': ' + results[k]); }
+    var details = (r && r.details) || {};
+    for (var k2 in details) { parts.push(k2 + ': ' + details[k2]); }
+    var msg = (r && r.error)
+      ? ('test failed: ' + r.error)
+      : ('test FAILED - ' + (parts.join('; ') || 'no channel tested'));
+    await notify.toastFrontendError(String(msg), 'Chat Shepherd');
+    return { ok: false, error: msg };
+  } finally {
+    window[GUARD] = false;
+  }
+};
+</script>
 </head>
 <body>
-<div id="chat-shepherd-root" x-data="chatShepherdSettings()" x-init="init()">
-
+<div x-data>
+<template x-if="config">
 <div class="cs-card">
 <h4>
-<span x-text="cfg.enabled ? '🟢' : '🔴'"></span>
+<span x-text="config.enabled ? '🟢' : '🔴'"></span>
 Chat Shepherd
 </h4>
 <label style="display: block; margin: 4px 0;">
-<input type="checkbox" x-model="cfg.enabled" />
+<input type="checkbox" x-model="config.enabled" />
 <strong>Enable Chat Shepherd</strong>
 </label>
 <small class="hint">Watches chats for stalls, auto-nudges stalled agents, and flags chats needing human input.</small>
 <label style="display: block; margin: 8px 0 0 0;">
-<input type="checkbox" x-model="cfg.watch_all" />
+<input type="checkbox" x-model="config.watch_all" />
 <strong>Watch all chats</strong>
 </label>
 <small class="hint">When off, only chats that have received at least one message are monitored.</small>
@@ -49,11 +96,11 @@ Chat Shepherd
 <div class='cs-row'>
 <div>
 <label>Status poll interval (seconds)</label>
-<input type='number' min='2' max='120' x-model.number='cfg.poll_seconds' />
+<input type='number' min='2' max='120' x-model.number='config.poll_seconds' />
 </div>
 <div>
 <label>State save interval (seconds)</label>
-<input type='number' min='0' max='180' x-model.number='cfg.save_state_interval_seconds' />
+<input type='number' min='0' max='180' x-model.number='config.save_state_interval_seconds' />
 </div>
 </div>
 <small class='hint'>How often the monitor panel refreshes itself (2-120 seconds; clamped on save). Takes effect after the next status fetch. Quiet-tick state.json rewrites are rate-limited by the state save interval (0-180 seconds, 0 = write every tick).</small>
@@ -64,19 +111,19 @@ Chat Shepherd
 <div class="cs-row">
 <div>
 <label>Stall threshold (minutes)</label>
-<input type="number" min="1" max="240" x-model.number="cfg.stall_minutes" />
+<input type="number" min="1" max="240" x-model.number="config.stall_minutes" />
 </div>
 <div>
 <label>Max auto-nudges</label>
-<input type="number" min="0" max="20" x-model.number="cfg.max_auto_nudges" />
+<input type="number" min="0" max="20" x-model.number="config.max_auto_nudges" />
 </div>
 <div>
 <label>Nudge cooldown (minutes)</label>
-<input type="number" min="1" max="240" x-model.number="cfg.nudge_cooldown_minutes" />
+<input type="number" min="1" max="240" x-model.number="config.nudge_cooldown_minutes" />
 </div>
 <div>
 <label>Max nudges per tick</label>
-<input type="number" min="0" max="10" x-model.number="cfg.max_nudges_per_tick" />
+<input type="number" min="0" max="10" x-model.number="config.max_nudges_per_tick" />
 </div>
 </div>
 <small class="hint">Global burst throttle: at most this many auto-nudges are sent per watch tick (0 disables auto-nudging). After max auto-nudges are exhausted, the chat escalates to intervention status.</small>
@@ -85,39 +132,39 @@ Chat Shepherd
 <div class="cs-card">
 <h4>Escalation</h4>
 <label style="display: block; margin: 4px 0;">
-<input type="checkbox" x-model="cfg.intervention_after_failed_nudges" />
+<input type="checkbox" x-model="config.intervention_after_failed_nudges" />
 <strong>Escalate to intervention after failed nudges</strong>
 </label>
 <label style="display: block; margin: 4px 0;">
-<input type="checkbox" x-model="cfg.notify_on_intervention" />
+<input type="checkbox" x-model="config.notify_on_intervention" />
 <strong>Notify when a chat needs human intervention</strong>
 </label>
 <label style="display: block; margin: 4px 0;">
-<input type="checkbox" x-model="cfg.notify_on_resume" />
+<input type="checkbox" x-model="config.notify_on_resume" />
 <strong>Notify when server restart resumes chats (info)</strong>
 </label>
 <div class="cs-row">
   <div>
     <label>Persistent-intervention page after (minutes, 0 = at once)</label>
-    <input type="number" min="0" max="720" x-model.number="cfg.notify_after_minutes" />
+    <input type="number" min="0" max="720" x-model.number="config.notify_after_minutes" />
   </div>
   <div>
     <label>Re-page interval for the same episode (minutes, 0 = once)</label>
-    <input type="number" min="0" max="720" x-model.number="cfg.notify_rearm_minutes" />
+    <input type="number" min="0" max="720" x-model.number="config.notify_rearm_minutes" />
   </div>
 </div>
     <label style="display: block; margin: 4px 0;">
-    <input type="checkbox" x-model="cfg.goal_gate_enabled" />
+    <input type="checkbox" x-model="config.goal_gate_enabled" />
     <strong>Goal completion gate: nudge when the agent claims done but its goal is still active</strong>
     </label>
     <div class="cs-row">
      <div>
      <label>Max gate nudges per goal version (0 = off)</label>
-     <input type="number" min="0" max="10" x-model.number="cfg.goal_gate_max_nudges" />
+     <input type="number" min="0" max="10" x-model.number="config.goal_gate_max_nudges" />
      </div>
      <div>
      <label>Gate nudge cooldown (minutes)</label>
-     <input type="number" min="0" max="240" x-model.number="cfg.goal_gate_cooldown_minutes" />
+     <input type="number" min="0" max="240" x-model.number="config.goal_gate_cooldown_minutes" />
      </div>
     </div>
 </div>
@@ -125,7 +172,7 @@ Chat Shepherd
 <div class="cs-card">
 <h4>Graceful reload</h4>
 <label style="display: block; margin: 4px 0;">
-<input type="checkbox" x-model="cfg.hot_reload_enabled" />
+<input type="checkbox" x-model="config.hot_reload_enabled" />
 <strong>Hot-reload patched helpers between ticks (no restart needed)</strong>
 </label>
 </div>
@@ -135,23 +182,23 @@ Chat Shepherd
 <div class="cs-row">
 <div>
 <label>Auto-continue after (minutes frozen)</label>
-<input type="number" min="2" max="240" x-model.number="cfg.wedge_nudge_after_minutes" />
+<input type="number" min="2" max="240" x-model.number="config.wedge_nudge_after_minutes" />
 </div>
 <div>
 <label>Max remediations per wedge</label>
-<input type="number" min="0" max="5" x-model.number="cfg.wedge_max_remediations" />
+<input type="number" min="0" max="5" x-model.number="config.wedge_max_remediations" />
 </div>
 <div>
 <label>Remediation cooldown (minutes)</label>
-<input type="number" min="1" max="240" x-model.number="cfg.wedge_remediation_cooldown_minutes" />
+<input type="number" min="1" max="240" x-model.number="config.wedge_remediation_cooldown_minutes" />
 </div>
 </div>
 <label style="display: block; margin: 4px 0;">
-<input type="checkbox" x-model="cfg.wedge_soft_restart" />
+<input type="checkbox" x-model="config.wedge_soft_restart" />
 <strong>Kill the hung task if auto-continue fails</strong>
 </label>
 <label style='display: block; margin: 4px 0;'>
-<input type='checkbox' x-model='cfg.wedge_liveness_probe' />
+<input type='checkbox' x-model='config.wedge_liveness_probe' />
 <strong>Classify wedges: hung call vs spinning dead loop</strong>
 </label>
 <small class="hint">A running chat that stops producing log output is "wedged". After the grace period it gets an automatic "continue" (the same nudge that fixes it manually). When remediations are exhausted and this toggle is on, the final attempt kills the hung task and re-sends the framework nudge — this loses the hung call's partial result. Max remediations 0 disables wedge auto-recovery.</small>
@@ -160,21 +207,21 @@ Chat Shepherd
 <div class='cs-card'>
 <h4>Adaptive thresholds (experimental)</h4>
 <label style='display: block; margin: 4px 0;'>
-<input type='checkbox' x-model='cfg.adaptive_thresholds' />
+<input type='checkbox' x-model='config.adaptive_thresholds' />
 <strong>Learn timing thresholds from nudge / wedge outcomes</strong>
 </label>
 <div class="cs-row">
 <div>
 <label>Evaluation interval (minutes)</label>
-<input type="number" min="15" max="1440" x-model.number="cfg.adaptive_interval_minutes" />
+<input type="number" min="15" max="1440" x-model.number="config.adaptive_interval_minutes" />
 </div>
 <div>
 <label>Minimum samples per window</label>
-<input type="number" min="5" max="100" x-model.number="cfg.adaptive_min_samples" />
+<input type="number" min="5" max="100" x-model.number="config.adaptive_min_samples" />
 </div>
 <div>
 <label>Max step per evaluation (% of value)</label>
-<input type="number" min="5" max="25" x-model.number="cfg.adaptive_step_pct" />
+<input type="number" min="5" max="25" x-model.number="config.adaptive_step_pct" />
 </div>
 </div>
 <small class='hint'>Opt-in: with enough fresh outcomes, nudge cooldown and wedge timing relax when remediations mostly work (≥70%) or back off when they mostly fail (<40%). Runtime-only overlay — your configured values are never overwritten; manual changes re-seed the baseline; learned values live in the plugin state and never leave the safety band.</small>
@@ -183,48 +230,71 @@ Chat Shepherd
 <div class='cs-card'>
 <h4>Supervised mode (experimental)</h4>
 <label style='display: block; margin: 4px 0;'>
-<input type='checkbox' x-model='cfg.supervised_mode' />
+<input type='checkbox' x-model='config.supervised_mode' />
 <strong>Queue resume prompts as drafts for human review</strong>
 </label>
 <small class='hint'>When on, restart-resume and stalled-chat nudges are NOT sent automatically. Instead an editable draft message (tailored to the situation and the chat's classification reason) appears on the dashboard; you edit it and send it, or dismiss it. Dismissed chats are not re-drafted for 30 minutes. Wedge remediation and the goal-completion gate stay automatic.</small>
 </div>
 
-<div class='cs-card'>
+<div class='cs-card' x-data="{ busy: '' }">
 <h4>External alerts (optional)</h4>
-<input type='text' x-model='cfg.webhook_url' placeholder='https://hooks.example.com/...' style='width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:inherit;font-size:12px;box-sizing:border-box;' />
+<input type='text' x-model='config.webhook_url' placeholder='https://hooks.example.com/...' class='cs-input wide' style='margin-top:6px;' />
 <label style='display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12px;'>
-<input type='checkbox' x-model='cfg.webhook_allow_private' /> Allow private/LAN webhook targets
+<input type='checkbox' x-model='config.webhook_allow_private' /> Allow private/LAN webhook targets
 </label>
-<input type='password' x-model='cfg.telegram_bot_token' placeholder='Telegram bot token' style='width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:inherit;font-size:12px;box-sizing:border-box;' />
-<input type='text' x-model='cfg.telegram_chat_id' placeholder='Telegram chat id' style='width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:inherit;font-size:12px;box-sizing:border-box;' />
+<input type='password' x-model='config.telegram_bot_token' placeholder='Telegram bot token' class='cs-input wide' style='margin-top:6px;' />
+<input type='text' x-model='config.telegram_chat_id' placeholder='Telegram chat id' class='cs-input wide' style='margin-top:6px;' />
 <div style='display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center;'>
-<button type='button' @click='testNotify("all")' :disabled='notifyTesting !== ""' style='cursor:pointer;border:1px solid rgba(255,255,255,0.2);border-radius:4px;padding:4px 10px;background:rgba(0,0,0,0.3);color:inherit;font-size:12px;'>Test all channels</button>
-<button type='button' @click='testNotify("webhook")' :disabled='notifyTesting !== ""' style='cursor:pointer;border:1px solid rgba(255,255,255,0.2);border-radius:4px;padding:4px 10px;background:rgba(0,0,0,0.3);color:inherit;font-size:12px;'>Test webhook</button>
-<button type='button' @click='testNotify("telegram")' :disabled='notifyTesting !== ""' style='cursor:pointer;border:1px solid rgba(255,255,255,0.2);border-radius:4px;padding:4px 10px;background:rgba(0,0,0,0.3);color:inherit;font-size:12px;'>Test Telegram</button>
-<small class='hint' style='flex-basis:100%;'>Sends a real test notification through the saved config (framework leg + channels). Results appear in the status line and the shepherd debug log.</small>
+<button type='button' class='cs-btn' @click="busy = 'all'; try { await window.chatShepherdTestNotify('all'); } finally { busy = '' }" :disabled="busy !== ''">Test all channels</button>
+<button type='button' class='cs-btn' @click="busy = 'webhook'; try { await window.chatShepherdTestNotify('webhook'); } finally { busy = '' }" :disabled="busy !== ''">Test webhook</button>
+<button type='button' class='cs-btn' @click="busy = 'telegram'; try { await window.chatShepherdTestNotify('telegram'); } finally { busy = '' }" :disabled="busy !== ''">Test Telegram</button>
+<small class='hint' style='flex-basis:100%;'>Sends a real test notification through the SAVED config (framework leg + channels). Save your changes first, then test. Results appear as toasts and in the shepherd debug log.</small>
 </div>
 <small class='hint'>Fires alongside in-app notifications for intervention + restart alerts.</small>
 </div>
 
 <div class='cs-card'>
 <h4>Chat allowlist (optional)</h4>
-<textarea x-model='cfg.allowed_chat_ids_text' rows='2' placeholder='G34Q4xbU, abcd1234' style='width:100%;padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:inherit;font-size:12px;box-sizing:border-box;'></textarea>
+<div x-data="{ text: (config.allowed_chat_ids || []).join(', ') }">
+<textarea x-model='text' @input="config.allowed_chat_ids = $el.value.split(',').map(function (s) { return s.trim(); }).filter(Boolean)" rows='2' placeholder='G34Q4xbU, abcd1234' class='cs-input wide'></textarea>
+</div>
 <small class='hint'>Comma-separated chat IDs to watch. Empty = watch all chats.</small>
 </div>
 
-<div class="cs-card">
+<div class="cs-card" x-data="{
+  openField: '',
+  fields: [
+  { key: 'running', label: 'Running' },
+  { key: 'stalled', label: 'Stalled' },
+  { key: 'nudged', label: 'Nudged' },
+  { key: 'intervention', label: 'Intervention' },
+  { key: 'interrupted', label: 'Interrupted' },
+  { key: 'awaiting_user', label: 'Awaiting you' },
+  { key: 'error', label: 'Error' },
+  { key: 'paused', label: 'Paused' },
+  { key: 'idle', label: 'Idle' },
+  ],
+  emojis: [
+  '🏃','⚡','🔥','🚀','⚙️','🔧','🤖','🧠','💭','💬','🗨️','❓','❗','⚠️','🚨','🛑',
+  '⛔','✅','❌','🔄','🔁','⏳','⌛','⏸️','▶️','⏹️','💤','😴','👀','🔔','📣','📢',
+  '🆘','🩺','🛠️','🎯','📡','🧭','💡','⭐','🌟','🟢','🟡','🟠','🔴','🟣','🔵','⚫',
+  '⚪','☑️','✔️','✖️','➡️','⏱️','🕐','📅','📞','✉️','📨','🧑‍🌾','🐑','🐐','🐕','🌾',
+  '🚩','🏁','🧪','🔍','📝','✏️','🔗','🧩','🧰','🔑','🔒','♾️','❔','‼️','⁉️','♻️',
+  '🎈','🫡','🤝','🫶','🙌','👏','🤔','😵','🥱','😤','🧑‍💻','🗣️'
+  ],
+}">
 <h4>Sidebar pictograms</h4>
-<small class="hint">Tap a pictogram to pick an emoji or symbol from the dropdown. Choose none to hide the pictogram for that state.</small>
+<small class="hint">Tap a pictogram to pick an emoji or symbol from the dropdown. Choose none to hide the pictogram for that state. Saved with the settings modal Save button.</small>
 <div class="cs-row" style="margin-top:8px; align-items: flex-end;">
-<template x-for="f in iconFields" :key="f.key">
-<div class="cs-icon-field" @click.outside="if (pickerField === f.key) pickerField = ''">
+<template x-for="f in fields" :key="f.key">
+<div class="cs-icon-field" @click.outside="if (openField === f.key) openField = ''">
 <label x-text="f.label"></label>
-<button type="button" class="cs-icon-btn" :class="{ empty: !cfg.icons[f.key] }" @click="pickerField = (pickerField === f.key ? '' : f.key)" x-text="cfg.icons[f.key] || '∅'"></button>
-<div class="cs-emoji-pop" x-show="pickerField === f.key" x-cloak>
-<button type="button" class="cs-emoji-clear" @click="pickIcon(f.key, '')">∅ none (hide pictogram)</button>
+<button type="button" class="cs-icon-btn" :class="{ empty: !config.icons[f.key] }" @click="openField = (openField === f.key ? '' : f.key)" x-text="config.icons[f.key] || '∅'"></button>
+<div class="cs-emoji-pop" x-show="openField === f.key" x-cloak>
+<button type="button" class="cs-emoji-clear" @click="config.icons[f.key] = ''; openField = ''">∅ none (hide pictogram)</button>
 <div class="cs-emoji-grid">
-<template x-for="(e, i) in EMOJIS" :key="i">
-<button type="button" @click="pickIcon(f.key, e)" x-text="e"></button>
+<template x-for="(e, i) in emojis" :key="i">
+<button type="button" @click="config.icons[f.key] = e; openField = ''" x-text="e"></button>
 </template>
 </div>
 </div>
@@ -233,233 +303,16 @@ Chat Shepherd
 </div>
 </div>
 
-<div class="cs-card">
-<h4>Status</h4>
+<div class="cs-card" x-data="{ counts: null }" x-init="(async () => { try { const m = await import('/js/api.js'); const s = await m.callJsonApi('/api/plugins/chat_shepherd/status', {}); if (s && s.success && s.counts) counts = s.counts; } catch (e) {} })()">
+<h4>Status (at open)</h4>
 <div class="cs-row" style="font-size: 12px; opacity: 0.85;">
-<div>Chats tracked: <strong x-text="chatsCount"></strong></div>
-<div>Intervention: <strong x-text="interventionCount"></strong></div>
+<div>Chats tracked: <strong x-text="counts ? Object.values(counts).reduce(function (a, b) { return a + b; }, 0) : '…'"></strong></div>
+<div>Intervention: <strong x-text="counts ? (counts.intervention || 0) : '…'"></strong></div>
 </div>
-</div>
-
-<div class="cs-card">
-<div class="cs-row">
-<button type="button" class="cs-btn cs-btn-primary" :disabled="busy" @click="save()">Save settings</button>
-<button type="button" class="cs-btn" :disabled="busy" @click="refresh()">Refresh</button>
-</div>
+<small class="hint">Live per-chat statuses are on the Chat Shepherd dashboard (plugin list → Open).</small>
 </div>
 
+</template>
 </div>
-
-<script>
-// Self-contained Alpine component — no global store dependency.
-function chatShepherdSettings() {
-return {
-busy: false,
-chatsCount: 0,
-interventionCount: 0,
-pickerField: '',
-iconFields: [
-{ key: 'running', label: 'Running' },
-{ key: 'stalled', label: 'Stalled' },
-{ key: 'nudged', label: 'Nudged' },
-{ key: 'intervention', label: 'Intervention' },
-{ key: 'interrupted', label: 'Interrupted' },
-{ key: 'awaiting_user', label: 'Awaiting you' },
-{ key: 'error', label: 'Error' },
-{ key: 'paused', label: 'Paused' },
-{ key: 'idle', label: 'Idle' },
-],
-EMOJIS: [
-'🏃','⚡','🔥','🚀','⚙️','🔧','🤖','🧠','💭','💬','🗨️','❓','❗','⚠️','🚨','🛑',
-'⛔','✅','❌','🔄','🔁','⏳','⌛','⏸️','▶️','⏹️','💤','😴','👀','🔔','📣','📢',
-'🆘','🩺','🛠️','🎯','📡','🧭','💡','⭐','🌟','🟢','🟡','🟠','🔴','🟣','🔵','⚫',
-'⚪','☑️','✔️','✖️','➡️','⏱️','🕐','📅','📞','✉️','📨','🧑‍🌾','🐑','🐐','🐕','🌾',
-'🚩','🏁','🧪','🔍','📝','✏️','🔗','🧩','🧰','🔑','🔒','♾️','❔','‼️','⁉️','♻️',
-'🎈','🫡','🤝','🫶','🙌','👏','🤔','😵','🥱','😤','🧑‍💻','🗣️'
-],
-cfg: {
-enabled: true,
-watch_all: true,
-stall_minutes: 5,
-max_auto_nudges: 3,
-max_nudges_per_tick: 1,
-nudge_cooldown_minutes: 10,
-poll_seconds: 5,
-save_state_interval_seconds: 120,
-allowed_chat_ids_text: '',
-intervention_after_failed_nudges: true,
-notify_on_intervention: true,
-notify_after_minutes: 30,
-notify_rearm_minutes: 60,
-notify_on_resume: false,
-goal_gate_enabled: true,
-goal_gate_max_nudges: 2,
-goal_gate_cooldown_minutes: 15,
-hot_reload_enabled: true,
-wedge_nudge_after_minutes: 10,
-wedge_max_remediations: 2,
-wedge_remediation_cooldown_minutes: 10,
-wedge_soft_restart: false,
-wedge_liveness_probe: true,
-adaptive_thresholds: false,
-adaptive_interval_minutes: 60,
-adaptive_min_samples: 10,
-adaptive_step_pct: 10,
-webhook_url: '',
-webhook_allow_private: false,
-telegram_bot_token: '',
-telegram_chat_id: '',
-notifyTesting: '',
-icons: {
-running: '🏃',
-stalled: '⚠️',
-nudged: '🔄',
-intervention: '🚨',
-interrupted: '🔌',
-awaiting_user: '💬',
-error: '❌',
-paused: '⏸️',
-idle: '',
-},
-},
-
-pickIcon(key, e) {
-this.cfg.icons[key] = e;
-this.pickerField = '';
-},
-
-async init() {
-await this.refresh();
-},
-
-async api(path, body) {
-// P6.3: framework callJsonApi via lazy dynamic import (inline script cannot top-level import);
-// CSRF token, Origin and credentials handled centrally.
-const { callJsonApi } = await import('/js/api.js');
-try { return await callJsonApi("/api/plugins/chat_shepherd" + path, body || {}); } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
-},
-
-async toast(msg, ok) {
-// v1.19.1: inline status line retired per the plugin UI contract
-// (no inline success/error boxes). Framework notification toasts via lazy
-// import; the backend-first toast stack is mounted in the hosting settings
-// document (config.html embeds as an x-component in the main WebUI).
-try {
-const ns = await import('/components/notifications/notification-store.js');
-const show = ok ? ns.toastFrontendSuccess : ns.toastFrontendError;
-await show(String(msg), 'Chat Shepherd');
-} catch (e) {
-console.log('chat_shepherd: toast unavailable: ' + ((e && e.message) || e));
-}
-},
-
-async refresh() {
-this.busy = true;
-try {
-const c = await this.api('/config');
-if (c && c.ok && c.config) {
-for (const k of Object.keys(c.config)) {
-if (k in this.cfg) this.cfg[k] = c.config[k];
-}
-if (c.config.icons) this.cfg.icons = c.config.icons;
-this.cfg.allowed_chat_ids_text = (c.config.allowed_chat_ids || []).join(', ');
-}
-} catch (e) { this.toast('config: ' + e, false); }
-try {
-const s = await this.api('/status');
-if (s && s.success) {
-const chats = s.chats || [];
-this.chatsCount = chats.length;
-this.interventionCount = chats.filter(function (c) { return c.status === 'intervention'; }).length;
-}
-} catch (e) { /* status may not be reachable yet */ }
-this.busy = false;
-},
-
-async testNotify(channel) {
-this.notifyTesting = channel;
-try {
-const r = await this.api('/test_notify', { channel: channel });
-if (r && r.success) {
-if (r.ok) {
-this.toast('test ok: ' + (r.tested || []).join(', '), true);
-} else {
-const parts = [];
-const results = r.results || {};
-for (const k of Object.keys(results)) { if (results[k]) parts.push(k + ': ' + results[k]); }
-const details = r.details || {};
-for (const k of Object.keys(details)) { parts.push(k + ': ' + details[k]); }
-this.toast('test FAILED - ' + (parts.join('; ') || 'no channel tested'), false);
-}
-} else {
-this.toast('test failed: ' + ((r && r.error) || 'unknown'), false);
-}
-} catch (e) {
-this.toast('test: ' + e, false);
-}
-this.notifyTesting = '';
-},
-
-async save() {
-this.busy = true;
-try {
-const payload = {
-enabled: this.cfg.enabled,
-watch_all: this.cfg.watch_all,
-stall_minutes: this.cfg.stall_minutes,
-max_auto_nudges: this.cfg.max_auto_nudges,
-max_nudges_per_tick: this.cfg.max_nudges_per_tick,
-nudge_cooldown_minutes: this.cfg.nudge_cooldown_minutes,
-poll_seconds: Number(this.cfg.poll_seconds) || 5,
-save_state_interval_seconds: Number(this.cfg.save_state_interval_seconds) || 0,
-intervention_after_failed_nudges: this.cfg.intervention_after_failed_nudges,
-notify_on_intervention: this.cfg.notify_on_intervention,
-notify_after_minutes: Number(this.cfg.notify_after_minutes) || 0,
-notify_rearm_minutes: Number(this.cfg.notify_rearm_minutes) || 0,
-notify_on_resume: !!this.cfg.notify_on_resume,
-goal_gate_enabled: !!this.cfg.goal_gate_enabled,
-goal_gate_max_nudges: Number(this.cfg.goal_gate_max_nudges) || 0,
-goal_gate_cooldown_minutes: Number(this.cfg.goal_gate_cooldown_minutes) || 0,
-hot_reload_enabled: !!this.cfg.hot_reload_enabled,
-wedge_nudge_after_minutes: this.cfg.wedge_nudge_after_minutes,
-wedge_max_remediations: this.cfg.wedge_max_remediations,
-wedge_remediation_cooldown_minutes: this.cfg.wedge_remediation_cooldown_minutes,
-wedge_soft_restart: this.cfg.wedge_soft_restart,
-wedge_liveness_probe: !!this.cfg.wedge_liveness_probe,
-adaptive_thresholds: !!this.cfg.adaptive_thresholds,
-adaptive_interval_minutes: Number(this.cfg.adaptive_interval_minutes) || 60,
-adaptive_min_samples: Number(this.cfg.adaptive_min_samples) || 10,
-adaptive_step_pct: Number(this.cfg.adaptive_step_pct) || 10,
-webhook_url: (this.cfg.webhook_url || '').trim(),
-webhook_allow_private: !!this.cfg.webhook_allow_private,
-telegram_bot_token: (this.cfg.telegram_bot_token || '').trim(),
-telegram_chat_id: (this.cfg.telegram_chat_id || '').trim(),
-allowed_chat_ids: (this.cfg.allowed_chat_ids_text || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean),
-icons: this.cfg.icons,
-};
-const r = await this.api('/config', payload);
-if (r && r.ok) {
-if (r.config) {
-for (const k of Object.keys(r.config)) {
-if (k in this.cfg) this.cfg[k] = r.config[k];
-}
-if (r.config.icons) this.cfg.icons = r.config.icons;
-this.cfg.webhook_url = r.config.webhook_url || '';
-this.cfg.webhook_allow_private = !!r.config.webhook_allow_private;
-this.cfg.telegram_bot_token = r.config.telegram_bot_token || '';
-this.cfg.telegram_chat_id = r.config.telegram_chat_id || '';
-}
-this.toast('saved: ' + ((r.updated || []).join(', ') || 'ok'), true);
-} else {
-this.toast('save failed: ' + ((r && r.error) || 'unknown'), false);
-}
-} catch (e) {
-this.toast('save: ' + e, false);
-}
-this.busy = false;
-},
-};
-}
-</script>
 </body>
 </html>

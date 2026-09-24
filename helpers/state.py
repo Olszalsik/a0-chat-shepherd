@@ -33,6 +33,10 @@ def default_state() -> dict[str, Any]:
 
 
 def load_state() -> dict[str, Any]:
+    # v1.20.0 (P8): snapshot the save serial BEFORE reading the file; a
+    # save landing during the read bumps it and the baseline adoption at
+    # the end is skipped (all-or-nothing).
+    serial_before = _save_serial
     path = files.get_abs_path(STATE_FILE)
     payload = None
     if files.exists(path):
@@ -58,8 +62,16 @@ def load_state() -> dict[str, Any]:
             _seed_journal(legacy)
     # v1.6.0: history of record is the append-only journal (newest first).
     state['history'] = read_journal(JOURNAL_READ_LIMIT)
-    global _last_saved_sig
-    _last_saved_sig = state_signature(state)
+    # v1.20.0 (P8): adopt the loaded payload as the saved baseline ONLY
+    # when no save raced this read (serial_before was snapshotted at the
+    # top, before the file read). /status calls load_state() from worker
+    # threads on every poll; a save finishing mid-read used to clobber
+    # _last_saved_sig with a stale signature, which could suppress one
+    # due save (or force one redundant save) on the next tick.
+    sig = state_signature(state)
+    with _sig_lock:
+        if _save_serial == serial_before:
+            _last_saved_sig = sig
     return state
 
 
@@ -73,9 +85,14 @@ def save_state(state: dict[str, Any]) -> None:
     tmp_rel = STATE_FILE + '.tmp'
     files.write_file(tmp_rel, json.dumps(payload, ensure_ascii=False, indent=2))
     os.replace(files.get_abs_path(tmp_rel), files.get_abs_path(STATE_FILE))
-    global _state_last_save, _last_saved_sig
-    _state_last_save = time.monotonic()
-    _last_saved_sig = state_signature(payload)
+    global _state_last_save, _last_saved_sig, _save_serial
+    # v1.20.0 (P8): the baseline bookkeeping (monotonic timestamp, save
+    # serial, durable signature) is updated atomically under _sig_lock so
+    # concurrent /status load_state() reads can never interleave it.
+    with _sig_lock:
+        _state_last_save = time.monotonic()
+        _save_serial += 1
+        _last_saved_sig = state_signature(payload)
 
 
 def state_signature(state: dict[str, Any]) -> str:
@@ -105,7 +122,10 @@ def state_signature(state: dict[str, Any]) -> str:
 
 
 def last_saved_signature() -> str:
-    return _last_saved_sig
+    # v1.20.0 (P8): read under _sig_lock so a concurrent save_state never
+    # hands out a half-updated baseline (timestamp vs signature mismatch).
+    with _sig_lock:
+        return _last_saved_sig
 
 
 # v1.18.0 (P7): serialized read-modify-write. The tick and the API
@@ -217,6 +237,11 @@ _journal_lock = threading.RLock()
 _journal_read_cache: dict[str, tuple[tuple[int, int], list]] = {}
 _state_last_save = 0.0  # v1.17.0: monotonic ts of the last full state.json write
 _last_saved_sig = ''  # v1.17.0: signature of the last written durable payload
+# v1.20.0 (P8): serialized baseline bookkeeping. The name ends in lock so
+# hotreload lock preservation keeps one object across re-exec; the save
+# serial lets load_state() detect a save that raced its file read.
+_sig_lock = threading.Lock()
+_save_serial = 0
 
 def _journal_abs() -> str:
     return files.get_abs_path(JOURNAL_FILE)
@@ -337,20 +362,40 @@ def compact_journal() -> None:
         except Exception as e:
             print('[chat_shepherd] journal compaction failed: ' + repr(e))
 
-def cap_chats(state: dict, keep: int = MAX_TRACKED_CHATS) -> list[str]:
-    """P1: cap the chats dict to the `keep` most recently ticked entries.
+def cap_chats(
+    state: dict,
+    keep: int = MAX_TRACKED_CHATS,
+    protected: Any = None,
+) -> list[str]:
+    """Cap the tracked-chats dict: only DEAD entries (ids not in
+    `protected`) are evicted, oldest last_ticked first, once the dead
+    surplus exceeds `keep`.
+
+    v1.20.0 (P8) live-aware fix: evicting a live chat wiped its
+    nudge/cooldown/wedge bookkeeping, so on instances with more live
+    contexts than the cap the same chats were evicted and re-created
+    every tick - the cooldown and max_auto_nudges budget never engaged
+    and stalled chats were re-nudged every ~2 minutes (73 auto-nudges
+    observed on one chat). Live entries are now never dropped; `keep`
+    bounds the dead surplus (persisted-only chats) instead of the total,
+    which is exactly the growth the original P1 cap was guarding.
 
     Returns the chat_ids that were dropped (callers use this for history).
     Ties / missing timestamps fall back to insertion order (dicts preserve it).
     """
     chats = state.get('chats')
-    if not isinstance(chats, dict) or len(chats) <= keep:
+    if not isinstance(chats, dict):
         return []
-    ranked = sorted(
-        chats.items(),
-        key=lambda kv: kv[1].get('last_ticked', '') or '',
-        reverse=True,
-    )
+    prot = set(protected) if protected else set()
+    dead = [(cid, ent) for cid, ent in chats.items() if cid not in prot]
+    if len(dead) <= keep:
+        return []
+
+    def _ticked(kv):
+        ent = kv[1]
+        return (ent.get('last_ticked', '') or '') if isinstance(ent, dict) else ''
+
+    ranked = sorted(dead, key=_ticked, reverse=True)
     doomed = {chat_id for chat_id, _ in ranked[keep:]}
     for chat_id in doomed:
         chats.pop(chat_id, None)

@@ -389,6 +389,18 @@ def _chat_display_name(chat_id: str, ctx: Any = None, prev: dict | None = None) 
     return name if name else chat_id
 
 
+def _redact_text(text: Any, *secrets: str) -> str:
+    # v1.20.0 (P8): strip credential-bearing strings from error text
+    # before it reaches the debug log or a caller. Telegram URLs embed
+    # the bot token; webhook URLs may embed auth credentials.
+    out = str(text or '')
+    for s in secrets:
+        s = str(s or '')
+        if s and s in out:
+            out = out.replace(s, '***')
+    return out
+
+
 def _post_json(url: str, payload: dict, timeout: float = 5.0) -> bool:
     # R3: minimal JSON POST for external alert channels. Returns
     # True on 2xx; kept separate so tests can monkeypatch it.
@@ -437,6 +449,10 @@ def _post_jobs(jobs: list[tuple[str, str, dict]], message: str = '') -> dict[str
     # v1.19.0: synchronous multi-channel post returning per-channel results
     # (None = delivered, string = error). Failure logging matches the
     # original fan-out loop exactly (channel + '_fail' kinds, ' :: ' + msg).
+    # v1.20.0 (P8): errors are redacted against the job's own URL before
+    # they reach the debug log or a caller - Telegram URLs embed the bot
+    # token and webhook URLs may embed auth credentials, and requests
+    # exceptions print the full URL.
     results: dict[str, str | None] = {}
     for channel, url, payload in jobs:
         try:
@@ -446,8 +462,8 @@ def _post_jobs(jobs: list[tuple[str, str, dict]], message: str = '') -> dict[str
             else:
                 results[channel] = None
         except Exception as e:
-            results[channel] = repr(e)
-            _debug_log(channel + '_fail', repr(e) + ' :: ' + message)
+            results[channel] = _redact_text(repr(e), url)
+            _debug_log(channel + '_fail', _redact_text(repr(e), url) + ' :: ' + message)
     return results
 
 
@@ -963,6 +979,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
         'notify_failures': 0,
         'goal_gate_nudged': 0,
         'pruned': 0,
+        'cap_evicted': 0,
     }
     summary['adaptive'] = adaptive_tag
 
@@ -1375,22 +1392,33 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
 
     # P1: prune state entries that are neither live nor persisted chats
     # (the chat dir is gone and no context exists -> dead history), then cap
-    # the dict to the most recently ticked MAX_TRACKED_CHATS entries.
-    pruned = 0
+    # the dict. v1.20.0 (P8): the cap is live-aware - live contexts are
+    # never evicted while dead entries remain, and dead surplus / live
+    # eviction are journaled separately. The old lumped "dead/stale"
+    # message hid the churn storm where the same live chats were evicted
+    # and re-created every tick, wiping their nudge/cooldown bookkeeping.
+    pruned_dead = 0
     for chat_id in list(state.get('chats', {}).keys()):
         if chat_id in live_contexts:
             continue
         if not _has_chat_dir(chat_id):
             state['chats'].pop(chat_id, None)
-            pruned += 1
-    dropped = state_mod.cap_chats(state, MAX_TRACKED_CHATS)
-    pruned += len(dropped)
-    if pruned:
-        summary['pruned'] = pruned
+            pruned_dead += 1
+    dropped = state_mod.cap_chats(state, MAX_TRACKED_CHATS, protected=set(live_contexts))
+    summary['pruned'] = pruned_dead + len(dropped)
+    summary['cap_evicted'] = len(dropped)
+    if pruned_dead:
         state_mod.append_history(state, {
             'chat_id': '',
             'action': 'prune_state',
-            'detail': f'{pruned} dead/stale chat entries removed',
+            'detail': f'{pruned_dead} dead/stale chat entries removed',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        })
+    if dropped:
+        state_mod.append_history(state, {
+            'chat_id': '',
+            'action': 'cap_evicted',
+            'detail': f'{len(dropped)} dead chat entries evicted (tracked-chats cap)',
             'timestamp': datetime.now(timezone.utc).isoformat(),
         })
 

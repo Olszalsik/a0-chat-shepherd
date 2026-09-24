@@ -26,8 +26,10 @@ from typing import Any
 
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# dependency order: constants -> state -> monitor -> hotreload (self last)
+# dependency order: config_defaults (leaf) -> constants -> state ->
+# adaptive -> aggregates -> resume_draft -> monitor -> hotreload (self last)
 _DEFAULT_WATCH = [
+    ('usr.plugins.chat_shepherd.helpers.config_defaults', 'helpers/config_defaults.py'),
     ('usr.plugins.chat_shepherd.helpers.constants', 'helpers/constants.py'),
     ('usr.plugins.chat_shepherd.helpers.state', 'helpers/state.py'),
     ('usr.plugins.chat_shepherd.helpers.adaptive', 'helpers/adaptive.py'),

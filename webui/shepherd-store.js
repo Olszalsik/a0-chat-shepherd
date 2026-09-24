@@ -50,6 +50,9 @@ export const store = createStore("chatShepherdStore", {
   pollInterval: 5000,
 
   init() {
+    // v1.20.0: idempotent start marker - the self-heal timer below (and
+    // any repeat init) must not double-schedule polling.
+    this._started = true;
     this.onOpen();
   },
 
@@ -258,3 +261,15 @@ export const store = createStore("chatShepherdStore", {
     }
   },
 });
+
+// v1.20.0: self-heal for the sidebar extension handoff. shepherd-init.html
+// wires init() through x-init guarded by store presence; if Alpine
+// evaluated that binding before this module registered the store (module
+// script vs Alpine.start timing), the store would never start polling and
+// the sidebar would stay icon-less. Idempotent: init() no-ops once started.
+setTimeout(function () {
+  try {
+    var s = window.Alpine && Alpine.store ? Alpine.store('chatShepherdStore') : null;
+    if (s && !s._started) s.init();
+  } catch (e) { /* store lifecycle is best-effort here */ }
+}, 2000);

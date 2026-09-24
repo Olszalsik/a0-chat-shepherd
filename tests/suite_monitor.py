@@ -1748,18 +1748,24 @@ def main():
             monitor._post_json = _orig_post25
             _cs_net25.resolve_host_ips = _orig_res25
 
-        # TEST26A/B: config.html toast migration (v1.19.1) - the inline
-        # status line is retired; framework toasts via lazy import must be
-        # wired with zero inline-box residue and a syntax-clean script block.
+        # TEST26A/B: config.html settings-contract migration (v1.20.0) -
+        # values bind to config.* through the framework settings scope,
+        # the own save button is gone (the modal Save owns persistence,
+        # sanitized by the save_plugin_config hook), the toast seam
+        # survives, and the script block stays syntax-clean.
         _cfgp26 = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'webui', 'config.html')
         _cfg26 = open(_cfgp26, encoding='utf-8').read()
-        for _gone26 in ('setMsg', 'lastMsg', 'lastOk', 'lastErr', 'cs-msg', 'cs-err', 'cs-on'):
-         assert _gone26 not in _cfg26, 'config.html residue: ' + _gone26
-        for _want26 in ('async toast(msg, ok)', 'toastFrontendSuccess', 'toastFrontendError', 'notification-store.js'):
-         assert _want26 in _cfg26, 'config.html missing: ' + _want26
-        assert _cfg26.count('this.toast(') == 8, 'toast call sites: %d' % _cfg26.count('this.toast(')
-        assert 'Save settings' in _cfg26 and '@click="save()"' in _cfg26, 'save button lost'
-        print('TEST26A_TOAST_SEAM_OK')
+        for _gone26 in ('setMsg', 'lastMsg', 'lastOk', 'lastErr', 'cs-msg', 'cs-err', 'cs-on',
+                        'chatShepherdSettings', 'this.toast(', "this.api('/config'",
+                        "this.api('/status'"):
+            assert _gone26 not in _cfg26, 'config.html residue: ' + _gone26
+        for _want26 in ('toastFrontendSuccess', 'toastFrontendError', 'notification-store.js',
+                        '<template x-if="config">', 'x-model="config.enabled"',
+                        'x-model="config.watch_all"', 'config.icons[',
+                        'chatShepherdTestNotify', 'callJsonApi'):
+            assert _want26 in _cfg26, 'config.html missing: ' + _want26
+        assert '@click="save()"' not in _cfg26, 'own save button must be gone (framework Save owns persistence)'
+        print('TEST26A_SETTINGS_CONTRACT_OK')
         import re as _re26, shutil as _sh26, subprocess as _sp26, tempfile as _tf26
         _node26 = _sh26.which('node')
         if _node26:
@@ -1779,6 +1785,137 @@ def main():
          print('TEST26B_NODE_CHECK_OK')
         else:
          print('TEST26B_SKIPPED_NO_NODE')
+        # ================= TEST 27: live-aware cap (v1.20.0, P8) =================
+        # Live contexts must NEVER be evicted (the old cap churned the
+        # same live chats every tick, wiping nudge/cooldown bookkeeping
+        # and re-nudging stalled chats every ~2 minutes); dead entries
+        # still prune/cap normally; the journal separates prune_state
+        # from cap_evicted.
+        _orig_hcd27 = monitor._has_chat_dir
+        try:
+            # A: >MAX live contexts + dead entries: live survive, dead prune.
+            monitor._has_chat_dir = lambda cid: cid.startswith('live')
+            _live_ids27 = ['live%04d' % i for i in range(120)]
+            _chats27 = {cid: {'status': 'running', 'nudge_count': 0, 'last_ticked': now_iso} for cid in _live_ids27}
+            for _i27 in range(20):
+                _chats27['dead%04d' % _i27] = {'status': 'idle', 'nudge_count': 0, 'last_ticked': '2026-01-01T00:00:00+00:00'}
+            _cooler27 = 'liveCool'
+            _chats27[_cooler27] = {
+                'status': 'stalled', 'nudge_count': 2,
+                'last_nudge_at': (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+                'last_ticked': now_iso,
+            }
+            _live_ids27.append(_cooler27)
+            ctxs27 = [FakeCtx(cid, ['user', 'tool'], idle_minutes=0) for cid in _live_ids27]
+            ctxs27[-1] = FakeCtx(_cooler27, ['user', 'tool'], idle_minutes=30)
+            FakeAgentContext._all = ctxs27
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats=_chats27)
+            s27 = monitor.tick(dict(cfg, nudge_cooldown_minutes=10, max_nudges_per_tick=5))
+            st27 = read_state()
+            for _cid27 in _live_ids27:
+                assert _cid27 in st27['chats'], 'live chat evicted: ' + _cid27
+            assert st27['chats'][_cooler27]['nudge_count'] == 2, st27['chats'].get(_cooler27)
+            for _i27 in range(20):
+                assert ('dead%04d' % _i27) not in st27['chats'], 'dead entry not pruned'
+            _acts27 = [h.get('action') for h in st27.get('history', [])]
+            assert 'prune_state' in _acts27 and 'cap_evicted' not in _acts27, _acts27
+            assert s27['cap_evicted'] == 0, s27
+            print('TEST27A_LIVE_PROTECTED_OK')
+
+            # B: the cap bounds the DEAD surplus only; live chats survive
+            # even alongside a full dead backlog.
+            monitor._has_chat_dir = lambda cid: True
+            _lives27b = ['liveCt01', 'liveCt02']
+            _chats27b = {cid: {'status': 'running', 'nudge_count': 0, 'last_ticked': now_iso} for cid in _lives27b}
+            for _i27 in range(105):
+                _chats27b['capd%04d' % _i27] = {
+                    'status': 'idle', 'nudge_count': 0,
+                    'last_ticked': (datetime.now(timezone.utc) - timedelta(minutes=_i27)).isoformat(),
+                }
+            FakeAgentContext._all = [FakeCtx(cid, ['user', 'tool'], idle_minutes=0) for cid in _lives27b]
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats=_chats27b)
+            s27b = monitor.tick(cfg)
+            st27b = read_state()
+            for _cid27 in _lives27b:
+                assert _cid27 in st27b['chats'], 'live chat evicted under cap: ' + _cid27
+            for _i27 in range(100):
+                assert ('capd%04d' % _i27) in st27b['chats'], 'fresh dead entry evicted: %d' % _i27
+            for _i27 in range(100, 105):
+                assert ('capd%04d' % _i27) not in st27b['chats'], 'oldest dead entry kept: %d' % _i27
+            _evicted27 = [h for h in st27b.get('history', []) if h.get('action') == 'cap_evicted']
+            assert _evicted27 and '5' in (_evicted27[0].get('detail') or ''), st27b.get('history', [])[-3:]
+            assert s27b['cap_evicted'] == 5 and s27b['pruned'] == 5, s27b
+            print('TEST27B_DEAD_SURPLUS_CAP_OK')
+        finally:
+            monitor._has_chat_dir = _orig_hcd27
+
+        # ================= TEST 28: URL-secret redaction (v1.20.0, P8) =================
+        # _post_jobs errors (debug log + return value) must never carry the
+        # Telegram bot token or webhook credential embedded in the job URL.
+        _orig_post28 = monitor._post_json
+        _dbg28 = []
+        _orig_dbg28 = monitor._debug_log
+        try:
+            monitor._debug_log = lambda kind, msg: _dbg28.append((kind, msg))
+            def _leak28(url, payload, timeout=5.0):
+                raise RuntimeError('connect failed for ' + url)
+            monitor._post_json = _leak28
+            _r28 = monitor._post_jobs([
+                ('telegram', 'https://api.telegram.org/botSECRETTOK99/sendMessage', {}),
+                ('webhook', 'https://hooks.example.com/x?token=WHSECRETTOK99', {}),
+            ], 'm')
+            assert 'SECRETTOK99' not in (_r28['telegram'] or ''), _r28
+            assert 'WHSECRETTOK99' not in (_r28['webhook'] or ''), _r28
+            assert '***' in _r28['telegram'] and '***' in _r28['webhook'], _r28
+            _blob28 = ' | '.join(m for _, m in _dbg28)
+            assert 'SECRETTOK99' not in _blob28 and 'WHSECRETTOK99' not in _blob28, _dbg28
+            print('TEST28_URL_SECRET_REDACTION_OK')
+        finally:
+            monitor._post_json = _orig_post28
+            monitor._debug_log = _orig_dbg28
+
+        # ================= TEST 29: /history id pattern gate (v1.20.0, P8) =================
+        from usr.plugins.chat_shepherd.api.history import History as _CSHistory29
+        import asyncio as _aio29
+        _h29 = _CSHistory29(None, None)
+        _r29 = _aio29.run(_h29.process({'chat_id': '../../settings'}, None))
+        assert _r29.get('success') is False, _r29
+        _r29 = _aio29.run(_h29.process({'chat_id': 'waytoolongid_1234567890'}, None))
+        assert _r29.get('success') is False, _r29
+        _truncate_journal()
+        state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'manual_nudge', 'timestamp': now_iso})
+        _r29 = _aio29.run(_h29.process({'chat_id': FAKE_CHAT_A}, None))
+        assert _r29.get('success') is True and _r29.get('chat_id') == FAKE_CHAT_A, _r29
+        assert any(h.get('action') == 'manual_nudge' for h in _r29.get('history', [])), _r29
+        print('TEST29_HISTORY_ID_GATE_OK')
+
+        # ================= TEST 30: saved-baseline race guard (v1.20.0, P8) =================
+        # A save landing while /status load_state() reads the file must not
+        # be clobbered by the in-flight load's stale-baseline adoption
+        # (suppressed/redundant saves on the next tick).
+        _orig_rj30 = state_mod.read_journal
+        try:
+            _payload30a = {'chats': {'raceAAAA': {'status': 'idle'}}, 'last_tick': now_iso}
+            files.write_file(state_mod.STATE_FILE, json.dumps(_payload30a))
+            state_mod.load_state()
+            _sig30a = state_mod.state_signature(_payload30a)
+            assert state_mod.last_saved_signature() == _sig30a, 'load_state failed to adopt baseline'
+            _payload30b = {'chats': {'raceBBBB': {'status': 'idle'}}, 'last_tick': now_iso}
+            def _rj_race30(limit, chat_id=None):
+                state_mod.save_state(_payload30b)
+                return _orig_rj30(limit, chat_id=chat_id)
+            state_mod.read_journal = _rj_race30
+            try:
+                state_mod.load_state()
+            finally:
+                state_mod.read_journal = _orig_rj30
+            _sig30b = state_mod.state_signature(_payload30b)
+            assert state_mod.last_saved_signature() == _sig30b, 'racing save clobbered by load_state'
+            state_mod.load_state()
+            assert state_mod.last_saved_signature() == _sig30b, 'clean load lost the baseline'
+            print('TEST30_BASELINE_RACE_GUARD_OK')
+        finally:
+            state_mod.read_journal = _orig_rj30
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

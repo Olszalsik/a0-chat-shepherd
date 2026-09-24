@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from helpers.api import ApiHandler, Request, Response
 
+from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN
 from usr.plugins.chat_shepherd.helpers.state import read_journal
 from usr.plugins.chat_shepherd.helpers import monitor
 
@@ -15,7 +16,12 @@ class History(ApiHandler):
     async def process(self, input: dict, request: Request) -> dict | Response:
         body = input or {}
         chat_id = str(body.get('chat_id', '')).strip()
-        if not chat_id or len(chat_id) > 64:
+        # v1.20.0 (P8): enforce the framework chat-id pattern, not just a
+        # length cap - the id is passed to _chat_display_name ->
+        # _read_chat_title, which builds a usr/chats/<id>/chat.json path
+        # from the raw value. POST + auth + CSRF already gate this
+        # endpoint; the pattern check closes the path-shaping corner.
+        if not chat_id or not CHAT_ID_PATTERN.match(chat_id):
             return {'success': False, 'error': 'chat_id required'}
         try:
             limit = int(body.get('limit', 30))

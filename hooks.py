@@ -17,7 +17,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from usr.plugins.chat_shepherd.helpers.config_defaults import deep_merge_defaults
+from usr.plugins.chat_shepherd.helpers.config_defaults import (
+    KNOWN_KEYS,
+    apply_overrides,
+    deep_merge_defaults,
+)
 
 _PLUGIN_NAME = "chat_shepherd"
 
@@ -62,6 +66,19 @@ def save_plugin_config(settings=None, **kwargs):
         out: dict[str, Any] = {}
         out.update(current)
         out.update(settings)
+        # v1.20.0: every save path gets the same sanitize pass as the
+        # plugin's own /config endpoint (int clamps, bool coercion,
+        # known-status icon merge). The framework settings modal now
+        # writes config.json too (config.html binds config.*), so the
+        # clamps must not depend on which UI saved. Fail-open: on any
+        # sanitize error the raw merge is written unchanged (never None,
+        # None would skip the framework write entirely).
+        try:
+            merged = deep_merge_defaults(out)
+            readable = {k: v for k, v in settings.items() if k in KNOWN_KEYS}
+            out = apply_overrides(merged, readable)
+        except Exception:
+            pass
         return out
     except Exception:
         return settings if isinstance(settings, dict) else {}
