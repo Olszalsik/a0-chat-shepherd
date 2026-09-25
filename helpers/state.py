@@ -33,6 +33,10 @@ def default_state() -> dict[str, Any]:
 
 
 def load_state() -> dict[str, Any]:
+    # `global` is required: without it the baseline adoption at the end of
+    # this function binds a function-local and the module global keeps its
+    # stale value (silently disabling the quiet-tick save gate).
+    global _last_saved_sig
     # v1.20.0 (P8): snapshot the save serial BEFORE reading the file; a
     # save landing during the read bumps it and the baseline adoption at
     # the end is skipped (all-or-nothing).

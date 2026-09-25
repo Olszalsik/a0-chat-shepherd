@@ -222,6 +222,25 @@ export const store = createStore("chatShepherdStore", {
    return !!(t && t.capped);
    },
 
+  // v1.20.0: tracked-chats maintenance. Routine dead-chat pruning and
+  // dead-surplus cap eviction are shown separately. cap_evicted is only
+  // non-zero when dead entries outnumber the cap, which - since live
+  // contexts are never evicted - is the visible proof that live chats are
+  // protected. Before v1.20.0 this churn was invisible and instead showed
+  // up as a constant prune_state count in the journal.
+  capLabel() {
+   const t = (this.data && this.data.throttle) || null;
+   if (!t) return '';
+   const pruned = t.pruned || 0;
+   const evicted = t.cap_evicted || 0;
+   if (!pruned && !evicted) return '';
+   let label = '🧹 ' + pruned + ' stale chat' + (pruned === 1 ? '' : 's') + ' pruned';
+   if (evicted) {
+     label += ' · ' + evicted + ' over cap evicted (live chats protected)';
+   }
+   return label;
+  },
+
   aggregatesLabel() {
   const a = (this.data && this.data.aggregates) || null;
   if (!a || !a.events_in_window) return '';

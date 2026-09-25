@@ -237,6 +237,10 @@ class Status(ApiHandler):
          'resume_nudged': _to_int(_th.get('resume_nudged')),
          'wedge_this_tick': _to_int(_th.get('wedge_nudged')) + _to_int(_th.get('wedge_restarts')),
          'wedge_budget': max(1, _th_budget),
+         # v1.20.0: dead-chat pruning vs dead-surplus cap eviction, kept
+         # separate so the dashboard can show that live chats are protected.
+         'pruned': _to_int(_th.get('pruned')),
+         'cap_evicted': _to_int(_th.get('cap_evicted')),
          'timestamp': str(_th.get('timestamp', '') or ''),
         }
         poll_seconds = cfg.get('poll_seconds', 5)

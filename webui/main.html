@@ -70,6 +70,9 @@
             <div class='shepherd-badge' :class="{'shepherd-throttle-capped': $store.chatShepherdStore.throttleCapped()}" x-show='$store.chatShepherdStore.throttleLabel().length > 0'>
              <span x-text='$store.chatShepherdStore.throttleLabel()'></span>
             </div>
+            <div class='shepherd-badge' x-show='$store.chatShepherdStore.capLabel().length > 0'>
+             <span x-text='$store.chatShepherdStore.capLabel()'></span>
+            </div>
             <div class='shepherd-badge' x-show='$store.chatShepherdStore.aggregatesLabel().length > 0'>
              <span x-text='$store.chatShepherdStore.aggregatesLabel()'></span>
             </div>

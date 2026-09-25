@@ -1447,6 +1447,14 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
      'wedge_nudged': summary['wedge_nudged'],
      'wedge_restarts': summary['wedge_restarts'],
      'wedge_budget': max(1, max_nudges_per_tick),
+     # v1.20.0: tracked-chats maintenance, split so the dashboard can tell
+     # dead-chat pruning (routine) from dead-surplus cap eviction (only
+     # possible when dead entries outnumber the cap). A non-zero
+     # cap_evicted on a busy instance is the visible proof that LIVE
+     # contexts are being protected - before v1.20.0 this churn showed up
+     # as a constant prune_state count instead.
+     'pruned': pruned_dead,
+     'cap_evicted': len(dropped),
      'timestamp': datetime.now(timezone.utc).isoformat(),
     }
     # v1.17.0 durability: skip the full state.json rewrite when nothing

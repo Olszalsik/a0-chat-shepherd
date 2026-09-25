@@ -1916,6 +1916,42 @@ def main():
             print('TEST30_BASELINE_RACE_GUARD_OK')
         finally:
             state_mod.read_journal = _orig_rj30
+
+        # ============ TEST 31: cap/prune split is persisted + surfaced (v1.20.0) ============
+        # The v1.20.0 fix separated dead-chat pruning from dead-surplus cap
+        # eviction. Both must reach the /status throttle snapshot, otherwise
+        # the dashboard badge silently reads zero and the "live chats are
+        # protected" signal regresses to invisible.
+        _orig_hcd31 = monitor._has_chat_dir
+        try:
+            monitor._has_chat_dir = lambda cid: cid.startswith('live')
+            _live_ids31 = ['live%04d' % i for i in range(120)]
+            _chats31 = {cid: {'status': 'running', 'nudge_count': 0, 'last_ticked': now_iso} for cid in _live_ids31}
+            FakeAgentContext._all = [FakeCtx(cid, ['user', 'tool'], idle_minutes=0) for cid in _live_ids31]
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats=_chats31)
+            s31 = monitor.tick(dict(cfg, max_nudges_per_tick=5))
+            st31 = read_state()
+            for _cid31 in _live_ids31:
+                assert _cid31 in st31['chats'], 'live chat evicted: ' + _cid31
+            th31 = st31.get('throttle') or {}
+            assert 'pruned' in th31 and 'cap_evicted' in th31, (
+                'throttle snapshot missing the v1.20.0 pruned/cap_evicted split: %r' % (th31,)
+            )
+            assert th31.get('pruned') == 0, th31
+            assert th31.get('cap_evicted') == 0, (
+                'live contexts must never be evicted, got cap_evicted=%r' % th31.get('cap_evicted')
+            )
+            assert s31['cap_evicted'] == 0, s31
+            # the /status handler must pass both fields through
+            from usr.plugins.chat_shepherd.api.status import Status as _CSStatus31
+            import asyncio as _aio31
+            _payload31 = _aio31.run(_CSStatus31(None, None).process({}, None))
+            _th_api31 = _payload31.get('throttle') or {}
+            assert 'cap_evicted' in _th_api31 and 'pruned' in _th_api31, _th_api31
+        finally:
+            monitor._has_chat_dir = _orig_hcd31
+            FakeAgentContext._all = []
+        print('TEST31_CAP_SPLIT_SIGNAL_OK')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file
