@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.20.3 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-26 follow-up pass (row hook + hook-independent config + lock contract → v1.20.3; full-plugin audit → v1.20.2; sidebar-row regression → v1.20.1; 2026-09-24 live-audit → v1.20.0)
+**Version:** 1.20.4 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-27 manual-override confirmation (→ v1.20.4; row hook + hook-independent config + lock contract → v1.20.3; full-plugin audit → v1.20.2; sidebar-row regression → v1.20.1; 2026-09-24 live-audit → v1.20.0)
 
 ## Purpose
 
@@ -31,6 +31,7 @@ Agent monitoring: a `job_loop` extension ticks periodically, classifies every li
 - **Sidebar badge row resolution (v1.20.1)**: `webui/shepherd-sidebar.js` resolves a row's chat id in this order — (1) row attributes `data-folder-thread` / `data-context-id` / `data-chat-id` walking up from `.chat-container`; (2) `Alpine.$data(container)` probing the scope keys `context`, `child`, `item`, `task`; (3) the legacy `<li>` scope lookup; (4) `dataset.chatId`. The container's own scope must be read, not only the `<li>`: since the v2.10 sidebar refactor, chat rows come from the shared `sidebar/chats/chat-tree.html` component, and a row-list extension (`_sidebar_folders`) binds the model as `item` on a wrapper `x-data` while its `x-for` scope sits on the `<li>`. The old `<li>`-only lookup returned `null` for those rows, so no badge was painted for top-level chats and only nested children (visible after expanding a parent) showed one.
 - **Config reads are hook-independent (v1.20.3)**: every runtime read goes through `monitor._load_config()`, which re-applies `config_defaults.deep_merge_defaults()` on top of whatever the framework returns. No runtime path may call `plugins.get_plugin_config` directly — the `hooks.py` deep-merge is the *primary* mechanism, but a hook regression must not silently zero every unwritten key. The tick extension, `/status`, and `/test_notify` all use the seam; `api/config.py` keeps its own `_read_disk()` (it must persist, not just read). `config.json` on disk is fully merged (TEST36) so the two paths cannot disagree.
 - **Row identity comes from the core hook (v1.20.3)**: `chat-tree.html` now renders `:data-context-id="context.id"` on the same element that carries `.chat-container`, so the badge injector resolves a row from that attribute with no Alpine scope at all. The scope and legacy-attribute lookups remain as fallbacks for third-party row views that do not reuse the core component.
+- **Manual nudges on a fatal stop are confirmed, audited, and non-destructive (v1.20.4)**: the AUTO ladder refuses to nudge a chat that ended on a real error or a security termination, because a nudge restarts the exact code path that just failed. A human must always be able to override that — the operator may have fixed the underlying bug — but the override is never silent and never destroys the evidence. See the v1.20.4 entry in the changelog below for the full request/response contract.
 - **Badge placement**: the badge is hosted by `.chat-list-button` and inserted before `.chat-list-action-btn`, so it sits with the chat name and never shifts when the hover-only close/overflow buttons appear. `pointer-events: none` keeps the whole row clickable.
 - **Badge identity**: repaint is keyed on `data-cs-status`, not on the glyph — two statuses may share one pictogram and must still update colour, tooltip, and `aria-label`. A badge already inside the current host is reused, never recreated; one found in a stale host is dropped.
 - **Extension script idempotence**: the file is a classic script inside the `sidebar-chats-list-start` HTML extension, and the component loader re-executes it on every extension (re)load. The `window.__chatShepherdSidebar` guard makes repeat loads a no-op that only re-runs `refresh()`, so timers and observers cannot stack.
@@ -112,12 +113,13 @@ Context: the plugin was being built by an agent whose chat died in the three 9p 
 
 ## Verification
 
-- `node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs` — badge-injector DOM regression suite (v1.20.1; 22 assertions, no external deps).
-- `node usr/plugins/chat_shepherd/tests/suite_store.mjs` — shared-store regression suite (v1.20.2; 12 assertions, data-URL module harness).
+- `node usr/plugins/chat_shepherd/tests/suite_store.mjs` — shared-store regression suite (v1.20.4; 26 assertions, data-URL module harness — stubs `showConfirmDialog` + `toastFrontendSuccess` to exercise the guarded-nudge confirm flow).
+- `node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs` — badge-injector DOM regression suite (v1.20.1; 23 assertions, no external deps).
 - `node --check usr/plugins/chat_shepherd/webui/shepherd-sidebar.js` and `.../shepherd-store.js`.
 - `python -m py_compile` over every plugin module.
 - `GET/POST /api/plugins/chat_shepherd/status` returns live classified chats + counts + config snapshot.
 - Sidebar shows per-chat icons; dashboard `webui/main.html` shows counts + history; manual Nudge increments the counter, Resolve resets it, Dismiss removes the entry.
+- v1.20.4: a manual Nudge on an `error` row shows a danger confirmation carrying the backend's reason, and only then sends; the row keeps `status: error` afterwards and the timeline records a `manual_nudge_override` row. TEST39 + `suite_store.mjs` §5/§5b/§5c/§6 guard it.
 - Settings → Plugins → Chat Shepherd card saves through `api/config.py` (clamped, known-key-only).
 - v1.9.0: TEST11 covers the reload engine (prime/clean, live swap, compile-error backoff, exec-failure rollback, config gate, force); live check via the `hot_reload` block in `/status`.
 - 2026-09-14 external review: full suite `ALL_TESTS_PASSED` on the Windows host with only the P6.2 bootstrap fix applied to a scratch copy (TEST1-TEST11). Off-Docker `pytest` collection is blocked until P6.2 lands; P6.1/P6.3/P6.4 verified against framework source (`helpers/api.py`, `webui/js/api.js`, `helpers/plugins.py`, `plugins/_goal/tools/goal.py`).
@@ -234,6 +236,29 @@ User report after updating Agent Zero: chat status icons were missing from the r
 - **Idempotence**: `shepherd-sidebar.js` is a classic script inside the `sidebar-chats-list-start` HTML extension, and the component loader re-clones and re-executes it on every extension (re)load. A `window.__chatShepherdSidebar` guard now makes repeat loads a no-op that only calls `refresh()`, so the poll interval and MutationObserver can no longer stack.
 - **Robustness**: `injectBadges` reschedules instead of silently dropping a re-entrant pass and swallows per-run DOM errors so a transient row shape cannot kill the poll loop; `pointer-events: none` keeps the row fully clickable; `role="img"` + `aria-label` added.
 - **Tests**: new `tests/suite_sidebar.mjs` — a dependency-free DOM harness (no jsdom in this repo) that runs the real injector against the four row shapes Agent Zero actually renders, plus placement, repaint, idle/blank-icon clearing, observer anchoring, and repeat-load idempotence. 22 assertions, `node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs` green. `node --check` green on both plugin scripts; the Python suite still reports ALL_TESTS_PASSED.
+### v1.20.4 — Confirmed, audited, non-destructive manual override (2026-09-27)
+
+The auto-nudge ladder's refusal to touch a chat that ended on a real error or a security termination is **correct and unchanged** — Shepherd cannot know whether the underlying bug was fixed, and a nudge restarts the exact code path that just failed. The finding was about the *manual* path, which bypassed that judgement with no acknowledgement and no record.
+
+Three defects in `api/nudge.py`, all reproduced before fixing:
+
+- **Silent send, no warning.** The Nudge button sent immediately on a chat whose fatal stop the ladder itself considers un-nudgeable. The operator got no hint that this was the one case Shepherd refuses on its own.
+- **The override erased the evidence.** `_apply` hardcoded `status='nudged'` and overwrote `last_classification`, so nudging an errored chat flipped the row to a healthy-looking `nudged` and replaced the reason it died. The signal an operator most needs *after* an override was the one thing the override destroyed. Reproduced directly: `{'status': 'error', ...}` → `{'status': 'nudged', 'last_classification': 'Manual nudge (attempt 1)'}`.
+- **No distinct audit record.** An override was journaled as an ordinary `manual_nudge`, so the timeline could not distinguish "routinely nudged a stalled chat" from "a human deliberately restarted a broken one".
+
+Contract now:
+
+- `_evaluate_guards(ctx, chat_id)` reuses the *same* two predicates the ladder applies — `monitor._last_log_fatal()` and `monitor._termination_cooldown_active()` — so the two paths cannot drift. It runs on the nudge path too, including when forced, because a forced nudge must still know *which* guard it overrode.
+- Guarded + no `force` → `{success: true, needs_confirmation: true, guard, warning}`. **Nothing is sent and no state is touched**, so the response is a confirmation request, not an error, and re-issuing with `force` is safe.
+- Guarded + `force` → sends, journals `action='manual_nudge_override'` with the guard in `detail`, and **preserves the prior status**, annotating `last_classification` and stamping `manual_nudge_override_at` / `manual_nudge_override_guard`. The row stays `error` until the monitor re-classifies it on a real signal.
+- Unguarded + `force` → an ordinary nudge (`overrode_guard: false`). `force` never invents an override.
+- `force` is parsed by `_as_bool`, not `bool()`: a client sending the string `"false"` must not override a fatal-stop guard.
+- WebUI: `nudge(chatId, force)` opens the framework's `showConfirmDialog` (type `danger`) carrying the backend's own warning text, and re-issues with `force: true` only on confirm. `nudgeHint(chat)` puts the same warning in the button's `title` on `status === 'error'` rows, so the behaviour is discoverable *before* the click.
+
+New `state.read_chat_entry(chat_id)` reads one entry without `load_state()`'s journal read + cache; the guard needs only the durable `terminated_at` stamp, and the v1.18.1 event-loop work exists precisely because those reads used to block it.
+
+**Tests**: TEST39 (backend, 5 cases: unguarded sends and flips status; guarded asks and sends/mutates nothing; forced delivers, journals an override, preserves `error`; `force` on a healthy chat stays ordinary; `force="false"` is not truthy) and `suite_store.mjs` §5/§5b/§5c/§6 (confirm dialog shown with the backend's reason, confirm re-issues with `force: true`, cancel sends nothing, ordinary nudges never force, the tool-tip keys only on real `STATUS_*` values). Verified by reverting each half: disabling the guard, retrying without force, and restoring `status='nudged'` in the override branch each fail the suite. `suite_monitor.py` 107 markers, `suite_store.mjs` 26 assertions.
+
 ### v1.20.3 — Row identity hook, hook-independent config, lock contract (2026-09-26)
 
 Follow-up on the three items flagged at the end of the v1.20.2 audit. Two were defects worth fixing; the third was reviewed and deliberately left as-is, with the reasoning recorded in code.

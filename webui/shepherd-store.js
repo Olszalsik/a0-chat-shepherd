@@ -1,6 +1,7 @@
 import { createStore } from "/js/AlpineStore.js";
 import { callJsonApi } from "/js/api.js";
-import { toastFrontendError } from "/components/notifications/notification-store.js";
+import { showConfirmDialog } from "/js/confirmDialog.js";
+import { toastFrontendError, toastFrontendSuccess } from "/components/notifications/notification-store.js";
 
 const API = "/api/plugins/chat_shepherd";
 
@@ -105,14 +106,48 @@ export const store = createStore("chatShepherdStore", {
     }
   },
 
-  async nudge(chatId) {
+  async nudge(chatId, force = false) {
+    // v1.20.4: the backend refuses to silently restart a chat that died from a
+    // real error / security termination - the same states the auto-nudge ladder
+    // deliberately refuses. It answers with needs_confirmation instead of
+    // sending, and the operator decides. Nothing has been sent or recorded at
+    // that point, so re-issuing with force is safe.
     try {
-      const json = await callApi("/nudge", { chat_id: chatId });
-      if (!json || !json.success) toastFrontendError((json && json.error) || "Nudge failed", "Chat Shepherd");
+      const json = await callApi("/nudge", { chat_id: chatId, force: force === true });
+      if (json && json.needs_confirmation) {
+        const confirmed = await showConfirmDialog({
+          title: "Restart a chat that errored?",
+          message: `${json.warning}<br><br>Only continue if you believe the underlying problem is fixed. Chat Shepherd still will not auto-nudge this chat while the suppression is active.`,
+          confirmText: "Nudge anyway",
+          cancelText: "Cancel",
+          type: "danger",
+        });
+        if (!confirmed) return;
+        return this.nudge(chatId, true);
+      }
+      if (!json || !json.success) {
+        toastFrontendError((json && json.error) || "Nudge failed", "Chat Shepherd");
+      } else if (json.overrode_guard) {
+        toastFrontendSuccess("Nudge sent (guard overridden)", "Chat Shepherd");
+      }
       this.fetchStatus();
     } catch (e) {
       toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
     }
+  },
+
+  // v1.20.4: tool-tip explaining the confirmation a guarded nudge will ask
+  // for, so the behaviour is discoverable before the click, not after it.
+  // Keys on the real helpers/constants.py STATUS_* values - 'error' is what
+  // classify_chat assigns to both a fatal stop and a security termination.
+  nudgeHint(chat) {
+    if (!chat) return "";
+    if (String(chat.status || "") === "error") {
+      return "This chat ended on an error or a security termination. "
+        + "Chat Shepherd will not auto-nudge it, and a manual nudge will ask "
+        + "for confirmation first.";
+    }
+    return "Send the nudge message to this chat.";
   },
 
   async resolve(chatId) {

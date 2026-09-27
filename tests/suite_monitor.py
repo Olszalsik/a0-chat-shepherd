@@ -2185,6 +2185,7 @@ def main():
             _tick_thread.start()
             assert _in_delivery.wait(5), 'the tick never reached message delivery'
             # The tick now holds the state lock. A manual action must wait.
+
             _handler_thread = _th38.Thread(target=_handler38)
             _handler_thread.start()
             _handler_thread.join(timeout=0.15)
@@ -2213,6 +2214,117 @@ def main():
             FakeAgentContext._all = []
         print('TEST38_TICK_HANDLER_SERIALIZATION_OK')
 
+        # ============ TEST 39: manual nudge on a fatal stop asks first (v1.20.4) ============
+        # The auto ladder refuses to nudge a chat that died from a real error
+        # (nudging restarts the same failing code path). A HUMAN must still be
+        # able to override - but until v1.20.4 the button gave no hint of that,
+        # sent silently, and overwrote status='error' with 'nudged', erasing the
+        # very signal the operator needs afterwards.
+        import asyncio as _aio39
+        from usr.plugins.chat_shepherd.api import nudge as _nudge39
+        from usr.plugins.chat_shepherd.helpers import state as _sm39
+        _orig_hcd39 = monitor._has_chat_dir
+        _orig_get39 = _nudge39._get_context
+        _orig_statefile39 = _sm39.STATE_FILE
+        _orig_journal39 = _sm39.JOURNAL_FILE
+        try:
+            monitor._has_chat_dir = lambda cid: True
+            _nudge39.monitor._has_chat_dir = lambda cid: True
+            _sm39.STATE_FILE = 'usr/plugins/chat_shepherd/data/test39_state.json'
+            _sm39.JOURNAL_FILE = 'usr/plugins/chat_shepherd/data/test39_hist.jsonl'
+
+            def _seed39(**entry):
+                files.write_file(_sm39.STATE_FILE, json.dumps({
+                    'chats': {FAKE_CHAT_A: entry}, 'last_tick': now_iso, 'history': [],
+                }))
+
+            def _read39():
+                raw = json.loads(files.read_file(files.get_abs_path(_sm39.STATE_FILE)))
+                return raw['chats'][FAKE_CHAT_A]
+
+            def _nudge39_run(force=None):
+                body = {'chat_id': FAKE_CHAT_A}
+                if force is not None:
+                    body['force'] = force
+                return _aio39.run(_nudge39.Nudge(None, None).process(body, None))
+
+            # (a) unguarded chat -> ordinary nudge, status flips to 'nudged'
+            _seed39(status='stalled', nudge_count=0, last_classification='Stalled 30m')
+            _nudge39._get_context = lambda cid: FakeCtx(
+                FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+            _r39a = _nudge39_run()
+            assert _r39a['success'] and not _r39a.get('needs_confirmation'), _r39a
+            assert _r39a.get('overrode_guard') is False, _r39a
+            assert _read39()['status'] == 'nudged', _read39()
+            assert 'Manual nudge' in _read39()['last_classification'], _read39()
+
+            # (b) fatal-stop chat -> confirmation requested, NOTHING sent
+            _seed39(status='error', nudge_count=0,
+                    last_classification='Chat stopped by an error or security termination')
+            _ctx39 = FakeCtx(FAKE_CHAT_A, ['user', 'tool', 'error'], idle_minutes=30)
+            _nudge39._get_context = lambda cid: _ctx39
+            _r39b = _nudge39_run()
+            assert _r39b.get('needs_confirmation') is True, _r39b
+            assert _r39b.get('guard') == 'fatal_stop', _r39b
+            assert _r39b.get('warning'), _r39b
+            assert _ctx39.communicated == [], 'the guarded nudge must not deliver'
+            _after39 = _read39()
+            assert _after39['status'] == 'error', ('guard must not touch state: %r' % _after39)
+            assert _after39.get('nudge_count') == 0, _after39
+
+            # (c) forced -> delivers, journals an override, PRESERVES the error
+            # Start from a clean journal: step (a) legitimately journaled a
+            # plain manual_nudge, and this step must not be judged against it.
+            try:
+                os.unlink(files.get_abs_path(_sm39.JOURNAL_FILE))
+            except Exception:
+                pass
+            _r39c = _nudge39_run(force=True)
+            assert _r39c['success'] and _r39c.get('overrode_guard') is True, _r39c
+            assert len(_ctx39.communicated) == 1, 'the forced nudge must deliver'
+            _after39c = _read39()
+            assert _after39c['status'] == 'error', (
+                'an override must NOT erase the error status: %r' % _after39c
+            )
+            assert 'OVERRIDE' in _after39c['last_classification'], _after39c
+            assert _after39c.get('manual_nudge_override_guard') == 'fatal_stop', _after39c
+            _acts39 = [h.get('action') for h in _sm39.read_journal(50)]
+            assert 'manual_nudge_override' in _acts39, _acts39
+            assert 'manual_nudge' not in _acts39, (
+                'an override must not also journal a plain manual_nudge: %r' % _acts39
+            )
+
+            # (d) force on a NON-guarded chat is an ordinary nudge
+            _nudge39._get_context = lambda cid: FakeCtx(
+                FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
+            _seed39(status='stalled', nudge_count=0, last_classification='Stalled 30m')
+            _r39d = _nudge39_run(force='true')
+            assert _r39d['success'] and _r39d.get('overrode_guard') is False, (
+                'force on a healthy chat must stay an ordinary nudge: %r' % _r39d
+            )
+            assert _read39()['status'] == 'nudged', _read39()
+
+            # (e) the string "false" must not be read as true
+            _seed39(status='error', nudge_count=0, last_classification='error')
+            _nudge39._get_context = lambda cid: FakeCtx(
+                FAKE_CHAT_A, ['user', 'tool', 'error'], idle_minutes=30)
+            _r39e = _nudge39_run(force='false')
+            assert _r39e.get('needs_confirmation') is True, (
+                'force="false" must not override the guard: %r' % _r39e
+            )
+        finally:
+            monitor._has_chat_dir = _orig_hcd39
+            _nudge39._get_context = _orig_get39
+            _nudge39.monitor._has_chat_dir = monitor._has_chat_dir
+            _sm39.STATE_FILE = _orig_statefile39
+            _sm39.JOURNAL_FILE = _orig_journal39
+            for _p39 in ('usr/plugins/chat_shepherd/data/test39_state.json',
+                         'usr/plugins/chat_shepherd/data/test39_hist.jsonl'):
+                try:
+                    os.unlink(files.get_abs_path(_p39))
+                except Exception:
+                    pass
+        print('TEST39_MANUAL_NUDGE_GUARD_OK')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

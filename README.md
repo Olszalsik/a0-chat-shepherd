@@ -50,6 +50,25 @@ It is an **active supervisor**, not a passive indicator. The sidebar
 
 Icons are fully configurable.
 
+### Nudging a chat that ended in an error
+
+Shepherd never auto-nudges a chat whose last run stopped on a real error or a
+security termination — a nudge just restarts the code path that already failed,
+and Shepherd cannot know whether the underlying bug was fixed.
+
+You can still nudge it by hand, and the dashboard will make you confirm it
+first:
+
+1. The **Nudge** button on an `error` row carries a tooltip saying so.
+2. Clicking it opens a confirmation explaining why the automatic nudges are
+   suppressed. **Nothing is sent and no state changes** at that point.
+3. If you confirm, the nudge is sent and the chat's timeline records a
+   `manual nudge override` entry naming the reason it was overridden.
+
+Your chat keeps its `error` status afterwards. Shepherd does not mark an
+errored chat as healthy just because you nudged it — it waits for a real
+signal, and the next tick re-classifies the chat from the live log.
+
 ---
 
 ## Install
@@ -182,13 +201,13 @@ still shows every chat's status — only the inline icon is skipped.
 ## Development
 
 ```bash
-# self-test suite (106 markers)
+# self-test suite (107 markers)
 python usr/plugins/chat_shepherd/tests/suite_monitor.py
 
 # sidebar badge-injector DOM suite (23 assertions, no external deps)
 node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs
 
-# shared frontend store suite (12 assertions, no external deps)
+# shared frontend store suite (26 assertions, no external deps)
 node usr/plugins/chat_shepherd/tests/suite_store.mjs
 
 # byte-compile check

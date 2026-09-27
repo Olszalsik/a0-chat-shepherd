@@ -136,7 +136,8 @@
                   <td x-text='chat.nudge_count'></td>
                   <td x-text='$store.chatShepherdStore.formatTime(chat.last_nudge_at)'></td>
                   <td class='shepherd-action'>
-                    <button class='shepherd-btn' @click='$store.chatShepherdStore.nudge(chat.chat_id)'>Nudge</button>
+                    <button class='shepherd-btn' @click='$store.chatShepherdStore.nudge(chat.chat_id)'
+                            :title='$store.chatShepherdStore.nudgeHint(chat)'>Nudge</button>
                     <button class='shepherd-btn' @click='$store.chatShepherdStore.resolve(chat.chat_id)' x-show='chat.status === &apos;intervention&apos;'>Resolve</button>
                     <button class='shepherd-btn' @click='$store.chatShepherdStore.dismiss(chat.chat_id)'>Dismiss</button>
                     <button class='shepherd-btn' @click='$store.chatShepherdStore.toggleTimeline(chat.chat_id)' x-text='$store.chatShepherdStore.timelineOpen === chat.chat_id ? &apos;Hide&apos; : &apos;Timeline&apos;'></button>

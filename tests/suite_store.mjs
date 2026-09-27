@@ -47,20 +47,28 @@ let loadSeq = 0;
 async function loadStore(overrides = {}) {
   const toasts = [];
   const apiCalls = [];
+  const dialogs = [];
   globalThis.__storeTest = {
     toasts,
     apiCalls,
+    dialogs,
     api: overrides.api || (() => ({ success: true })),
   };
   const header = `
     const toasts = globalThis.__storeTest.toasts;
     const apiCalls = globalThis.__storeTest.apiCalls;
+    const dialogs = globalThis.__storeTest.dialogs;
     const createStore = (_name, model) => model;
-    const callJsonApi = async (url) => {
-      apiCalls.push(url);
-      return globalThis.__storeTest.api(url);
+    const callJsonApi = async (url, body) => {
+      apiCalls.push([url, body]);
+      return globalThis.__storeTest.api(url, body);
     };
-    const toastFrontendError = (message, title) => { toasts.push({ message, title }); };
+    const toastFrontendError = (message, title) => { toasts.push({ kind: 'error', message, title }); };
+    const toastFrontendSuccess = (message, title) => { toasts.push({ kind: 'success', message, title }); };
+    const showConfirmDialog = async (options) => {
+      dialogs.push(options);
+      return globalThis.__storeTest.confirmAnswer !== false;
+    };
   `;
   // Strip the framework imports (unresolvable in a data: URL) and the ESM
   // export keywords; the stubs above stand in for them.
@@ -76,7 +84,13 @@ async function loadStore(overrides = {}) {
       + "//#" + (++loadSeq),
   ).toString("base64");
   await import(url);
-  return { store: globalThis.__storeModule.store, toasts, apiCalls };
+  return {
+    store: globalThis.__storeModule.store,
+    toasts,
+    apiCalls,
+    dialogs,
+    setConfirmAnswer: (v) => { globalThis.__storeTest.confirmAnswer = v; },
+  };
 }
 
 const OK_RESP = () => ({
@@ -153,6 +167,69 @@ const OK_RESP = () => ({
   ok(store.draftEdits.keep2 === "server text 2", "new drafts are seeded from the server text");
   ok(!("gone1" in store.draftEdits) && !("gone2" in store.draftEdits),
     "edits for removed drafts must be pruned");
+  store.stopPolling();
+}
+
+// 5. A guarded nudge asks before it restarts an errored chat (v1.20.4).
+{
+  const responses = [
+    { success: true, needs_confirmation: true, guard: "fatal_stop",
+      warning: "This chat stopped on an error or a security termination." },
+    { success: true, overrode_guard: true, nudge_count: 1 },
+  ];
+  let i = 0;
+  const { store, apiCalls, dialogs } = await loadStore({ api: () => responses[i++] });
+  await store.nudge("chat0001");
+  ok(dialogs.length === 1, "a guarded nudge must ask for confirmation");
+  ok(dialogs[0].type === "danger", "the dialog is a danger confirmation");
+  ok(/stopped on an error/.test(dialogs[0].message),
+    "the dialog must show the backend's reason");
+  const nudges = apiCalls.filter(([url]) => url.endsWith("/nudge"));
+  ok(nudges.length === 2, "confirming re-issues the request with force");
+  ok(nudges[0][1].force === false, "the first attempt must not force");
+  ok(nudges[1][1].force === true, "the confirmed attempt must force");
+  store.stopPolling();
+}
+
+// 5b. Cancelling the confirmation sends nothing.
+{
+  const responses = [
+    { success: true, needs_confirmation: true, guard: "fatal_stop", warning: "boom" },
+  ];
+  let i = 0;
+  const { store, apiCalls, dialogs, setConfirmAnswer } = await loadStore({
+    api: () => responses[i++],
+  });
+  setConfirmAnswer(false);
+  await store.nudge("chat0001");
+  ok(dialogs.length === 1, "the confirmation was shown");
+  const nudges = apiCalls.filter(([url]) => url.endsWith("/nudge"));
+  ok(nudges.length === 1, "cancelling must NOT re-issue a forced nudge");
+  store.stopPolling();
+}
+
+// 5c. An ordinary nudge never opens a dialog and never forces.
+{
+  const { store, apiCalls, dialogs } = await loadStore({
+    api: () => ({ success: true, nudge_count: 1 }),
+  });
+  await store.nudge("chat0001");
+  ok(dialogs.length === 0, "a healthy chat nudges without a confirmation");
+  const nudges = apiCalls.filter(([url]) => url.endsWith("/nudge"));
+  ok(nudges.length === 1, "exactly one request");
+  ok(nudges[0][1].force === false, "and it is not forced");
+  store.stopPolling();
+}
+
+// 6. The nudge tool-tip advertises the confirmation on errored rows only.
+{
+  const { store } = await loadStore();
+  ok(/ask for confirmation/.test(store.nudgeHint({ status: "error" })),
+    "an errored chat warns before the click");
+  ok(!/ask for confirmation/.test(store.nudgeHint({ status: "stalled" })),
+    "a merely stalled chat does not warn");
+  ok(!/ask for confirmation/.test(store.nudgeHint(null)),
+    "a missing chat does not warn");
   store.stopPolling();
 }
 

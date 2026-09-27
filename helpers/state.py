@@ -93,6 +93,32 @@ def load_state() -> dict[str, Any]:
 
 
 
+def read_chat_entry(chat_id: str) -> dict[str, Any]:
+    """Read ONE persisted chat entry, without the journal mirror.
+
+    v1.20.4: guard checks (e.g. the durable `terminated_at` stamp) only need
+    the entry's own fields. `load_state()` also reads and caches the journal,
+    which is far heavier and would make a request handler pay for a file it
+    does not use - the v1.18.1 event-loop work exists precisely because those
+    reads used to block the loop. Read-only, never raises, never seeds.
+    """
+    try:
+        path = files.get_abs_path(STATE_FILE)
+        if not files.exists(path):
+            return {}
+        payload = json.loads(files.read_file(path))
+        if not isinstance(payload, dict):
+            return {}
+        chats = payload.get('chats')
+        if not isinstance(chats, dict):
+            return {}
+        entry = chats.get(chat_id)
+        return entry if isinstance(entry, dict) else {}
+    except Exception:
+        return {}
+
+
+
 def save_state(state: dict[str, Any]) -> None:
     # Atomic replace: a crash mid-write must never truncate state.json.
     # v1.6.0: history no longer round-trips through state.json; the
