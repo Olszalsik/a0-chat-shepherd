@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.20.5 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-27 endpoint offload + /config silent-drop fix (→ v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3; full-plugin audit → v1.20.2; sidebar-row regression → v1.20.1)
+**Version:** 1.20.6 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-27 config no longer pins defaults (→ v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
 
 ## Purpose
 
@@ -29,7 +29,7 @@ Agent monitoring: a `job_loop` extension ticks periodically, classifies every li
 ## Local Contracts
 
 - **Sidebar badge row resolution (v1.20.1)**: `webui/shepherd-sidebar.js` resolves a row's chat id in this order — (1) row attributes `data-folder-thread` / `data-context-id` / `data-chat-id` walking up from `.chat-container`; (2) `Alpine.$data(container)` probing the scope keys `context`, `child`, `item`, `task`; (3) the legacy `<li>` scope lookup; (4) `dataset.chatId`. The container's own scope must be read, not only the `<li>`: since the v2.10 sidebar refactor, chat rows come from the shared `sidebar/chats/chat-tree.html` component, and a row-list extension (`_sidebar_folders`) binds the model as `item` on a wrapper `x-data` while its `x-for` scope sits on the `<li>`. The old `<li>`-only lookup returned `null` for those rows, so no badge was painted for top-level chats and only nested children (visible after expanding a parent) showed one.
-- **Config reads are hook-independent (v1.20.3)**: every runtime read goes through `monitor._load_config()`, which re-applies `config_defaults.deep_merge_defaults()` on top of whatever the framework returns. No runtime path may call `plugins.get_plugin_config` directly — the `hooks.py` deep-merge is the *primary* mechanism, but a hook regression must not silently zero every unwritten key. The tick extension, `/status`, and `/test_notify` all use the seam; `api/config.py` keeps its own `_read_disk()` (it must persist, not just read). `config.json` on disk is fully merged (TEST36) so the two paths cannot disagree.
+- **Config reads are hook-independent (v1.20.3)**: every runtime read goes through `monitor._load_config()`, which re-applies `config_defaults.deep_merge_defaults()` on top of whatever the framework returns. No runtime path may call `plugins.get_plugin_config` directly — the `hooks.py` deep-merge is the *primary* mechanism, but a hook regression must not silently zero every unwritten key. The tick extension, `/status`, and `/test_notify` all use the seam; `api/config.py` keeps its own `_read_disk()` (it must persist, not just read). **The on-disk `config.json` is the inverse of this: it holds ONLY explicitly-set values (v1.20.6), never the full 33-key merge** — a fully-merged file pins every shipped default and would block any future default change. Completeness is the read path's job, proven by TEST36 + TEST37.
 - **Row identity comes from the core hook (v1.20.3)**: `chat-tree.html` now renders `:data-context-id="context.id"` on the same element that carries `.chat-container`, so the badge injector resolves a row from that attribute with no Alpine scope at all. The scope and legacy-attribute lookups remain as fallbacks for third-party row views that do not reuse the core component.
 - **Manual nudges on a fatal stop are confirmed, audited, and non-destructive (v1.20.4)**: the AUTO ladder refuses to nudge a chat that ended on a real error or a security termination, because a nudge restarts the exact code path that just failed. A human must always be able to override that — the operator may have fixed the underlying bug — but the override is never silent and never destroys the evidence. See the v1.20.4 entry in the changelog below for the full request/response contract.
 - **Badge placement**: the badge is hosted by `.chat-list-button` and inserted before `.chat-list-action-btn`, so it sits with the chat name and never shifts when the hover-only close/overflow buttons appear. `pointer-events: none` keeps the whole row clickable.
@@ -269,6 +269,52 @@ User report after updating Agent Zero: chat status icons were missing from the r
 - **Idempotence**: `shepherd-sidebar.js` is a classic script inside the `sidebar-chats-list-start` HTML extension, and the component loader re-clones and re-executes it on every extension (re)load. A `window.__chatShepherdSidebar` guard now makes repeat loads a no-op that only calls `refresh()`, so the poll interval and MutationObserver can no longer stack.
 - **Robustness**: `injectBadges` reschedules instead of silently dropping a re-entrant pass and swallows per-run DOM errors so a transient row shape cannot kill the poll loop; `pointer-events: none` keeps the row fully clickable; `role="img"` + `aria-label` added.
 - **Tests**: new `tests/suite_sidebar.mjs` — a dependency-free DOM harness (no jsdom in this repo) that runs the real injector against the four row shapes Agent Zero actually renders, plus placement, repaint, idle/blank-icon clearing, observer anchoring, and repeat-load idempotence. 22 assertions, `node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs` green. `node --check` green on both plugin scripts; the Python suite still reports ALL_TESTS_PASSED.
+### v1.20.6 — config.json records only what the operator set (2026-09-27)
+
+Closes the forward-compatibility item deliberately deferred in v1.20.5, at the
+owner's direction (their own install is the only one that matters).
+
+- **Every shipped default was being pinned into the user's file.** Both save
+  paths persisted the FULLY MERGED config, so the first time anyone saved one
+  setting, all 33 keys landed on disk — including 32 values identical to
+  `DEFAULTS`. In `deep_merge_defaults` the file always wins over `DEFAULTS`, so
+  those 32 stale copies would shadow any value a later release changed: a
+  corrected default could never reach an existing install, silently, forever.
+  This is also what v1.20.3's "config.json is fully merged 33/33" actually
+  described — a side effect of saving the merged view, never a correctness
+  feature. Both read paths (`api/config.py::_read_disk` and
+  `monitor._load_config`) already apply `deep_merge_defaults` independently,
+  so they agreed either way; the full file bought nothing.
+- New pure `config_defaults.prune_to_explicit(merged)` reduces a merged config
+  back to the operator's values: keep a known key only when it differs from
+  `DEFAULTS`, keep **every** unknown key untouched (a key we do not understand
+  may belong to another version — dropping it would destroy config), and for
+  the `icons` dict keep only the sub-keys the user changed. It is idempotent.
+  Applied in `api/config.py` **and** in `hooks.save_plugin_config`, because the
+  hook is the path the *framework settings modal* takes, not just this
+  endpoint.
+- **TEST36 is inverted, not deleted.** It asserted the old contract
+  (fully-merged, 33/33) and would have failed the moment a single key was
+  pruned. It now asserts nothing on disk is pinned to a default, that the read
+  path still yields all 33 regardless, that prune is lossless and idempotent,
+  and that an unknown key survives. TEST37 (hookless read) is unchanged and
+  still proves the runtime never depended on the file being complete.
+- The owner's own `config.json` was 33/33 with every value equal to its
+  default, so pruning reduced it to `{}`. Verified the read still returns all
+  33 keys — nothing was lost, nothing was customised to begin with.
+
+**Tests**: TEST42 (a save writes exactly the explicit keys and no default-valued
+key; resetting a key to its default removes it from the file while the read
+still returns the default; an unknown key survives) and TEST43 (the
+`hooks.save_plugin_config` path prunes too, survives a `_read_persisted`
+explosion, and never returns `None`). Mutation-tested; **one mutation escaped
+twice** — the first TEST42/43 draft stubbed `plugins_helper.save_plugin_config`
+and so never executed the hook, meaning deleting the hook's prune call passed
+the entire suite. TEST43 now calls `hooks.save_plugin_config` directly. A
+transient `PermissionError` seen once during mutation testing was my script
+holding `hooks.py` open, not a product flake — four consecutive clean runs
+afterwards. 112 markers.
+
 ### v1.20.5 — /config silent-drop fix, all endpoints off the event loop (2026-09-27)
 
 Closes the one actionable follow-up recorded in v1.20.4's limitations list, and

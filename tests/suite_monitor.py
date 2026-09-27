@@ -2082,25 +2082,40 @@ def main():
             FakeAgentContext._all = []
         print('TEST35_STATUS_TRACKING_PREDICATE_OK')
 
-        # ============ TEST 36: on-disk config.json is complete + already merged (v1.20.3) ============
-        # config.json is routinely partial (only the keys someone changed).
-        # That is safe now that every runtime read re-applies DEFAULTS, but a
-        # complete file means a get_plugin_config hook regression cannot change
-        # behavior at all. Guard it so it cannot silently rot back to partial.
+        # ============ TEST 36: config.json holds ONLY explicitly-set values (v1.20.6) ============
+        # v1.20.3 asserted the OPPOSITE (fully merged 33/33). Saving the merged
+        # view pinned every shipped default into the file, so a later release
+        # that changed a default could never reach an existing install - the
+        # file's stale copy always won over DEFAULTS. The contract is inverted:
+        # the file records what the operator set, and COMPLETENESS is the read
+        # path's job (monitor._load_config / deep_merge_defaults, TEST37).
         from usr.plugins.chat_shepherd.helpers import config_defaults as _cd36
         _cfg_path36 = 'usr/plugins/chat_shepherd/config.json'
         _raw36 = json.loads(files.read_file(files.get_abs_path(_cfg_path36)))
-        _missing36 = sorted(_cd36.KNOWN_KEYS - set(_raw36))
-        assert not _missing36, (
-            'config.json is missing keys (runtime now survives this, but the hook '
-            'is the primary path): %r' % _missing36
+        _pinned36 = sorted(k for k in _cd36.KNOWN_KEYS
+                           if k in _raw36 and _raw36[k] == _cd36.DEFAULTS[k])
+        assert not _pinned36, (
+            'config.json pins values identical to the shipped defaults, so a new '
+            'release could never change them here: %r' % _pinned36
         )
-        assert _cd36.deep_merge_defaults(_raw36) == _raw36, (
-            'config.json is not fully merged; a hook regression would change values'
-        )
+        # ...and completeness must not depend on the file being complete.
+        _merged36 = _cd36.deep_merge_defaults(_raw36)
+        assert sorted(_cd36.KNOWN_KEYS - set(_merged36)) == [], _merged36
         for _k36 in _cd36.ICON_STATUSES:
-            assert _k36 in (_raw36.get('icons') or {}), 'icon missing: ' + _k36
-        print('TEST36_CONFIG_COMPLETE_OK')
+            assert _k36 in (_merged36.get('icons') or {}), 'icon lost: ' + _k36
+        # prune must be lossless for explicit values and idempotent
+        assert _cd36.prune_to_explicit(_merged36) == _raw36, (
+            'prune_to_explicit lost an explicitly-set value: %r' % _raw36
+        )
+        assert _cd36.prune_to_explicit(_cd36.prune_to_explicit(_merged36)) == _raw36
+        # a key we do not understand must survive untouched
+        _probe36 = dict(_raw36)
+        _probe36['some_future_key'] = 42
+        assert _cd36.prune_to_explicit(
+            _cd36.deep_merge_defaults(_probe36))['some_future_key'] == 42, (
+            'prune_to_explicit dropped an unknown key it must preserve'
+        )
+        print('TEST36_CONFIG_EXPLICIT_ONLY_OK')
 
         # ============ TEST 37: _load_config is independent of the hook (v1.20.3) ============
         # Every runtime read goes through monitor._load_config(), which
@@ -2471,6 +2486,101 @@ def main():
             _exp41.load_state = _orig41['ls']
             _exp41.read_journal = _orig41['rj2']
         print('TEST41_ENDPOINTS_OFF_EVENT_LOOP_OK')
+        # ============ TEST 43: the settings-modal save hook prunes too (v1.20.6) ============
+        # hooks.save_plugin_config is the path the FRAMEWORK settings modal
+        # takes - api/config.py is only one caller. The v1.20.6 tests above
+        # stub plugins_helper.save_plugin_config, so they never execute this
+        # function; removing its prune call passed the whole suite. Test it
+        # directly.
+        from usr.plugins.chat_shepherd import hooks as _hooks43
+        from usr.plugins.chat_shepherd.helpers import config_defaults as _cd43
+        _orig_persisted43 = _hooks43._read_persisted
+        try:
+            _hooks43._read_persisted = lambda project_name='', agent_profile='': {
+                'stall_minutes': 9, 'mystery_key': 'keep-me',
+            }
+            _out43 = _hooks43.save_plugin_config({'max_auto_nudges': 4})
+            assert sorted(_out43) == [
+                'max_auto_nudges', 'mystery_key', 'stall_minutes',
+            ], 'the hook wrote keys that are not explicitly set: %r' % _out43
+            assert _out43['max_auto_nudges'] == 4, _out43
+            assert _out43['stall_minutes'] == 9, _out43
+            assert _out43['mystery_key'] == 'keep-me', _out43
+            # a hook read failure must not explode or leak the merged view
+            _hooks43._read_persisted = lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError('boom'))
+            _out43b = _hooks43.save_plugin_config({'poll_seconds': 30})
+            assert sorted(_out43b) == ['poll_seconds'], _out43b
+            assert _out43b['poll_seconds'] == 30, _out43b
+            # and the hook must still return a dict, never None
+            assert isinstance(_hooks43.save_plugin_config('not-a-dict'), dict)
+        finally:
+            _hooks43._read_persisted = _orig_persisted43
+        print('TEST43_SAVE_HOOK_PRUNES_OK')
+
+
+        # ============ TEST 42: a save writes only what was set (v1.20.6) ============
+        # Persisting the merged 33-key view pinned every shipped default into
+        # config.json, so a future release's new defaults could never reach an
+        # existing install. Saving one key must now write exactly that key (plus
+        # anything already explicitly set and any unknown key).
+        from usr.plugins.chat_shepherd.api import config as _cfg42
+        from usr.plugins.chat_shepherd.helpers import config_defaults as _cd42
+        _disk42 = {'stall_minutes': 9}   # one pre-existing explicit value
+        _wrote42 = []
+
+        def _helper42():
+            return type('H42', (), {
+                'get_plugin_config': staticmethod(
+                    lambda name: _cd42.deep_merge_defaults(_disk42)),
+                'save_plugin_config': staticmethod(
+                    lambda n, p, a, s: (_wrote42.append(dict(s)), s)[1]),
+                'clear_plugin_cache': staticmethod(lambda names: None),
+            })()
+        _orig_h42 = _cfg42.plugins_helper
+        _orig_rd42 = _cfg42._read_disk
+        try:
+            _cfg42.plugins_helper = _helper42()
+            _cfg42._read_disk = lambda: _cd42.deep_merge_defaults(_disk42)
+            _run42 = lambda b: _aio40.run(_cfg42.Config(None, None).process(b, None))
+
+            _wrote42.clear()
+            _r42 = _run42({'max_auto_nudges': 4})
+            assert _r42.get('success') is True, _r42
+            _written = _wrote42[-1]
+            # exactly the two explicit values, NOT 33 merged keys
+            assert sorted(_written) == ['max_auto_nudges', 'stall_minutes'], _written
+            assert _written['max_auto_nudges'] == 4, _written
+            # and nothing pinned to a default leaked through
+            _leaked = sorted(k for k in _cd42.KNOWN_KEYS
+                             if k in _written and _written[k] == _cd42.DEFAULTS[k])
+            assert not _leaked, 'a default-valued key was written: %r' % _leaked
+
+            # setting a value BACK to its default removes it from the file,
+            # and the read still returns the default. NOTE: an empty body is
+            # a PURE READ and never saves, so the reset must be sent as an
+            # explicit override.
+            _wrote42.clear()
+            _run42({'stall_minutes': _cd42.DEFAULTS['stall_minutes']})
+            assert _wrote42, 'an explicit override must reach the save path'
+            assert 'stall_minutes' not in _wrote42[-1], (
+                'a key reset to its default should leave the file: %r' % _wrote42[-1]
+            )
+            _after = _cd42.deep_merge_defaults(_wrote42[-1])
+            assert _after['stall_minutes'] == _cd42.DEFAULTS['stall_minutes'], _after
+
+            # an unknown key on disk must survive a save untouched
+            _disk42['mystery_key'] = 'keep-me'
+            _wrote42.clear()
+            _run42({'max_auto_nudges': 2})
+            assert _wrote42[-1].get('mystery_key') == 'keep-me', (
+                'a save dropped an unknown key: %r' % _wrote42[-1]
+            )
+        finally:
+            _cfg42.plugins_helper = _orig_h42
+            _cfg42._read_disk = _orig_rd42
+        print('TEST42_SAVE_WRITES_ONLY_EXPLICIT_OK')
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

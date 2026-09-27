@@ -100,6 +100,41 @@ def deep_merge_defaults(overlay: Any) -> dict[str, Any]:
     return merged
 
 
+def prune_to_explicit(merged: dict[str, Any]) -> dict[str, Any]:
+    # v1.20.6: reduce a FULLY MERGED config back to the values the operator
+    # actually set.
+    #
+    # The save paths used to persist all 33 keys, which silently PINNED every
+    # shipped default into the user's file: a later release that changed a
+    # default could never reach an existing install, because the file's stale
+    # copy always won over DEFAULTS in deep_merge_defaults. That is why
+    # config.json on disk was "fully merged 33/33" - not a correctness feature
+    # (both read paths already apply deep_merge_defaults independently and
+    # agree either way), just a side effect of saving the merged view.
+    #
+    # Rules: keep a known key only when its value differs from DEFAULTS, and
+    # keep EVERY unknown key untouched (a newer/other plugin version may own
+    # it - dropping those would destroy configuration we do not understand).
+    # For a dict value (icons) keep only the sub-keys the user changed.
+    # Prune is idempotent: prune(prune(x)) == prune(x).
+    out: dict[str, Any] = {}
+    if not isinstance(merged, dict):
+        return out
+    for key, val in merged.items():
+        if key not in DEFAULTS:
+            out[key] = val
+            continue
+        default = DEFAULTS[key]
+        if isinstance(default, dict) and isinstance(val, dict):
+            child = {ck: cv for ck, cv in val.items() if default.get(ck) != cv}
+            if child:
+                out[key] = child
+            continue
+        if val != default:
+            out[key] = val
+    return out
+
+
 def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[str, Any]:
     # Sanitize readable overrides onto current. Flat top-level ifs only:
     # a partial save must never touch keys it does not mention (the P6.1

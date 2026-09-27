@@ -28,6 +28,7 @@ from usr.plugins.chat_shepherd.helpers.config_defaults import (
     coerce_bool as _coerce_bool,
     coerce_int as _coerce_int,
     deep_merge_defaults,
+    prune_to_explicit,
 )
 
 PLUGIN_NAME = "chat_shepherd"
@@ -90,9 +91,16 @@ class Config(ApiHandler):
         # request handler on the event loop (v1.18.1 contract).
         current = await asyncio.to_thread(_read_disk)
         current = apply_overrides(current, readable)
+        # v1.20.6: write only the values the operator actually set. Persisting
+        # the merged 33-key view pinned every shipped default into the file, so
+        # a later release's new defaults could never reach this install.
+        # hooks.save_plugin_config prunes too (it is the path the framework
+        # settings modal takes); pruning here keeps the contract even if the
+        # hook is inactive. prune_to_explicit is idempotent.
+        to_save = prune_to_explicit(current)
 
         try:
-            plugins_helper.save_plugin_config(PLUGIN_NAME, "", "", current)
+            plugins_helper.save_plugin_config(PLUGIN_NAME, "", "", to_save)
         except Exception as e:
             return {"ok": False, "success": False, "error": f"save failed: {e}"}
 

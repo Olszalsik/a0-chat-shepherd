@@ -21,6 +21,7 @@ from usr.plugins.chat_shepherd.helpers.config_defaults import (
     KNOWN_KEYS,
     apply_overrides,
     deep_merge_defaults,
+    prune_to_explicit,
 )
 
 _PLUGIN_NAME = "chat_shepherd"
@@ -77,6 +78,12 @@ def save_plugin_config(settings=None, **kwargs):
             merged = deep_merge_defaults(out)
             readable = {k: v for k, v in settings.items() if k in KNOWN_KEYS}
             out = apply_overrides(merged, readable)
+            # v1.20.6: persist only what the operator actually set, so a later
+            # release's new/changed defaults can still reach this install
+            # instead of being shadowed by the 33 keys written here. Runs in
+            # the hook as well as in api/config.py, because this hook is the
+            # path the framework settings modal takes.
+            out = prune_to_explicit(out)
         except Exception:
             pass
         return out
