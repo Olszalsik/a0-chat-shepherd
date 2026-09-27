@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -43,22 +44,51 @@ def _read_disk() -> dict[str, Any]:
 
 class Config(ApiHandler):
     async def process(self, input_data: dict, request: Any) -> dict:
-        overrides = input_data or {}
-        if not isinstance(overrides, dict):
-            return {"ok": False, "error": "body must be a JSON object"}
+        # v1.20.5: validate the RAW body. The old `overrides = input_data or {}`
+        # turned any falsy non-dict (0, "", []) into an empty dict, so a
+        # malformed body was answered as a legitimate pure read.
+        if input_data is None:
+            input_data = {}
+        if not isinstance(input_data, dict):
+            return {
+                "ok": False,
+                # v1.20.5: every error path carries BOTH keys. The old
+                # "body must be a JSON object" reply was the one shape without
+                # `success`, and config.html gates on `r.success && r.ok` - it
+                # only behaved because undefined is falsy.
+                "success": False,
+                "error": "body must be a JSON object",
+            }
+        overrides = input_data
+
+        # v1.20.5: separate KNOWN keys from rejected ones. The endpoint used to
+        # drop them silently and still answer ok/success, so a typo (or a
+        # third-party client sending an unknown field) looked like a clean save
+        # while persisting nothing at all.
+        readable = {k: v for k, v in overrides.items() if k in _KNOWN_KEYS}
+        rejected = sorted(k for k in overrides if k not in _KNOWN_KEYS)
 
         # No body keys = pure read
-        readable = {k: v for k, v in overrides.items() if k in _KNOWN_KEYS}
         if not readable:
-            return {
+            body = {
                 "ok": True,
                 "success": True,
-                "config": _read_disk(),
+                "config": await asyncio.to_thread(_read_disk),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            if rejected:
+                # An all-unknown body is NOT a read; say so instead of
+                # returning a success that changed nothing.
+                body["ok"] = False
+                body["success"] = False
+                body["rejected"] = rejected
+                body["error"] = "unknown config keys: " + ", ".join(rejected)
+            return body
 
-        # Sanitize before persisting (pure logic in helpers/config_defaults.py)
-        current = _read_disk()
+        # Sanitize before persisting (pure logic in helpers/config_defaults.py).
+        # v1.20.5: offloaded - get_plugin_config can touch disk, and this is a
+        # request handler on the event loop (v1.18.1 contract).
+        current = await asyncio.to_thread(_read_disk)
         current = apply_overrides(current, readable)
 
         try:
@@ -71,10 +101,15 @@ class Config(ApiHandler):
         except Exception:
             pass
 
-        return {
+        result = {
             "ok": True,
             "success": True,
             "updated": sorted(readable.keys()),
-            "config": _read_disk(),
+            "config": await asyncio.to_thread(_read_disk),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        if rejected:
+            # Partial save: the known keys landed, the rest did not. Report
+            # both so the caller is never left guessing.
+            result["rejected"] = rejected
+        return result

@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.20.4 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-27 manual-override confirmation (→ v1.20.4; row hook + hook-independent config + lock contract → v1.20.3; full-plugin audit → v1.20.2; sidebar-row regression → v1.20.1; 2026-09-24 live-audit → v1.20.0)
+**Version:** 1.20.5 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-27 endpoint offload + /config silent-drop fix (→ v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3; full-plugin audit → v1.20.2; sidebar-row regression → v1.20.1)
 
 ## Purpose
 
@@ -52,7 +52,7 @@ Agent monitoring: a `job_loop` extension ticks periodically, classifies every li
 - **Cross-thread `communicate()` (v1.1.0, P4 — audited, safe)**: `tick()` runs on the JobLoop thread but calls `context.communicate()` on other contexts. Verified safe: if the target task is alive it sets `agent.intervention` (plain attribute write); otherwise `DeferredTask.start_task` → `EventLoopThread.run_coroutine` = `asyncio.run_coroutine_threadsafe` onto the context's name-keyed shared loop (`helpers/defer.py`). No nudge executes inline on the JobLoop thread.
 - **Restart recovery (v1.1.x)**: a `last_tick` gap > `RESTART_GAP_MINUTES` (5) flags a server/job-loop restart. USER-type contexts that were active before it, are not running after it, and whose log doesn't end with `response`, become `interrupted` (🔌) and get a `RESUME_TEXT` nudge from a dedicated resume queue (budget ≥ 3/tick, bypasses per-chat cooldown, still respects `max_auto_nudges`). Scheduler (`AgentContextType.TASK`) chats are excluded — the scheduler resumes its own chats. History gets a `restart_detected` entry.
 
-## Known limitations (verified true as of v1.20.4)
+## Known limitations (verified true as of v1.20.5)
 
 Every bullet here was re-checked against the code on 2026-09-27. Earlier
 versions of this list carried three entries that had already been fixed
@@ -60,21 +60,22 @@ versions of this list carried three entries that had already been fixed
 predicate) - they are recorded in the changelog under the release that fixed
 them, not here. Do not re-file them.
 
-- `tick()` runs synchronously on the JobLoop thread (blocking `state.json` I/O + log scans). A filesystem wedge there freezes only shepherding, not chats, and `files.exists` is globally bounded. The request path was moved off this thread in v1.18.1 - `/status` and `/draft` offload via `asyncio.to_thread`, and the per-chat stat probes + journal parse are cached, so the event loop is not a shepherd bottleneck. The remaining user-triggered endpoints (`config`, `export`, `history`) still read files inline; they are rare and small. Moving them to `to_thread` is a clean, low-risk follow-up.
+- `tick()` runs synchronously on the JobLoop thread (blocking `state.json` I/O + log scans). A filesystem wedge there freezes only shepherding, not chats, and `files.exists` is globally bounded. **As of v1.20.5 every request handler reads off the event loop** — `/status` and `/draft` (v1.18.1) plus `/config`, `/history` and `/export` (v1.20.5), so a slow 9p stat in a plugin request can no longer stall the rest of the server. What remains is the JobLoop side, which is by design: the tick is the shepherd's own work.
 - `api/*` handlers keep their `from`-import bindings until the next plugin refresh, so an endpoint change needs a refresh or restart. The helper/tick path hot-reloads on its own (v1.9.0) and the `hot_reload` block in `/status` reports the last result.
 - Wedge detection compares the log ENTRY count (plus a mutation counter since v1.10.0, which separates an actively-streaming call from a fully hung one). A long legitimate tool call that emits no entries for `stall_minutes` can still classify as `intervention`. Mitigations: the immediate task-kill requires `wedge_soft_restart: true` (off by default), and the flag drains when the call returns.
 - `watch_all: false` skips any context with an empty log. The per-chat watch list (`allowed_chat_ids`) is implemented and enforced in `tick()`.
 - `state.json` and `config.json` are deliberately NOT removed by `hooks.uninstall()` - a reinstall resumes monitoring with its history intact. Only the debug logs are deleted.
 
-## Release readiness (v1.20.4)
+## Release readiness (v1.20.5)
 
-**What is verified.** 107 backend markers, 26 shared-store and 23 sidebar
+**What is verified.** 109 backend markers, 26 shared-store and 23 sidebar
 assertions, all green on Windows off-Docker; `node --check` and `py_compile`
 clean; the core sidebar contract tests pass; `config.json` fully merged 33/33
-against `KNOWN_KEYS`. Four deliberate mutations of the v1.20.4 guard
-(disabling the guard, retrying without `force`, restoring `status='nudged'`,
-removing the confirm branch) each fail the suite, so those tests are not
-vacuous.
+against `KNOWN_KEYS`. Seven deliberate mutations (disabling the v1.20.4 guard,
+retrying without `force`, restoring `status='nudged'`, removing the confirm
+branch, restoring the v1.20.5 silent key-drop, returning either `/config`
+branch to an inline read, and reusing export's 200-entry mirror) each fail the
+suite, so those tests are not vacuous.
 
 **What is NOT certified.** "Bug free" is not a claim this repo can make, and
 the following are genuinely outside what the suites prove:
@@ -268,6 +269,66 @@ User report after updating Agent Zero: chat status icons were missing from the r
 - **Idempotence**: `shepherd-sidebar.js` is a classic script inside the `sidebar-chats-list-start` HTML extension, and the component loader re-clones and re-executes it on every extension (re)load. A `window.__chatShepherdSidebar` guard now makes repeat loads a no-op that only calls `refresh()`, so the poll interval and MutationObserver can no longer stack.
 - **Robustness**: `injectBadges` reschedules instead of silently dropping a re-entrant pass and swallows per-run DOM errors so a transient row shape cannot kill the poll loop; `pointer-events: none` keeps the row fully clickable; `role="img"` + `aria-label` added.
 - **Tests**: new `tests/suite_sidebar.mjs` — a dependency-free DOM harness (no jsdom in this repo) that runs the real injector against the four row shapes Agent Zero actually renders, plus placement, repaint, idle/blank-icon clearing, observer anchoring, and repeat-load idempotence. 22 assertions, `node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs` green. `node --check` green on both plugin scripts; the Python suite still reports ALL_TESTS_PASSED.
+### v1.20.5 — /config silent-drop fix, all endpoints off the event loop (2026-09-27)
+
+Closes the one actionable follow-up recorded in v1.20.4's limitations list, and
+fixes two defects found while doing it. Every claim below was reproduced
+against the pre-fix code first.
+
+- **A typo'd config key reported success and persisted nothing** (real,
+  user-facing). `/config` split the body into `readable` (known keys) and
+  discarded the rest, then answered `ok: True, success: True` with no mention
+  of the drop. Reproduced: `{"totally_bogus_key": 1}` → `ok: True`,
+  `success: True`, `error: None`, `updated: None`, and **nothing written**. An
+  operator (or a third-party client) sending a misspelled field got a clean
+  save confirmation for a no-op. Unknown keys are now collected into
+  `rejected`; an all-unknown body is an explicit `ok/success: False` with the
+  offending names in `error`, and a mixed body reports both `updated` and
+  `rejected` so a partial save is never silent. TEST40.
+- **Inconsistent error shape** (contract). The "body must be a JSON object"
+  reply was the only path returning `{ok, error}` without `success`. It
+  *behaved* — `config.html:54` gates on `r.success && r.ok` and `undefined` is
+  falsy — so the inconsistency was invisible until you compared the three error
+  paths side by side. Every path now carries both flags. Related: the old
+  `overrides = input_data or {}` turned any *falsy* non-dict (`0`, `""`, `[]`)
+  into `{}` and answered a malformed body as a legitimate pure read; the raw
+  body is now validated before that coercion.
+- **`/history` reported a malformed id as a missing one.** `if not chat_id or
+  not CHAT_ID_PATTERN.match(chat_id)` returned `'chat_id required'` for both,
+  so a caller sending `../../etc/passwd` was told to go look for a field it had
+  actually supplied. Split into two accurate messages. The path-shaping
+  rejection itself was already correct (v1.20.0 P8) and is unchanged.
+- **All three endpoints now read off the event loop** (the improvement). v1.18.1
+  moved `/status` and `/draft` onto `asyncio.to_thread`; `/config`, `/history`
+  and `/export` were left reading files inline, so one slow 9p stat in a plugin
+  request stalled every other request in the server. Each handler now delegates
+  to a small sync `_build`/`_snapshot`/`_read_disk` body under
+  `asyncio.to_thread`, mirroring the `_snapshot_sync` shape `api/status.py`
+  already used. TEST41 asserts the read seam runs on a *different* thread than
+  the caller, for every branch of `/config` (read AND save) plus `/history` and
+  `/export`.
+
+**A rejected optimization, recorded deliberately.** `/export` appeared to parse
+the journal twice (`load_state()` builds a mirror, then `read_journal()` again),
+and the first version of this work reused the mirror instead. That was wrong
+twice over: `read_journal` is already cached by `(mtime_ns, size)`, so the
+second call never re-parsed and the saving was zero; and `load_state()` fills
+the mirror with `JOURNAL_READ_LIMIT` (200) while `/export` is a **full** export
+that must use `JOURNAL_KEEP` (1000) — the reuse would have silently truncated
+every export to 200 entries. The code comment in `_snapshot()` says so, and
+TEST41 pins the constant so it cannot be reintroduced.
+
+**Tests**: TEST40 (4 groups: all-unknown is an error and writes nothing; mixed
+reports both sides; four malformed bodies all carry both flags; clean read/save
+unchanged) and TEST41 (every read seam off the calling thread, including both
+`/config` branches; export keeps `JOURNAL_KEEP`; a bad id is not called
+missing). Mutation-tested: restoring the silent drop, either `/config` branch's
+inline read, the 200-entry export reuse, and the old "required" message each
+fail the suite. **One mutation initially escaped** — the first TEST41 only
+covered `/config`'s read branch, so reverting the *save* branch's `to_thread`
+passed; the test now exercises both branches. 109 markers, 26 store assertions,
+23 sidebar assertions, core sidebar 6 passed.
+
 ### v1.20.4 — Confirmed, audited, non-destructive manual override (2026-09-27)
 
 The auto-nudge ladder's refusal to touch a chat that ended on a real error or a security termination is **correct and unchanged** — Shepherd cannot know whether the underlying bug was fixed, and a nudge restarts the exact code path that just failed. The finding was about the *manual* path, which bypassed that judgement with no acknowledgement and no record.

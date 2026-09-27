@@ -201,7 +201,7 @@ still shows every chat's status — only the inline icon is skipped.
 ## Development
 
 ```bash
-# self-test suite (107 markers)
+# self-test suite (109 markers)
 python usr/plugins/chat_shepherd/tests/suite_monitor.py
 
 # sidebar badge-injector DOM suite (23 assertions, no external deps)

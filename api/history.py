@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+import asyncio
+
 from helpers.api import ApiHandler, Request, Response
 
 from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN
 from usr.plugins.chat_shepherd.helpers.state import read_journal
 from usr.plugins.chat_shepherd.helpers import monitor
+
+
+def _build(chat_id: str, limit: int) -> dict:
+    """Sync body: the journal parse and the chat.json title probe both touch
+    disk, so the whole thing runs off the event loop (v1.20.5; the same rule
+    v1.18.1 applied to /status and /draft)."""
+    items = read_journal(limit, chat_id=chat_id)
+    try:
+        name = monitor._chat_display_name(chat_id)
+    except Exception:
+        name = chat_id
+    return {'success': True, 'chat_id': chat_id, 'name': name, 'history': items}
+
 
 class History(ApiHandler):
     # Per-chat timeline: this chat's entries from the shared monitor
@@ -21,21 +36,15 @@ class History(ApiHandler):
         # _read_chat_title, which builds a usr/chats/<id>/chat.json path
         # from the raw value. POST + auth + CSRF already gate this
         # endpoint; the pattern check closes the path-shaping corner.
-        if not chat_id or not CHAT_ID_PATTERN.match(chat_id):
+        if not chat_id:
             return {'success': False, 'error': 'chat_id required'}
+        if not CHAT_ID_PATTERN.match(chat_id):
+            # v1.20.5: this used to also say "chat_id required", which sent the
+            # caller looking for a missing field when it had sent a bad one.
+            return {'success': False, 'error': f'invalid chat_id: {chat_id!r}'}
         try:
             limit = int(body.get('limit', 30))
         except (TypeError, ValueError):
             limit = 30
         limit = max(1, min(50, limit))
-        items = read_journal(limit, chat_id=chat_id)
-        try:
-            name = monitor._chat_display_name(chat_id)
-        except Exception:
-            name = chat_id
-        return {
-            'success': True,
-            'chat_id': chat_id,
-            'name': name,
-            'history': items,
-        }
+        return await asyncio.to_thread(_build, chat_id, limit)

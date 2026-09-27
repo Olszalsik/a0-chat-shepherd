@@ -93,6 +93,8 @@ def make_chat_dirs():
 
 
 def cleanup():
+
+
     for cid in (FAKE_CHAT_A, FAKE_CHAT_B, FAKE_CHAT_C):
         d = files.get_abs_path('usr/chats/' + cid)
         try:
@@ -2325,6 +2327,150 @@ def main():
                 except Exception:
                     pass
         print('TEST39_MANUAL_NUDGE_GUARD_OK')
+
+        # ============ TEST 40: /config rejects unknown keys loudly (v1.20.5) ============
+        # The endpoint used to drop unknown keys and still answer ok/success,
+        # so a typo looked like a clean save while persisting nothing.
+        import asyncio as _aio40
+        from usr.plugins.chat_shepherd.api import config as _cfg40
+        _saved40 = []
+        _orig_helper40 = _cfg40.plugins_helper
+        _orig_read_disk40 = _cfg40._read_disk
+        _DISK40 = {'stall_minutes': 5, 'max_auto_nudges': 3}
+
+        def _fake_helper40():
+            return type('H', (), {
+                'get_plugin_config': staticmethod(lambda name: dict(_DISK40)),
+                'save_plugin_config': staticmethod(
+                    lambda name, p, a, s: (_saved40.append(dict(s)), s)[1]),
+                'clear_plugin_cache': staticmethod(lambda names: None),
+            })()
+        try:
+            _cfg40.plugins_helper = _fake_helper40()
+            _cfg40._read_disk = lambda: dict(_DISK40)
+            _run40 = lambda b: _aio40.run(_cfg40.Config(None, None).process(b, None))
+
+            # (a) unknown key ONLY -> must not claim success
+            _saved40.clear()
+            _r40a = _run40({'totally_bogus_key': 1})
+            assert _r40a.get('ok') is False and _r40a.get('success') is False, _r40a
+            assert _r40a.get('rejected') == ['totally_bogus_key'], _r40a
+            assert 'totally_bogus_key' in (_r40a.get('error') or ''), _r40a
+            assert not _saved40, 'an all-unknown body must not write'
+
+            # (b) mixed -> known key applies, unknown key REPORTED
+            _saved40.clear()
+            _r40b = _run40({'stall_minutes': 42, 'also_bogus': 2})
+            assert _r40b.get('ok') is True and _r40b.get('success') is True, _r40b
+            assert _r40b.get('updated') == ['stall_minutes'], _r40b
+            assert _r40b.get('rejected') == ['also_bogus'], _r40b
+            assert _saved40 and _saved40[-1].get('stall_minutes') == 42, _saved40
+
+            # (c) every error path carries BOTH ok and success
+            for _bad40 in ('not-a-dict', ['a'], 0, ''):
+                _r40c = _run40(_bad40)
+                assert 'ok' in _r40c and 'success' in _r40c, (
+                    'a malformed body (%r) must carry both flags: %r' % (_bad40, _r40c)
+                )
+                assert _r40c['ok'] is False and _r40c['success'] is False, _r40c
+
+            # (d) a clean save and a pure read are unaffected
+            _r40d = _run40({})
+            assert _r40d.get('ok') is True and 'rejected' not in _r40d, _r40d
+            assert _r40d.get('config'), _r40d
+            _r40e = _run40({'max_auto_nudges': 9})
+            assert _r40e.get('rejected') is None, 'a clean save reports nothing'
+        finally:
+            _cfg40.plugins_helper = _orig_helper40
+            _cfg40._read_disk = _orig_read_disk40
+        print('TEST40_CONFIG_REJECTS_UNKNOWN_KEYS_OK')
+        # ============ TEST 41: user endpoints read off the event loop (v1.20.5) ============
+        # /config, /history and /export all touch disk. v1.18.1 moved the
+        # equivalent work out of /status and /draft; these three were left
+        # behind, so a slow 9p stat blocked every other request in the server.
+        import threading as _th41
+        from usr.plugins.chat_shepherd.api import history as _his41
+        from usr.plugins.chat_shepherd.api import export as _exp41
+        _orig41 = {}
+        try:
+            _main41 = _th41.current_thread()
+
+            # /config: the disk read must not run on the calling thread.
+            # BOTH branches matter - a pure read and a save each call
+            # _read_disk, and an earlier draft of this test only covered the
+            # read, so reverting the save branch's to_thread passed the suite.
+            _seen41 = []
+            _orig41['read_disk'] = _cfg40._read_disk
+            _cfg40._read_disk = lambda: (
+                _seen41.append(_th41.current_thread()), dict(_DISK40))[1]
+            _orig41['helper'] = _cfg40.plugins_helper
+            _cfg40.plugins_helper = type('H41', (), {
+                'get_plugin_config': staticmethod(lambda name: dict(_DISK40)),
+                'save_plugin_config': staticmethod(lambda n, p, a, s: s),
+                'clear_plugin_cache': staticmethod(lambda names: None),
+            })()
+            _aio40.run(_cfg40.Config(None, None).process({}, None))
+            assert _seen41, 'the config read seam was never called (read path)'
+            assert all(t is not _main41 for t in _seen41), (
+                'api/config.py READ path must read config off the event loop'
+            )
+            _seen41.clear()
+            _aio40.run(_cfg40.Config(None, None).process({'stall_minutes': 42}, None))
+            assert _seen41, 'the config read seam was never called (save path)'
+            assert all(t is not _main41 for t in _seen41), (
+                'api/config.py SAVE path must read config off the event loop'
+            )
+
+            # /history: the journal read must not run on the calling thread
+            _seen41.clear()
+            _orig41['rj'] = _his41.read_journal
+            _his41.read_journal = lambda limit=200, chat_id=None: (
+                _seen41.append(_th41.current_thread()), [])[1]
+            _orig41['name'] = _his41.monitor._chat_display_name
+            _his41.monitor._chat_display_name = lambda cid: 'probe'
+            _r41 = _aio40.run(_his41.History(None, None).process(
+                {'chat_id': FAKE_CHAT_A}, None))
+            assert _r41.get('success') is True, _r41
+            assert _seen41 and _seen41[0] is not _main41, (
+                'api/history.py must read the journal off the event loop'
+            )
+
+            # /export: must offload AND must keep the FULL journal
+            _seen41.clear()
+            _orig41['ls'] = _exp41.load_state
+            _exp41.load_state = lambda: (
+                _seen41.append(_th41.current_thread()),
+                {'chats': {}, 'last_tick': '', 'history': ['MIRROR-ONLY-200']})[1]
+            _orig41['rj2'] = _exp41.read_journal
+            _exp41.read_journal = lambda limit=200, chat_id=None: ['FULL-%s' % limit]
+            _r41b = _aio40.run(_exp41.Export(None, None).process({}, None))
+            assert _r41b.get('success') is True, _r41b
+            assert _seen41 and _seen41[0] is not _main41, (
+                'api/export.py must build the snapshot off the event loop'
+            )
+            # Guards a regression that was actually written and then reverted:
+            # reusing load_state()'s 200-entry mirror here would ship a
+            # silently truncated "full" export.
+            assert _r41b['history'] == ['FULL-1000'], (
+                'export must use JOURNAL_KEEP (1000), not the 200 mirror: %r'
+                % _r41b['history']
+            )
+
+            # a malformed id must not be reported as a MISSING id
+            _r41c = _aio40.run(_his41.History(None, None).process(
+                {'chat_id': '../../etc/passwd'}, None))
+            assert _r41c.get('success') is False, _r41c
+            assert 'required' not in (_r41c.get('error') or ''), (
+                'a bad id must not be reported as missing: %r' % _r41c
+            )
+        finally:
+            _cfg40._read_disk = _orig41['read_disk']
+            _cfg40.plugins_helper = _orig41['helper']
+            _his41.read_journal = _orig41['rj']
+            _his41.monitor._chat_display_name = _orig41['name']
+            _exp41.load_state = _orig41['ls']
+            _exp41.read_journal = _orig41['rj2']
+        print('TEST41_ENDPOINTS_OFF_EVENT_LOOP_OK')
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file
