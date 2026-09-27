@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 
 from helpers.api import ApiHandler, Request, Response
 
-from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME
 from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers import state as state_mod
 
@@ -13,9 +12,10 @@ from usr.plugins.chat_shepherd.helpers import state as state_mod
 def _load_plugin_config() -> dict:
     # Module-level seam so tests can patch the config source
     # (plugins.get_plugin_config attribute patch).
-    from helpers import plugins as _plugins
-
-    return _plugins.get_plugin_config(PLUGIN_NAME) or {}
+    # v1.20.3: delegates to monitor._load_config(), which re-applies the
+    # shipped defaults so the Test buttons verify the values the runtime
+    # actually uses.
+    return monitor._load_config()
 
 
 def _redact(text: str, secrets: list[str]) -> str:

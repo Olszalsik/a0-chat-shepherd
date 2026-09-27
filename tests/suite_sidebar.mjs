@@ -265,6 +265,18 @@ function ok(condition, message) { assert.ok(condition, message); checks += 1; }
  * 1. Folder view: the regression. Top-level rows must get a badge.  *
  * ---------------------------------------------------------------- */
 
+// 0. The core row identity hook (chat-tree.html publishes data-context-id on
+// the same element that carries .chat-container). This is now the primary
+// path, so a row is resolvable with no Alpine scope at all.
+{
+  const env = installEnv({ data: statusData([["chat0000", "running"]]) });
+  const row = buildRow({ attrs: { "data-context-id": "chat0000" } });
+  row.container.setAttribute("data-context-id", "chat0000");
+  env.chatsSection.appendChild(row.li);
+  load()._test.injectBadges();
+  ok(badgeIn(row), "the core data-context-id hook resolves a row with no Alpine scope");
+}
+
 {
   const env = installEnv({ data: statusData([["chat0001", "running"]]) });
   const row = buildRow({

@@ -346,6 +346,35 @@ def _wedge_minutes(context: AgentContext, prev_entry: dict[str, Any]) -> float:
     return _minutes_since(since)
 
 
+def _load_config() -> dict[str, Any]:
+    """Read the plugin config with the shipped defaults ALWAYS applied.
+
+    v1.20.3: `config.json` is hand-editable and routinely partial (it only
+    carries the keys someone actually changed). The `get_plugin_config` hook
+    in `hooks.py` deep-merges DEFAULTS underneath it, but no runtime path
+    should *depend* on that hook being installed and healthy - if it ever
+    regressed, every unwritten key would silently fall back to a hard-coded
+    `cfg.get(key, default)` that can drift from `config_defaults.DEFAULTS`
+    (the exact hazard the hook was added to close). This seam re-applies the
+    merge locally, so the two paths cannot disagree.
+    """
+    raw: Any = {}
+    try:
+        from helpers import plugins as _plugins
+
+        raw = _plugins.get_plugin_config(PLUGIN_NAME) or {}
+    except Exception:
+        raw = {}
+    try:
+        from usr.plugins.chat_shepherd.helpers.config_defaults import (
+            deep_merge_defaults,
+        )
+
+        return deep_merge_defaults(raw)
+    except Exception:
+        return dict(raw) if isinstance(raw, dict) else {}
+
+
 def _debug_log(kind: str, message: str) -> None:
     # R2: no more silently swallowed exceptions - kind-tagged,
     # daily-rotated debug log under the plugin data dir.
@@ -906,8 +935,25 @@ def _goal_gate_check(
 
 
 def tick(cfg: dict[str, Any]) -> dict[str, Any]:
-    # v1.18.0 (P7): whole-tick RMW holds the shared state lock so API
-    # transactions cannot interleave; _tick_impl logic is unchanged.
+    # v1.18.0 (P7): the whole-tick read-modify-write holds the shared state
+    # lock so API transactions cannot interleave and lose updates.
+    #
+    # v1.20.3 (reviewed, NOT changed): the lock IS held across message
+    # delivery (`_nudge_context` / `ctx.nudge()`), which looks inconsistent
+    # with api/nudge.py + api/draft.py, where `communicate()` deliberately runs
+    # outside the lock. It was left as is on purpose:
+    #   - delivery is non-blocking by the audited cross-thread contract (an
+    #     alive task takes a plain `agent.intervention` attribute write; a dead
+    #     one schedules onto the context's shared loop via DeferredTask), so
+    #     the extra hold is microseconds, not the tick's real cost;
+    #   - the alternative - plan the sends, release the lock, deliver, then
+    #     re-acquire the lock to apply the bookkeeping - splits one durable
+    #     transition into two. A crash in between would persist a tick that
+    #     claims nudges were sent when they were not, and re-reading state in
+    #     the second phase risks discarding the in-memory work the first phase
+    #     built. That is a worse failure mode than a short lock hold.
+    # TEST38 pins the invariant that actually matters: a manual API action
+    # landing during a tick never loses the tick's updates.
     with state_mod.state_lock():
         return _tick_impl(cfg)
 

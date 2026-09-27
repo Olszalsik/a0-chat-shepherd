@@ -5,9 +5,8 @@ import asyncio
 from typing import Any
 
 from helpers.api import ApiHandler, Request, Response
-from helpers import plugins
 
-from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN, PLUGIN_NAME
+from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN
 from usr.plugins.chat_shepherd.helpers.state import load_state
 from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers import hotreload
@@ -88,7 +87,9 @@ class Status(ApiHandler):
         return await asyncio.to_thread(self._snapshot_sync)
 
     def _snapshot_sync(self) -> dict | Response:
-        cfg = plugins.get_plugin_config(PLUGIN_NAME) or {}
+        # v1.20.3: defaults are re-applied locally, so a get_plugin_config
+        # hook regression cannot hand this endpoint a partial config.
+        cfg = monitor._load_config()
         state = load_state()
         icons = _resolve_icons(cfg)
 

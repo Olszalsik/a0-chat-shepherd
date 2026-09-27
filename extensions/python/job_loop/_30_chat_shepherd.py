@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 from helpers.extension import Extension
-from helpers import plugins
 
 from usr.plugins.chat_shepherd.helpers import hotreload, monitor
 from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME
@@ -11,7 +10,9 @@ from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME
 
 class ChatShepherdTick(Extension):
     async def execute(self, **kwargs: Any) -> None:
-        cfg = plugins.get_plugin_config(PLUGIN_NAME) or {}
+        # v1.20.3: monitor._load_config() re-applies the shipped defaults, so
+        # the tick does not depend on the get_plugin_config hook being active.
+        cfg = monitor._load_config()
         if not cfg.get("enabled", False):
             return
         try:

@@ -170,22 +170,22 @@ The per-chat icon is drawn next to the chat name in the sidebar and works with t
 built-in flat chat list, the built-in parent/child chat tree, and plugin list views
 such as **Sidebar Folders** (`folder_view: true`).
 
-A sidebar list plugin that renders its own rows can still hide the icons. Chat
-Shepherd identifies a row by, in order: a `data-folder-thread` / `data-context-id` /
-`data-chat-id` attribute on the row or one of its ancestors, or an Alpine scope
-exposing `context`, `child`, `item`, or `task`. If a custom list view provides none
-of those, the dashboard still shows every chat's status — only the inline icon is
-skipped.
+Chat Shepherd identifies a row by, in order: a `data-context-id` / `data-folder-thread` /
+`data-chat-id` attribute on the row or one of its ancestors, or an Alpine scope exposing
+`context`, `child`, `item`, or `task`. Agent Zero's own chat rows publish `data-context-id`
+directly, and any list view built on the core row components inherits it. A custom list
+view that renders its own rows should publish an equivalent id; without one, the dashboard
+still shows every chat's status — only the inline icon is skipped.
 
 ---
 
 ## Development
 
 ```bash
-# self-test suite (105 markers)
+# self-test suite (106 markers)
 python usr/plugins/chat_shepherd/tests/suite_monitor.py
 
-# sidebar badge-injector DOM suite (22 assertions, no external deps)
+# sidebar badge-injector DOM suite (23 assertions, no external deps)
 node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs
 
 # shared frontend store suite (12 assertions, no external deps)

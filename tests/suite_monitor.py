@@ -2080,6 +2080,139 @@ def main():
             FakeAgentContext._all = []
         print('TEST35_STATUS_TRACKING_PREDICATE_OK')
 
+        # ============ TEST 36: on-disk config.json is complete + already merged (v1.20.3) ============
+        # config.json is routinely partial (only the keys someone changed).
+        # That is safe now that every runtime read re-applies DEFAULTS, but a
+        # complete file means a get_plugin_config hook regression cannot change
+        # behavior at all. Guard it so it cannot silently rot back to partial.
+        from usr.plugins.chat_shepherd.helpers import config_defaults as _cd36
+        _cfg_path36 = 'usr/plugins/chat_shepherd/config.json'
+        _raw36 = json.loads(files.read_file(files.get_abs_path(_cfg_path36)))
+        _missing36 = sorted(_cd36.KNOWN_KEYS - set(_raw36))
+        assert not _missing36, (
+            'config.json is missing keys (runtime now survives this, but the hook '
+            'is the primary path): %r' % _missing36
+        )
+        assert _cd36.deep_merge_defaults(_raw36) == _raw36, (
+            'config.json is not fully merged; a hook regression would change values'
+        )
+        for _k36 in _cd36.ICON_STATUSES:
+            assert _k36 in (_raw36.get('icons') or {}), 'icon missing: ' + _k36
+        print('TEST36_CONFIG_COMPLETE_OK')
+
+        # ============ TEST 37: _load_config is independent of the hook (v1.20.3) ============
+        # Every runtime read goes through monitor._load_config(), which
+        # re-applies DEFAULTS locally. Simulate a hook regression (raw partial
+        # config) and prove the runtime still sees a complete config.
+        from helpers import plugins as _plugins36
+        _orig_gpc36 = _plugins36.get_plugin_config
+        try:
+            _plugins36.get_plugin_config = lambda name: {
+                'enabled': True, 'stall_minutes': 7, 'max_auto_nudges': 2,
+            }
+            _seen36 = monitor._load_config()
+            _missing36b = sorted(_cd36.KNOWN_KEYS - set(_seen36))
+            assert not _missing36b, 'hookless read lost keys: %r' % _missing36b
+            assert _seen36['stall_minutes'] == 7, 'user override must win'
+            assert _seen36['poll_seconds'] == _cd36.DEFAULTS['poll_seconds'], (
+                'an unwritten key must fall back to the shipped default'
+            )
+            for _k36b in _cd36.ICON_STATUSES:
+                assert _k36b in (_seen36.get('icons') or {}), 'icon lost: ' + _k36b
+            # a broken framework read must still yield a usable config
+            _plugins36.get_plugin_config = lambda name: (_ for _ in ()).throw(RuntimeError('boom'))
+            _fallback36 = monitor._load_config()
+            assert _fallback36.get('enabled') is True, _fallback36
+            assert sorted(_cd36.KNOWN_KEYS - set(_fallback36)) == [], _fallback36
+        finally:
+            _plugins36.get_plugin_config = _orig_gpc36
+        print('TEST37_HOOKLESS_CONFIG_READ_OK')
+
+        # ============ TEST 38: a manual action mid-tick never loses tick updates (v1.20.3) ============
+        # The tick holds the state lock across the whole read-modify-write,
+        # including message delivery (reviewed and deliberately kept - see the
+        # comment on tick()). What actually matters is the v1.18.0 guarantee:
+        # a /nudge, /resolve or /draft transaction landing during a tick must
+        # be serialized, not merged into a stale snapshot. Prove it by running
+        # a handler transaction from another thread while the tick holds the
+        # lock and asserting (a) the handler really did block, and (b) neither
+        # side's update was lost.
+        import threading as _th38
+        import time as _time38
+        _orig_hcd38 = monitor._has_chat_dir
+        _orig_nudge38 = monitor._nudge_context
+        try:
+            monitor._has_chat_dir = lambda cid: True
+            _ctx38 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=600)
+            FakeAgentContext._all = [_ctx38]
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+                        chats={FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 0,
+                                             'last_ticked': now_iso}})
+            _order38 = []
+            _in_delivery = _th38.Event()
+            _handler_done = _th38.Event()
+
+            # Hold the tick inside the delivery step (i.e. inside the state
+            # lock) long enough for a handler transaction to collide with it.
+            def _slow_nudge38(context, text=None, chat_id=''):
+                _in_delivery.set()
+                _time38.sleep(0.4)
+                return _orig_nudge38(context, text, chat_id=chat_id)
+
+            monitor._nudge_context = _slow_nudge38
+
+            def _handler38():
+                # A real handler transaction: blocks on the tick's lock, then
+                # applies on a fresh snapshot.
+                def _apply(st):
+                    _order38.append('handler_enter')
+                    state_mod.update_chat(st, FAKE_CHAT_A,
+                                          last_classification='manual action')
+                    return True
+
+                state_mod.state_transaction_apply(_apply)
+                _handler_done.set()
+
+            _tick_err = []
+
+            def _run_tick38():
+                try:
+                    monitor.tick(dict(cfg, max_nudges_per_tick=1))
+                except Exception as e:  # pragma: no cover - surfaced below
+                    _tick_err.append(e)
+
+            _tick_thread = _th38.Thread(target=_run_tick38)
+            _tick_thread.start()
+            assert _in_delivery.wait(5), 'the tick never reached message delivery'
+            # The tick now holds the state lock. A manual action must wait.
+            _handler_thread = _th38.Thread(target=_handler38)
+            _handler_thread.start()
+            _handler_thread.join(timeout=0.15)
+            assert not _handler_done.is_set(), (
+                'a manual action ran concurrently with the tick instead of '
+                'waiting for the state lock'
+            )
+            _tick_thread.join(timeout=10)
+            assert not _tick_err, _tick_err
+            _handler_thread.join(timeout=10)
+            assert _handler_done.is_set(), 'the manual action never completed'
+            assert _order38 == ['handler_enter'], _order38
+            st38 = read_state()
+            # The manual action applied on a snapshot taken AFTER the tick
+            # released the lock, so it is present - and the tick's own
+            # bookkeeping is still there next to it (nothing clobbered).
+            assert st38['chats'][FAKE_CHAT_A].get('last_classification') == 'manual action', (
+                'the manual action was lost: %r' % st38['chats'][FAKE_CHAT_A]
+            )
+            assert st38['chats'][FAKE_CHAT_A].get('nudges_sent', 0) >= 1, (
+                "the tick's own delivery bookkeeping was lost: %r" % st38['chats'][FAKE_CHAT_A]
+            )
+        finally:
+            monitor._nudge_context = _orig_nudge38
+            monitor._has_chat_dir = _orig_hcd38
+            FakeAgentContext._all = []
+        print('TEST38_TICK_HANDLER_SERIALIZATION_OK')
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

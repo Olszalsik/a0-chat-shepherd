@@ -5,9 +5,8 @@ import asyncio
 from typing import Any
 
 from helpers.api import ApiHandler, Request, Response
-from helpers import plugins
 
-from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME, NUDGE_TEXT
+from usr.plugins.chat_shepherd.helpers.constants import NUDGE_TEXT
 from usr.plugins.chat_shepherd.helpers import state as state_mod
 from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers.state import get_chat, update_chat, append_history
