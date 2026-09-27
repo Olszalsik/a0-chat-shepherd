@@ -1,16 +1,39 @@
 /*
  * Chat Shepherd — sidebar status icon injector.
- * Reads status from the shared Alpine store (chatShepherdStore)
- * and paints a badge on sidebar chat rows with a non-idle status.
- * Icons are user-configurable via plugin settings (config.icons);
- * an empty icon means "no pictogram for this state".
+ *
+ * Reads status from the shared Alpine store (chatShepherdStore) and paints a
+ * badge on sidebar chat rows with a non-idle status. Icons are user-configurable
+ * via plugin settings (config.icons); an empty icon means "no pictogram for
+ * this state".
+ *
+ * Row resolution notes (Agent Zero v2.10+ sidebar refactor):
+ *   - A chat row is rendered by the shared `sidebar/chats/chat-tree.html`
+ *     component, so `.chat-container` is not always wrapped in the same <li>.
+ *   - The default list binds the loop scope as `context`/`child`; the
+ *     `_sidebar_folders` list view binds it as `item` and publishes
+ *     `data-folder-thread` on the row.
+ *   - Alpine's inherited scope is reachable from the row container itself via
+ *     `Alpine.$data(container)`, which resolves every one of those shapes.
+ *     Reading the <li> was the old behaviour and returned null for folder rows,
+ *     so no badge was created for the top-level chats you actually glance at.
  */
 (function () {
   "use strict";
 
+  // Idempotence guard: this file is a classic script inside the
+  // `sidebar-chats-list-start` HTML extension. The component loader clones and
+  // re-executes extension scripts on every extension (re)load, which used to
+  // stack a second poll interval and a second MutationObserver each time.
+  if (window.__chatShepherdSidebar) {
+    window.__chatShepherdSidebar.refresh();
+    return;
+  }
+
   var POLL_MS = 2500;
   var debounceTimer = null;
   var injecting = false;
+  var obs = null;
+  var observedEl = null;
 
   var DEFAULT_ICONS = {
     running: "🏃",
@@ -36,7 +59,7 @@
     idle: "Idle",
   };
 
-  var COLORS = {
+  var DEFAULT_COLORS = {
     running: "#4caf50",
     stalled: "#ff9800",
     nudged: "#2196f3",
@@ -48,11 +71,23 @@
     idle: "#757575",
   };
 
+  // Alpine scope keys that can carry the row model on any sidebar list view.
+  var SCOPE_KEYS = ["context", "child", "item", "task"];
+  // Row attributes published by core/community list views.
+  var ROW_ID_ATTRS = ["data-folder-thread", "data-context-id", "data-chat-id"];
+  // Badge host candidates, in preference order. The badge belongs next to the
+  // chat name: appending it to `.chat-container` put it after the hover-only
+  // action buttons, so the icon jumped sideways on every hover.
+  var HOST_SELECTORS = [".chat-list-button", ".chat-container"];
+
   function store() {
     if (window.Alpine && Alpine.store) return Alpine.store("chatShepherdStore");
     return null;
   }
 
+  // Icons are owned by the store (and ultimately by /status) so the sidebar can
+  // no longer drift from the dashboard. The local map is a fallback for the
+  // window before the store module has evaluated.
   function iconFor(s, status) {
     var custom = (s && s.data && s.data.config && s.data.config.icons) || {};
     if (Object.prototype.hasOwnProperty.call(custom, status)) {
@@ -61,143 +96,253 @@
     return DEFAULT_ICONS[status] || "";
   }
 
-  setInterval(function () {
-    var s = store();
-    if (s && s.data) scheduleInject();
-  // Sidebar re-render replaced the list element -> re-scope the observer.
-  if (listEl && !document.contains(listEl)) attachObserver();
-  }, POLL_MS);
-
-  function scheduleInject() {
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(function () {
-      requestAnimationFrame(injectBadges);
-    }, 50);
+  function colorFor(s, status) {
+    try {
+      if (s && typeof s.statusColor === "function") {
+        var fromStore = s.statusColor(status);
+        if (fromStore) return fromStore;
+      }
+    } catch (e) {
+      /* store not ready */
+    }
+    return DEFAULT_COLORS[status] || DEFAULT_COLORS.idle;
   }
 
-  function chatIdFromContainer(container) {
-    var li = container.closest("li");
-    if (li) {
-      try {
-        if (window.Alpine && Alpine.$data) {
-          var d = Alpine.$data(li);
-          if (d) {
-            if (d.context && d.context.id) return d.context.id;
-            if (d.child && d.child.id) return d.child.id;
-          }
-        }
-      } catch (e) {}
-      if (li._x_dataStack && li._x_dataStack[0]) {
-        var stack = li._x_dataStack[0];
-        if (stack.context && stack.context.id) return stack.context.id;
-        if (stack.child && stack.child.id) return stack.child.id;
-      }
+  function scopeId(scope) {
+    if (!scope) return null;
+    for (var i = 0; i < SCOPE_KEYS.length; i++) {
+      var row = scope[SCOPE_KEYS[i]];
+      if (row && typeof row === "object" && row.id) return String(row.id);
     }
-    if (container.dataset && container.dataset.chatId) return container.dataset.chatId;
     return null;
   }
 
+  function idFromAttributes(el) {
+    if (!el || !el.getAttribute) return null;
+    for (var i = 0; i < ROW_ID_ATTRS.length; i++) {
+      var value = el.getAttribute(ROW_ID_ATTRS[i]);
+      if (value) return String(value);
+    }
+    return null;
+  }
+
+  function alpineScope(el) {
+    try {
+      if (window.Alpine && typeof Alpine.$data === "function") return Alpine.$data(el);
+    } catch (e) {
+      /* detached / uninitialised node */
+    }
+    try {
+      if (el && el._x_dataStack && el._x_dataStack[0]) return el._x_dataStack[0];
+    } catch (e) {
+      /* no scope */
+    }
+    return null;
+  }
+
+  // Resolve the chat id a row represents, tolerating every sidebar list view.
+  function chatIdFromContainer(container) {
+    if (!container) return null;
+
+    // 1. Explicit row attributes published by the list view (most stable).
+    var node = container;
+    while (node && node.getAttribute) {
+      var attr = idFromAttributes(node);
+      if (attr) return attr;
+      node = node.parentElement;
+    }
+
+    // 2. The row's own inherited Alpine scope. This is the fix for folder
+    //    view, where `item` is bound on a wrapper x-data rather than the <li>.
+    var own = scopeId(alpineScope(container));
+    if (own) return own;
+
+    // 3. Legacy <li> scope lookup (default list / nested child rows).
+    var li = container.closest ? container.closest("li") : null;
+    if (li) {
+      var fromLi = scopeId(alpineScope(li));
+      if (fromLi) return fromLi;
+    }
+
+    // 4. Last resort: a dataset id directly on the row.
+    if (container.dataset && container.dataset.chatId) {
+      return String(container.dataset.chatId);
+    }
+    return null;
+  }
+
+  // Where the badge lives inside a row: the label host, inserted before the
+  // hover-only action buttons so the icon never shifts when they appear.
+  function anchorFor(container) {
+    var host = null;
+    for (var i = 0; i < HOST_SELECTORS.length; i++) {
+      host = container.querySelector(HOST_SELECTORS[i]);
+      if (host) break;
+    }
+    if (!host) host = container;
+    var actions = host.querySelector ? host.querySelector(".chat-list-action-btn") : null;
+    if (actions && actions.parentNode === host) {
+      return { host: host, before: actions };
+    }
+    return { host: host, before: null };
+  }
+
+  function placeBadge(badge, anchor) {
+    if (anchor.before) {
+      if (badge.parentNode !== anchor.host || badge.nextSibling !== anchor.before) {
+        anchor.host.insertBefore(badge, anchor.before);
+      }
+      return;
+    }
+    if (badge.parentNode !== anchor.host || anchor.host.lastElementChild !== badge) {
+      anchor.host.appendChild(badge);
+    }
+  }
+
+  function applyBadge(badge, status, glyph, color, label) {
+    // Track the status, not just the glyph: two states may share one pictogram,
+    // and the old textContent-only comparison left a stale colour and tooltip.
+    if (badge.getAttribute("data-cs-status") !== status) {
+      badge.setAttribute("data-cs-status", status);
+    }
+    if (badge.textContent !== glyph) badge.textContent = glyph;
+    if (badge.getAttribute("title") !== label) badge.title = label;
+    if (badge.getAttribute("aria-label") !== label) badge.setAttribute("aria-label", label);
+    if (badge.style.color !== color) badge.style.color = color;
+  }
+
+  function makeBadge() {
+    var badge = document.createElement("span");
+    badge.className = "cs-badge";
+    badge.setAttribute("role", "img");
+    // pointer-events:none keeps the whole row clickable and hoverable.
+    badge.style.cssText =
+      "margin-left:6px;flex:none;font-size:12px;line-height:1;pointer-events:none;";
+    return badge;
+  }
+
+  function paintRows(s) {
+    var chats = (s && s.data && s.data.chats) || [];
+    var map = {};
+    for (var i = 0; i < chats.length; i++) {
+      var c = chats[i];
+      if (c && c.chat_id && c.status && c.status !== "idle") {
+        map[c.chat_id] = c.status;
+      }
+    }
+
+    var containers = document.querySelectorAll(".chat-container");
+    for (var j = 0; j < containers.length; j++) {
+      var container = containers[j];
+      if (container.isConnected === false) continue;
+
+      var chatId = chatIdFromContainer(container);
+      if (!chatId) continue;
+
+      var status = map[chatId];
+      var existing = container.querySelector(".cs-badge");
+      if (!status) {
+        if (existing) existing.remove();
+        continue;
+      }
+
+      var glyph = iconFor(s, status);
+      // Configurable "no pictogram" for this state.
+      if (!glyph) {
+        if (existing) existing.remove();
+        continue;
+      }
+
+      var anchor = anchorFor(container);
+      // Alpine may have re-keyed the row; never steal another chat's badge.
+      if (existing && !anchor.host.contains(existing)) existing = null;
+      var badge = existing || makeBadge();
+      applyBadge(badge, status, glyph, colorFor(s, status),
+        "Chat Shepherd: " + (LABELS[status] || status));
+      if (!existing) placeBadge(badge, anchor);
+    }
+  }
+
   function injectBadges() {
-    if (injecting) return;
+    if (injecting) {
+      // Never drop a pass silently; re-run on the next frame.
+      scheduleInject();
+      return;
+    }
     injecting = true;
     try {
-      var s = store();
-      var chats = (s && s.data && s.data.chats) || [];
-      var map = {};
-      chats.forEach(function (c) {
-        if (c && c.chat_id && c.status && c.status !== "idle") {
-          map[c.chat_id] = c.status;
-        }
-      });
-
-      var containers = document.querySelectorAll(".chat-container");
-      containers.forEach(function (container) {
-        var chatId = chatIdFromContainer(container);
-        if (!chatId) return;
-        var status = map[chatId];
-        var existing = container.querySelector(".cs-badge");
-
-        if (!status) {
-          if (existing) existing.remove();
-          return;
-        }
-
-        var ch = iconFor(s, status);
-        var color = COLORS[status] || "#757575";
-
-        // Configurable "no pictogram" for this state.
-        if (!ch) {
-          if (existing) existing.remove();
-          return;
-        }
-
-        var label = "Chat Shepherd: " + (LABELS[status] || status);
-        if (existing) {
-          if (existing.textContent !== ch) {
-            existing.textContent = ch;
-            existing.style.color = color;
-            existing.title = label;
-          }
-          return;
-        }
-
-        var badge = document.createElement("span");
-        badge.className = "cs-badge";
-        badge.textContent = ch;
-        badge.title = label;
-        badge.style.cssText =
-          "margin-left:6px;flex:none;font-size:12px;line-height:1;pointer-events:auto;" +
-          "color:" + color + ";";
-        container.appendChild(badge);
-      });
+      paintRows(store());
+    } catch (e) {
+      /* a transient DOM shape must not kill the poll loop */
     } finally {
       injecting = false;
     }
   }
 
-  // P7 follow-up: scope the MutationObserver to .chats-config-list once
-  // found instead of document.body, so unrelated DOM changes anywhere in
-  // the UI stop re-triggering badge injection. Until the list renders we
-  // keep a temporary body fallback whose only job is to notice the list
-  // appearing (then re-scope) plus normal injection scheduling; the poll
-  // loop re-scopes when the list element is detached or replaced.
-  var obs = null;
-  var listEl = null;
-  
-  function findChatList() {
-   return document.querySelector(".chats-config-list");
+  function scheduleInject() {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(function () {
+      debounceTimer = null;
+      requestAnimationFrame(injectBadges);
+    }, 50);
   }
-  
+
+  // Observe the core-owned chats section so every list presentation (default
+  // list, _sidebar_folders, any future row-list extension) is covered. The old
+  // `.chats-config-list` lookup depended on a class that is not part of the
+  // row-list extension contract, so an alternative view silently lost badges.
+  function findChatRoot() {
+    return (
+      document.querySelector("#chats-section") ||
+      document.querySelector(".chats-list-container") ||
+      document.querySelector(".chats-config-list")
+    );
+  }
+
   function attachObserver() {
-   if (obs) obs.disconnect();
-   var target = findChatList();
-   if (target) {
-    listEl = target;
-    obs = new MutationObserver(scheduleInject);
-    obs.observe(target, { childList: true, subtree: true });
-   } else {
-    listEl = null;
-    obs = new MutationObserver(function () {
-     if (findChatList()) {
-      attachObserver();
-      return;
-     }
-     scheduleInject();
-    });
-    obs.observe(document.body, { childList: true, subtree: true });
-   }
-   scheduleInject();
+    if (obs) obs.disconnect();
+    var target = findChatRoot();
+    observedEl = target;
+    if (target) {
+      obs = new MutationObserver(scheduleInject);
+      obs.observe(target, { childList: true, subtree: true });
+    } else {
+      // Temporary body fallback: its only job is to notice the sidebar
+      // appearing, then re-scope.
+      obs = new MutationObserver(function () {
+        if (findChatRoot()) {
+          attachObserver();
+          return;
+        }
+        scheduleInject();
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+    }
+    scheduleInject();
   }
-  
-  function startObserver() {
-   attachObserver();
-  }
+
+  setInterval(function () {
+    var s = store();
+    if (s && s.data) scheduleInject();
+    // A sidebar re-render replaced the observed root -> re-scope the observer.
+    if (observedEl && !document.contains(observedEl)) attachObserver();
+  }, POLL_MS);
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", startObserver);
+    document.addEventListener("DOMContentLoaded", attachObserver);
   } else {
-    startObserver();
+    attachObserver();
   }
 
-  window.__chatShepherdSidebarRefresh = scheduleInject;
+  window.__chatShepherdSidebar = {
+    refresh: scheduleInject,
+    // Exposed for the offline regression suite in tests/suite_sidebar.mjs.
+    _test: {
+      chatIdFromContainer: chatIdFromContainer,
+      anchorFor: anchorFor,
+      injectBadges: injectBadges,
+      attachObserver: attachObserver,
+      observedTarget: function () { return observedEl; },
+    },
+  };
 })();

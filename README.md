@@ -157,28 +157,53 @@ directory — nothing outside it is touched, and no chat data is modified.
 
 | Symptom | Fix |
 | --- | --- |
-| No sidebar icons | Confirm the plugin is enabled and the WebUI was refreshed. The store self-heals a missed init handoff within 2s. |
+| No sidebar icons | Confirm the plugin is enabled and the WebUI was refreshed. The store self-heals a missed init handoff within 2s. Icons render in **both** the flat chat list and the folder view; if only nested (expanded) chats show an icon, your sidebar list view is a plugin list that the plugin cannot yet read — see *Troubleshooting* below. |
 | Chats never nudge | Check `stall_minutes`, `max_auto_nudges`, and whether `supervised_mode` is queueing drafts instead. |
 | Want to inspect a stall | Open the chat's timeline in the dashboard, or the **Export** button for full JSON. |
 | Edited a helper and nothing changed | `hot_reload_enabled: true` reloads helpers between ticks; `api/*` endpoint changes still need a plugin refresh. |
 | Chat says "done" but the goal is open | The goal gate needs the bundled `_goal` plugin installed. |
+| Icons show only after expanding a parent chat | Fixed in v1.20.1 — update the plugin. Older builds only recognised the flat list's row markup, so rows rendered by a folder/list-view plugin got no icon until a nested chat was expanded. |
+
+### Sidebar icons and third-party list views
+
+The per-chat icon is drawn next to the chat name in the sidebar and works with the
+built-in flat chat list, the built-in parent/child chat tree, and plugin list views
+such as **Sidebar Folders** (`folder_view: true`).
+
+A sidebar list plugin that renders its own rows can still hide the icons. Chat
+Shepherd identifies a row by, in order: a `data-folder-thread` / `data-context-id` /
+`data-chat-id` attribute on the row or one of its ancestors, or an Alpine scope
+exposing `context`, `child`, `item`, or `task`. If a custom list view provides none
+of those, the dashboard still shows every chat's status — only the inline icon is
+skipped.
 
 ---
 
 ## Development
 
 ```bash
-# self-test suite (99 markers)
+# self-test suite (100 markers)
 python usr/plugins/chat_shepherd/tests/suite_monitor.py
+
+# sidebar badge-injector DOM suite (22 assertions, no external deps)
+node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs
 
 # byte-compile check
 python -m py_compile usr/plugins/chat_shepherd/helpers/*.py
+
+# javascript syntax check
+node --check usr/plugins/chat_shepherd/webui/shepherd-sidebar.js
 ```
 
 `tests/suite_monitor.py` runs fully offline against a temporary state directory and
 covers classification, nudge budgeting, wedge ladders, the journal, hot reload,
 the settings contract, secret redaction, and the live-aware cap. It prints
 `ALL_TESTS_PASSED` on success.
+
+`tests/suite_sidebar.mjs` runs the real sidebar injector against every chat-row
+shape Agent Zero renders (flat list, folder view, nested children) and checks
+placement, repaint on status change, idle/blank-icon clearing, and repeat-load
+idempotence.
 
 `AGENTS.md` in this folder is the full engineering contract: architecture, state
 schema, config keys, and the version history.
