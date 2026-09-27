@@ -323,6 +323,12 @@
 
   setInterval(function () {
     var s = store();
+    // v1.20.2: the shared store is page-scoped, but re-arm the poll if any
+    // surface ever stopped it - otherwise the icons would silently freeze on
+    // stale data with no way to recover short of a reload.
+    if (s && s._started && !s.pollTimer && typeof s.startPolling === "function") {
+      s.startPolling();
+    }
     if (s && s.data) scheduleInject();
     // A sidebar re-render replaced the observed root -> re-scope the observer.
     if (observedEl && !document.contains(observedEl)) attachObserver();

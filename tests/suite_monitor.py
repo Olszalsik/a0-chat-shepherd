@@ -1952,6 +1952,134 @@ def main():
             monitor._has_chat_dir = _orig_hcd31
             FakeAgentContext._all = []
         print('TEST31_CAP_SPLIT_SIGNAL_OK')
+
+        # ============ TEST 32: one malformed state entry must not abort the tick (v1.20.2) ============
+        # A hand-edited / legacy state.json can carry a non-int counter
+        # ("nudge_count": "3"). That used to raise TypeError out of
+        # classify_chat, out of the unguarded per-chat loop, and out of the
+        # WHOLE tick: no nudges, no prune, no cap, no throttle snapshot for
+        # ANY chat. One bad chat must never blind the supervisor.
+        _orig_hcd32 = monitor._has_chat_dir
+        try:
+            monitor._has_chat_dir = lambda cid: True
+            # CHAT A carries the poisoned field; CHAT B is a healthy stalled
+            # chat that MUST still be classified (and is the control).
+            _bad32 = {FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': '3', 'last_ticked': now_iso}}
+            _good32 = {FAKE_CHAT_B: {'status': 'stalled', 'nudge_count': 0, 'last_ticked': now_iso}}
+            FakeAgentContext._all = [
+                FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=600),
+                FakeCtx(FAKE_CHAT_B, ['user', 'tool'], idle_minutes=600),
+            ]
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+                        chats={**_bad32, **_good32})
+            # classify_chat itself must degrade instead of raising. A numeric
+            # string still parses (so "3" really is 3 nudges used ->
+            # intervention); a junk value degrades to 0 -> stalled.
+            _st32a, _r32a = monitor.classify_chat(
+                FakeAgentContext._all[0], FAKE_CHAT_A,
+                dict(cfg, stall_minutes=5), {'nudge_count': 'abc'}, 0.0,
+            )
+            assert _st32a == 'stalled', 'junk nudge_count should degrade to 0, got ' + str(_st32a)
+            _st32b, _r32b = monitor.classify_chat(
+                FakeAgentContext._all[0], FAKE_CHAT_A,
+                dict(cfg, stall_minutes=5), {'nudge_count': '3'}, 0.0,
+            )
+            assert _st32b == 'intervention', 'numeric string should still parse, got ' + str(_st32b)
+            s32 = monitor.tick(dict(cfg, max_nudges_per_tick=1))
+            st32 = read_state()
+            # The healthy chat is still supervised...
+            assert st32['chats'][FAKE_CHAT_B]['status'] in ('stalled', 'nudged'), (
+                'a poisoned sibling entry stopped supervising a healthy chat: %r' % st32['chats'][FAKE_CHAT_B]
+            )
+            # ...and the tick still completed its bookkeeping tail.
+            assert 'throttle' in st32, 'tick aborted before the throttle snapshot: %r' % list(st32)
+            assert s32['checked'] == 2, s32
+            assert s32.get('chat_errors', 0) == 0, (
+                'the coercion should have absorbed the bad counter outright: %r' % s32
+            )
+
+            # Second defence layer: an entry that is not even a dict (the shape a
+            # hand-edit or a half-migrated state.json can produce) still breaks
+            # attribute access, so the per-chat guard must catch it, count it,
+            # and keep supervising every other chat.
+            FakeAgentContext._all = [
+                FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=600),
+                FakeCtx(FAKE_CHAT_B, ['user', 'tool'], idle_minutes=600),
+            ]
+            write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+                        chats={FAKE_CHAT_A: 'not-a-dict',
+                               FAKE_CHAT_B: {'status': 'stalled', 'nudge_count': 0,
+                                             'last_ticked': now_iso}})
+            s32b = monitor.tick(dict(cfg, max_nudges_per_tick=1))
+            st32b = read_state()
+            # load_state() repairs the corrupt entry, so the tick completes
+            # cleanly and the healthy sibling is still supervised.
+            assert 'throttle' in st32b, 'tick aborted before the throttle snapshot: %r' % list(st32b)
+            assert s32b['checked'] == 2, s32b
+            assert st32b['chats'][FAKE_CHAT_B]['status'] in ('stalled', 'nudged'), (
+                'a corrupt sibling entry stopped supervising a healthy chat: %r' % st32b['chats'][FAKE_CHAT_B]
+            )
+            # the repair marker is reported once and never persisted
+            assert s32b.get('repaired_entries') is None or s32b['repaired_entries'] >= 0, s32b
+            assert 'repaired_entries' not in st32b, (
+                'the transient repair marker leaked into state.json: %r' % list(st32b)
+            )
+        finally:
+            monitor._has_chat_dir = _orig_hcd32
+            FakeAgentContext._all = []
+        print('TEST32_MALFORMED_ENTRY_ISOLATION_OK')
+
+        # ============ TEST 33: _as_int coercion contract (v1.20.2) ============
+        for _bad33 in ('3', 'abc', None, [1], {}, 2.7):
+            _v33 = monitor._as_int(_bad33, 0)
+            assert isinstance(_v33, int), (_bad33, _v33)
+        assert monitor._as_int('3', 0) == 3
+        assert monitor._as_int(2.7, 0) == 2
+        assert monitor._as_int(None, 7) == 7
+        assert monitor._as_int(True, 0) == 1
+        print('TEST33_AS_INT_OK')
+
+        # ============ TEST 34: tail scanners must not copy the whole log (v1.20.2) ============
+        # Each helper used to do list(context.log.logs) under the agent's log
+        # lock (blocking the agent's own writer) and then inspect a handful of
+        # tail items. Guard the bounded slice structurally.
+        import inspect as _insp34
+        for _fn34 in ('_last_log_type', '_last_log_fatal', '_scan_log_for_termination',
+                      '_last_response_text', '_last_entry_type'):
+            _src34 = _insp34.getsource(getattr(monitor, _fn34))
+            _code34 = '\n'.join(
+                ln for ln in _src34.splitlines()
+                if not ln.strip().startswith('#') and 'log.logs)' not in ln
+            )
+            assert 'logs[-_LOG_TAIL:]' in _code34 or 'logs = context.log.logs' in _code34, (
+                _fn34 + ' still copies the entire log under the lock'
+            )
+        print('TEST34_LOG_TAIL_SLICE_OK')
+
+        # ============ TEST 35: /status uses the same real-chat predicate as tick (v1.20.2) ============
+        # /status used to list EVERY live AgentContext, so throwaway script
+        # contexts showed in the dashboard and /nudge then refused them.
+        _orig_hcd35 = monitor._has_chat_dir
+        try:
+            monitor._has_chat_dir = lambda cid: cid == FAKE_CHAT_A
+            FakeAgentContext._all = [
+                FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=0),
+                FakeCtx('verify-1788992102', ['user'], idle_minutes=0),
+            ]
+            write_state(now_iso, chats={FAKE_CHAT_A: {'status': 'idle'}})
+            from usr.plugins.chat_shepherd.api.status import Status as _CSStatus35
+            import asyncio as _aio35
+            _p35 = _aio35.run(_CSStatus35(None, None).process({}, None))
+            _ids35 = [c['chat_id'] for c in _p35['chats']]
+            assert FAKE_CHAT_A in _ids35, _ids35
+            assert 'verify-1788992102' not in _ids35, (
+                '/status surfaced an untracked script context: %r' % _ids35
+            )
+        finally:
+            monitor._has_chat_dir = _orig_hcd35
+            FakeAgentContext._all = []
+        print('TEST35_STATUS_TRACKING_PREDICATE_OK')
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

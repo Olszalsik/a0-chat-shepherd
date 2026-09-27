@@ -53,6 +53,19 @@ def load_state() -> dict[str, Any]:
         state.update(payload)
     if not isinstance(state.get('chats'), dict):
         state['chats'] = {}
+    # v1.20.2: repair non-dict chat entries at the load boundary. A hand-edited
+    # or half-migrated state.json can hold `"chats": {"x": "oops"}`, and every
+    # downstream consumer (classify_chat, the nudge-budget reset loop, /status)
+    # assumes a dict - one such entry raised AttributeError and took down the
+    # whole tick. Entries without usable bookkeeping are dropped here, once,
+    # instead of guarded at a dozen call sites.
+    _chats36 = state.get('chats') or {}
+    _bad36 = [cid for cid, ent in _chats36.items() if not isinstance(ent, dict)]
+    if _bad36:
+        for cid in _bad36:
+            _chats36.pop(cid, None)
+        state['chats'] = _chats36
+        state['repaired_entries'] = len(_bad36)
     if not isinstance(state.get('drafts'), list):
         state['drafts'] = []
     # v1.6.0: one-time migration - seed the journal from legacy history.
@@ -86,6 +99,8 @@ def save_state(state: dict[str, Any]) -> None:
     # append-only journal is its source of truth.
     payload = dict(state)
     payload.pop('history', None)
+    # v1.20.2: transient load-time repair marker, never persisted.
+    payload.pop('repaired_entries', None)
     tmp_rel = STATE_FILE + '.tmp'
     files.write_file(tmp_rel, json.dumps(payload, ensure_ascii=False, indent=2))
     os.replace(files.get_abs_path(tmp_rel), files.get_abs_path(STATE_FILE))

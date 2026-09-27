@@ -182,11 +182,14 @@ skipped.
 ## Development
 
 ```bash
-# self-test suite (100 markers)
+# self-test suite (105 markers)
 python usr/plugins/chat_shepherd/tests/suite_monitor.py
 
 # sidebar badge-injector DOM suite (22 assertions, no external deps)
 node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs
+
+# shared frontend store suite (12 assertions, no external deps)
+node usr/plugins/chat_shepherd/tests/suite_store.mjs
 
 # byte-compile check
 python -m py_compile usr/plugins/chat_shepherd/helpers/*.py
@@ -197,13 +200,17 @@ node --check usr/plugins/chat_shepherd/webui/shepherd-sidebar.js
 
 `tests/suite_monitor.py` runs fully offline against a temporary state directory and
 covers classification, nudge budgeting, wedge ladders, the journal, hot reload,
-the settings contract, secret redaction, and the live-aware cap. It prints
-`ALL_TESTS_PASSED` on success.
+the settings contract, secret redaction, the live-aware cap, and state-corruption
+resilience. It prints `ALL_TESTS_PASSED` on success.
 
 `tests/suite_sidebar.mjs` runs the real sidebar injector against every chat-row
 shape Agent Zero renders (flat list, folder view, nested children) and checks
 placement, repaint on status change, idle/blank-icon clearing, and repeat-load
 idempotence.
+
+`tests/suite_store.mjs` covers the store shared by the sidebar and the dashboard:
+the poll-failure toast latch, the page-scoped poll contract, timer stacking, and
+draft-edit pruning.
 
 `AGENTS.md` in this folder is the full engineering contract: architecture, state
 schema, config keys, and the version history.

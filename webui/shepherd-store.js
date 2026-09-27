@@ -62,7 +62,13 @@ export const store = createStore("chatShepherdStore", {
   },
 
   cleanup() {
-    this.stopPolling();
+    // v1.20.2: deliberately a no-op. This store is SHARED with the sidebar
+    // badge injector, so tearing the poll down when a surface unmounts froze
+    // the sidebar icons on stale data for the rest of the page session (the
+    // dashboard modal's x-destroy used to call this). Polling costs one small
+    // GET every poll_seconds and the sidebar needs it anyway, so the poll is
+    // page-scoped and only a full unload ends it. Consumers that genuinely
+    // want it stopped can call stopPolling() directly.
   },
 
   startPolling() {
@@ -82,14 +88,20 @@ export const store = createStore("chatShepherdStore", {
       const json = await callApi("/status");
       if (json && json.success) {
         this.data = json;
-      this._fetchFailed = false;
-      this.initDraftEdits();
-      this.applyPollFromConfig();
+        this._fetchFailed = false;
+        this.initDraftEdits();
+        this.applyPollFromConfig();
       } else {
+        // v1.20.2: the "toast once, not every 5s" guard was dead code -
+        // _fetchFailed was only ever assigned false, so a wedged backend
+        // raised an error toast on every poll for the rest of the session.
+        // Latch AFTER the check so the first failure still reports.
         if (!this._fetchFailed) toastFrontendError((json && json.error) || "Status request failed", "Chat Shepherd");
+        this._fetchFailed = true;
       }
     } catch (e) {
       if (!this._fetchFailed) toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
+      this._fetchFailed = true;
     }
   },
 
@@ -125,8 +137,16 @@ export const store = createStore("chatShepherdStore", {
 
   initDraftEdits() {
       const ds = (this.data && this.data.drafts) || [];
+      const live = new Set();
       for (const d of ds) {
+          live.add(d.id);
           if (!(d.id in this.draftEdits)) this.draftEdits[d.id] = d.text || '';
+      }
+      // v1.20.2: drop edits for drafts that no longer exist (sent, dismissed,
+      // or aged out by the server-side DRAFT_MAX cap). The map only ever grew
+      // before, so a long dashboard session leaked one entry per draft.
+      for (const id of Object.keys(this.draftEdits)) {
+          if (!live.has(id)) delete this.draftEdits[id];
       }
   },
 

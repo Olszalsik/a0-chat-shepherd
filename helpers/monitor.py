@@ -78,6 +78,25 @@ def _minutes_since(dt: datetime | None) -> float:
     return (_now() - dt).total_seconds() / 60.0
 
 
+def _as_int(val: Any, fallback: int = 0) -> int:
+    """Coerce a state field to int without ever raising.
+
+    v1.20.2: state.json is hand-editable and survives plugin upgrades, so a
+    counter can arrive as a string, None, or a list (`"nudge_count": "3"`).
+    Comparing that against an int raised TypeError inside classify_chat and
+    aborted the whole tick. Counters are best-effort bookkeeping, so a bad
+    value degrades to the fallback instead of taking supervision down.
+    """
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, int):
+        return val
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return fallback
+
+
 # v1.18.1: fs-probe caches. tick() and every /status poll stat-probed one
 # path per tracked chat (usr/chats/<id> + error.txt) through files.exists,
 # whose bounded stat can block the calling thread up to 5s on a degraded
@@ -135,11 +154,24 @@ def _check_error_file(chat_id: str) -> bool:
     return result
 
 
+# v1.20.2: how many trailing log entries the tail scanners read. Every one of
+# these helpers used to copy the ENTIRE log while holding the agent's log lock
+# (blocking the agent's own writer) and then looked at the last handful of
+# items. Slicing the tail under the lock keeps the scans identical on chats of
+# any length. Generous enough to still see a fatal stop that a few shepherd
+# nudges have pushed down the log.
+_LOG_TAIL = 50
+
+
 def _last_log_type(context: AgentContext) -> str:
+    # `list(context.log.logs)` copies every entry while holding the agent's
+    # log lock, blocking the agent's own writer for the duration; only the
+    # last few entries are ever inspected. _log_len() proves a big log exists
+    # without touching it, so the tail scan stays correct.
     try:
         with context.log._lock:
-            logs = list(context.log.logs)
-        for item in reversed(logs):
+            tail = list(context.log.logs[-_LOG_TAIL:])
+        for item in reversed(tail):
             if item.type in ('response', 'tool', 'user', 'error'):
                 return item.type
     except Exception:
@@ -165,8 +197,8 @@ def _last_log_fatal(context: AgentContext) -> bool:
     # human turn clears the stamp.
     try:
         with context.log._lock:
-            logs = list(context.log.logs)
-        for item in reversed(logs[-5:]):
+            tail = list(context.log.logs[-_LOG_TAIL:])
+        for item in reversed(tail):
             ltype = str(getattr(item, 'type', '') or '')
             if ltype == 'user' and '[chat_shepherd]' not in str(
                 getattr(item, 'content', '') or ''
@@ -203,12 +235,14 @@ def _scan_log_for_termination(context: AgentContext) -> tuple[bool, bool]:
       item, meaning the chat already moved on (clears the suppression).
     Unlike _last_log_fatal this is a full-tail scan (not just 5 items) so
     the stamp is stamped once, durably, even if later log items hide it.
+    The scan is bounded to the last _LOG_TAIL entries and sliced under the
+    lock, so a long-running chat no longer copies its whole log here.
     """
     try:
         with context.log._lock:
-            logs = list(context.log.logs)
+            tail = list(context.log.logs[-_LOG_TAIL:])
         found = False
-        for item in reversed(logs):
+        for item in reversed(tail):
             ltype = str(getattr(item, 'type', '') or '')
             if ltype == 'user' and '[chat_shepherd]' not in str(
                 getattr(item, 'content', '') or ''
@@ -240,9 +274,10 @@ def _termination_cooldown_active(prev_entry: dict[str, Any]) -> bool:
 
 def _last_entry_type(context: AgentContext) -> str:
     """Type of the very last log entry (unfiltered)."""
+    # v1.20.2: read the last entry in place; the full copy was pure waste.
     try:
         with context.log._lock:
-            logs = list(context.log.logs)
+            logs = context.log.logs
             if logs:
                 return str(getattr(logs[-1], 'type', '') or '')
     except Exception:
@@ -668,10 +703,10 @@ def classify_chat(
                 reason += ' (liveness: spinning dead loop, only a task kill drains it)'
             elif live == 'hung':
                 reason += ' (liveness: hung call)'
-            wedge_count = int(prev_entry.get('wedge_nudge_count', 0) or 0)
-            max_remediations = max(0, min(5, int(cfg.get(
+            wedge_count = _as_int(prev_entry.get('wedge_nudge_count', 0))
+            max_remediations = max(0, min(5, _as_int(cfg.get(
                 'wedge_max_remediations', WEDGE_MAX_REMEDIATIONS
-            ))))
+            ), WEDGE_MAX_REMEDIATIONS)))
             if wedge_count > 0:
                 if wedge_count >= max_remediations:
                     reason += ', remediation exhausted'
@@ -715,8 +750,8 @@ def classify_chat(
         return STATUS_AWAITING_USER, 'Agent finished response, waiting for user'
 
     stall_minutes = float(cfg.get('stall_minutes', 5))
-    nudge_count = prev_entry.get('nudge_count', 0)
-    max_nudges = int(cfg.get('max_auto_nudges', 3))
+    nudge_count = _as_int(prev_entry.get('nudge_count', 0))
+    max_nudges = _as_int(cfg.get('max_auto_nudges', 3), 3)
 
     if minutes_idle > stall_minutes:
         if nudge_count >= max_nudges:
@@ -755,10 +790,11 @@ def _active_goal(chat_id: str) -> dict[str, Any] | None:
 def _last_response_text(context: AgentContext) -> str:
     # v1.8.0: heading + content of the most recent response log item
     # (completion-claim evidence). Same lock discipline as _last_log_type.
+    # v1.20.2: tail slice under the lock instead of copying the whole log.
     try:
         with context.log._lock:
-            logs = list(context.log.logs)
-        for item in reversed(logs):
+            tail = list(context.log.logs[-_LOG_TAIL:])
+        for item in reversed(tail):
             if getattr(item, 'type', '') == 'response':
                 heading = str(getattr(item, 'heading', '') or '')
                 content = str(getattr(item, 'content', '') or '')
@@ -991,217 +1027,228 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     wedge_queue: list[tuple[float, str, Any, dict, float]] = []
 
     for chat_id, ctx in live_contexts.items():
-        summary['checked'] += 1
-        now_iso = datetime.now(timezone.utc).isoformat()
-        prev = state_mod.get_chat(state, chat_id)
-        old_status = prev.get('status', '')
+        # v1.20.2: isolate per-chat failures. A single malformed state entry
+        # (e.g. a hand-edited nudge_count string) used to raise out of this
+        # loop and abort the WHOLE tick - no nudges, no prune, no cap, no
+        # throttle snapshot for any chat. One bad chat must not blind the
+        # supervisor to every other chat.
+        try:
+          summary['checked'] += 1
+          now_iso = datetime.now(timezone.utc).isoformat()
+          prev = state_mod.get_chat(state, chat_id)
+          old_status = prev.get('status', '')
 
-        # P3 wedge detection: capture the log length and compare with the
-        # previous tick. Unchanged length while running => start/continue the
-        # frozen clock; any growth resets it.
-        cur_log_len = _log_len(ctx)
-        prev_log_len = prev.get('last_log_len', -1)
-        # v1.10.0 liveness probe: read the log mutation counter next
-        # to the entry count. Entries frozen + mutations advancing =
-        # spinning dead loop; both frozen = hung call. O(1) reads
-        # under the same lock; unknown counter = legacy behavior.
-        cur_updates = _log_updates(ctx) if wedge_probe else -1
-        frozen_minutes = 0.0
-        liveness = ''
-        if (
-            ctx.is_running()
-            and cur_log_len >= 0
-            and prev_log_len >= 0
-            and cur_log_len == prev_log_len
-        ):
-            frozen_since = _parse_dt(prev.get('log_len_since', ''))
-            if frozen_since is None:
-                prev['log_len_since'] = now_iso
-                frozen_minutes = 0.0
-            else:
-                frozen_minutes = _minutes_since(frozen_since)
-                prev_updates = prev.get('last_updates_len', -1)
-                try:
-                    prev_updates = int(prev_updates)
-                except (TypeError, ValueError):
-                    prev_updates = -1
-                if cur_updates >= 0 and prev_updates >= 0:
-                    if cur_updates > prev_updates:
-                        liveness = 'spinning'
-                    elif cur_updates == prev_updates:
-                        liveness = 'hung'
-                prev['liveness'] = liveness
-        else:
-            prev['log_len_since'] = ''
-            prev['liveness'] = ''
-            # v1.2.0: the log grew again (or the task stopped) - a pending
-            # wedge remediation either worked or is moot; credit it if recent.
-            _record_wedge_outcome(state, chat_id, now_iso)
+          # P3 wedge detection: capture the log length and compare with the
+          # previous tick. Unchanged length while running => start/continue the
+          # frozen clock; any growth resets it.
+          cur_log_len = _log_len(ctx)
+          prev_log_len = prev.get('last_log_len', -1)
+          # v1.10.0 liveness probe: read the log mutation counter next
+          # to the entry count. Entries frozen + mutations advancing =
+          # spinning dead loop; both frozen = hung call. O(1) reads
+          # under the same lock; unknown counter = legacy behavior.
+          cur_updates = _log_updates(ctx) if wedge_probe else -1
+          frozen_minutes = 0.0
+          liveness = ''
+          if (
+              ctx.is_running()
+              and cur_log_len >= 0
+              and prev_log_len >= 0
+              and cur_log_len == prev_log_len
+          ):
+              frozen_since = _parse_dt(prev.get('log_len_since', ''))
+              if frozen_since is None:
+                  prev['log_len_since'] = now_iso
+                  frozen_minutes = 0.0
+              else:
+                  frozen_minutes = _minutes_since(frozen_since)
+                  prev_updates = prev.get('last_updates_len', -1)
+                  try:
+                      prev_updates = int(prev_updates)
+                  except (TypeError, ValueError):
+                      prev_updates = -1
+                  if cur_updates >= 0 and prev_updates >= 0:
+                      if cur_updates > prev_updates:
+                          liveness = 'spinning'
+                      elif cur_updates == prev_updates:
+                          liveness = 'hung'
+                  prev['liveness'] = liveness
+          else:
+              prev['log_len_since'] = ''
+              prev['liveness'] = ''
+              # v1.2.0: the log grew again (or the task stopped) - a pending
+              # wedge remediation either worked or is moot; credit it if recent.
+              _record_wedge_outcome(state, chat_id, now_iso)
 
-        new_status, reason = classify_chat(ctx, chat_id, cfg, prev, frozen_minutes)
+          new_status, reason = classify_chat(ctx, chat_id, cfg, prev, frozen_minutes)
 
-        # v1.18.2 fix (terminate-loop, part 2): persist the termination
-        # stamp durably in state. A full-tail scan catches a TERMINATED
-        # warning / error stop even when later items (shepherd nudges,
-        # progress entries) bury it; a fresh human turn (shepherd nudges
-        # excluded) clears the suppression early. The stamp gates both
-        # nudge queues below for TERMINATION_NUDGE_COOLDOWN_MIN minutes.
-        _term_found, _term_fresh_human = _scan_log_for_termination(ctx)
-        if _term_found:
-            prev['terminated_at'] = now_iso
-        elif _term_fresh_human:
-            prev['terminated_at'] = ''
-        _term_cooldown_active = _termination_cooldown_active(prev)
+          # v1.18.2 fix (terminate-loop, part 2): persist the termination
+          # stamp durably in state. A full-tail scan catches a TERMINATED
+          # warning / error stop even when later items (shepherd nudges,
+          # progress entries) bury it; a fresh human turn (shepherd nudges
+          # excluded) clears the suppression early. The stamp gates both
+          # nudge queues below for TERMINATION_NUDGE_COOLDOWN_MIN minutes.
+          _term_found, _term_fresh_human = _scan_log_for_termination(ctx)
+          if _term_found:
+              prev['terminated_at'] = now_iso
+          elif _term_fresh_human:
+              prev['terminated_at'] = ''
+          _term_cooldown_active = _termination_cooldown_active(prev)
 
-        # Restart recovery: chat was active before the restart, is
-        # restored-but-idle now, and its log does not end with a completed
-        # response => it was interrupted mid-task. USER contexts only -
-        # the scheduler resumes its own task chats on its own cadence.
-        if (
-            server_restarted
-            and old_status in (
-                STATUS_RUNNING, STATUS_STALLED, STATUS_NUDGED, STATUS_INTERVENTION
-            )
-            and getattr(ctx, 'type', None) == AgentContextType.USER
-            and not ctx.is_running()
-            and not getattr(ctx, 'paused', False)
-            and _last_entry_type(ctx) != 'response'
-        ):
-            new_status = STATUS_INTERRUPTED
-            reason = (
-                f'Server restarted while chat was {old_status}; '
-                'mid-task work interrupted'
-            )
+          # Restart recovery: chat was active before the restart, is
+          # restored-but-idle now, and its log does not end with a completed
+          # response => it was interrupted mid-task. USER contexts only -
+          # the scheduler resumes its own task chats on its own cadence.
+          if (
+              server_restarted
+              and old_status in (
+                  STATUS_RUNNING, STATUS_STALLED, STATUS_NUDGED, STATUS_INTERVENTION
+              )
+              and getattr(ctx, 'type', None) == AgentContextType.USER
+              and not ctx.is_running()
+              and not getattr(ctx, 'paused', False)
+              and _last_entry_type(ctx) != 'response'
+          ):
+              new_status = STATUS_INTERRUPTED
+              reason = (
+                  f'Server restarted while chat was {old_status}; '
+                  'mid-task work interrupted'
+              )
 
-        fname = _chat_display_name(chat_id, ctx, prev)
-        entry = state_mod.update_chat(
-            state,
-            chat_id,
-            name=fname,
-            status=new_status,
-            last_classification=reason,
-            last_log_type=_last_log_type(ctx) if ctx else '',
-            last_log_len=cur_log_len,
-            last_updates_len=cur_updates,
-            last_ticked=now_iso,
-        )
-        if new_status != STATUS_INTERVENTION:
-            # v1.7.0: episode ended (recovered / awaiting / error) - clear the
-            # quiet-bell clock so a future episode pages on its own merits.
-            entry['intervention_since'] = ''
-            entry['intervention_notify_at'] = ''
+          fname = _chat_display_name(chat_id, ctx, prev)
+          entry = state_mod.update_chat(
+              state,
+              chat_id,
+              name=fname,
+              status=new_status,
+              last_classification=reason,
+              last_log_type=_last_log_type(ctx) if ctx else '',
+              last_log_len=cur_log_len,
+              last_updates_len=cur_updates,
+              last_ticked=now_iso,
+          )
+          if new_status != STATUS_INTERVENTION:
+              # v1.7.0: episode ended (recovered / awaiting / error) - clear the
+              # quiet-bell clock so a future episode pages on its own merits.
+              entry['intervention_since'] = ''
+              entry['intervention_notify_at'] = ''
 
-        if new_status == STATUS_RUNNING:
-            entry['last_seen_running'] = now_iso
-            summary['running'] += 1
-            _record_nudge_outcome(state, chat_id, now_iso)
-        elif new_status == STATUS_PAUSED:
-            summary['paused'] += 1
-        elif new_status == STATUS_ERROR:
-            entry['error_detected'] = True
-            summary['error'] += 1
-        elif new_status == STATUS_AWAITING_USER:
-            summary['awaiting'] += 1
-            _record_nudge_outcome(state, chat_id, now_iso)
-            # v1.8.0 goal completion gate: a response that claims the work is
-            # done while the chat's native goal is still open gets a silent
-            # nudge to finish the goal or close it via the goal tool.
-            if (
-                goal_gate_enabled
-                and getattr(ctx, 'type', None) == AgentContextType.USER
-                and _goal_gate_check(
-                    state, chat_id, ctx, entry, cfg, now_iso, summary
-                )
-            ):
-                entry['status'] = STATUS_NUDGED
-                entry['last_classification'] = (
-                    'Goal gate: completion claim while goal still active'
-                )
-        elif new_status == STATUS_STALLED:
-            summary['stalled'] += 1
-            last_nudge_dt = _parse_dt(prev.get('last_nudge_at', ''))
-            cooldown_ok = _minutes_since(last_nudge_dt) >= nudge_cooldown
-            minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
-            nudge_count = prev.get('nudge_count', 0)
-            if (
-                cooldown_ok
-                and not _term_cooldown_active
-                and nudge_count < max_nudges
-            ):
-                # Oldest stall first; final ordering happens post-loop.
-                nudge_queue.append((minutes_idle, chat_id, ctx, entry, now_iso))
-        elif new_status == STATUS_INTERVENTION:
-            summary['intervention'] += 1
-            if 'log frozen' in reason:
-                summary['wedged'] += 1
-                if prev.get('liveness', '') == 'spinning':
-                    summary['wedge_spinning'] += 1
-                # v1.2.0 remediation ladder: USER chats frozen past the grace
-                # period get an automatic "continue" (Tier 1), with the
-                # framework's ctx.nudge() (kill + fw.msg_nudge.md) available
-                # as the final attempt when wedge_soft_restart is enabled.
-                # Scheduler TASK contexts are excluded — the scheduler
-                # resumes its own task chats on its own cadence.
-                wedge_count = int(prev.get('wedge_nudge_count', 0) or 0)
-                last_wedge_dt = _parse_dt(prev.get('last_wedge_nudge_at', ''))
-                wedge_cooldown_ok = _minutes_since(last_wedge_dt) >= wedge_cooldown
-                if (
-                    wedge_max_remediations > 0
-                    and wedge_count < wedge_max_remediations
-                    and wedge_cooldown_ok
-                    and not _term_cooldown_active
-                    and frozen_minutes >= wedge_nudge_after
-                    and getattr(ctx, 'type', None) == AgentContextType.USER
-                ):
-                    # Oldest freeze first; final ordering post-loop.
-                    wedge_queue.append((frozen_minutes, chat_id, ctx, entry, now_iso))
-            # v1.7.0 quiet bell: persistence-gated paging. A fresh episode starts
-            # the clock silently; the bell rings only once the chat has
-            # persistently needed human help for >= notify_after minutes
-            # (0 = page immediately). notify_rearm re-pages an ongoing
-            # episode (0 = one page per episode). Self-healed episodes (e.g.
-            # the wedge auto-continue worked) never page.
-            if notify_on_intervention:
-                since_dt = _parse_dt(prev.get('intervention_since', ''))
-                if since_dt is None:
-                    entry['intervention_since'] = now_iso
-                    since_dt = _parse_dt(now_iso)
-                waited = _minutes_since(since_dt)
-                if waited >= notify_after:
-                    notify_at_dt = _parse_dt(entry.get('intervention_notify_at', ''))
-                    rearm_ok = notify_at_dt is None or (
-                        notify_rearm > 0
-                        and _minutes_since(notify_at_dt) >= notify_rearm
-                    )
-                    if rearm_ok:
-                        if not _notify(
-                            'warning',
-                            f'Chat {fname!r} ({chat_id}) still needs human '
-                            f'intervention after {waited:.0f}m: {reason}',
-                            priority='high',
-                            cfg=cfg,
-                            ):
-                            summary['notify_failures'] += 1
-                        entry['intervention_notify_at'] = now_iso
-        elif new_status == STATUS_INTERRUPTED:
-            summary['interrupted'] += 1
-            if supervised:
-                # v1.16.0 supervised mode: queue an editable draft for
-                # human review instead of auto-resuming; nothing is
-                # sent and the nudge budget stays untouched.
-                if state_mod.add_draft(
-                    state, chat_id, 'restart_resume', reason=reason
-                ):
-                    summary['drafted'] += 1
-            else:
-                nudge_count = entry.get('nudge_count', 0)
-                if nudge_count < max_nudges:
-                    minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
-                    resume_queue.append(
-                        (minutes_idle, chat_id, ctx, entry, now_iso, RESUME_TEXT)
-                    )
-        elif new_status == STATUS_IDLE:
-            summary['idle'] += 1
+          if new_status == STATUS_RUNNING:
+              entry['last_seen_running'] = now_iso
+              summary['running'] += 1
+              _record_nudge_outcome(state, chat_id, now_iso)
+          elif new_status == STATUS_PAUSED:
+              summary['paused'] += 1
+          elif new_status == STATUS_ERROR:
+              entry['error_detected'] = True
+              summary['error'] += 1
+          elif new_status == STATUS_AWAITING_USER:
+              summary['awaiting'] += 1
+              _record_nudge_outcome(state, chat_id, now_iso)
+              # v1.8.0 goal completion gate: a response that claims the work is
+              # done while the chat's native goal is still open gets a silent
+              # nudge to finish the goal or close it via the goal tool.
+              if (
+                  goal_gate_enabled
+                  and getattr(ctx, 'type', None) == AgentContextType.USER
+                  and _goal_gate_check(
+                      state, chat_id, ctx, entry, cfg, now_iso, summary
+                  )
+              ):
+                  entry['status'] = STATUS_NUDGED
+                  entry['last_classification'] = (
+                      'Goal gate: completion claim while goal still active'
+                  )
+          elif new_status == STATUS_STALLED:
+              summary['stalled'] += 1
+              last_nudge_dt = _parse_dt(prev.get('last_nudge_at', ''))
+              cooldown_ok = _minutes_since(last_nudge_dt) >= nudge_cooldown
+              minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
+              nudge_count = prev.get('nudge_count', 0)
+              if (
+                  cooldown_ok
+                  and not _term_cooldown_active
+                  and nudge_count < max_nudges
+              ):
+                  # Oldest stall first; final ordering happens post-loop.
+                  nudge_queue.append((minutes_idle, chat_id, ctx, entry, now_iso))
+          elif new_status == STATUS_INTERVENTION:
+              summary['intervention'] += 1
+              if 'log frozen' in reason:
+                  summary['wedged'] += 1
+                  if prev.get('liveness', '') == 'spinning':
+                      summary['wedge_spinning'] += 1
+                  # v1.2.0 remediation ladder: USER chats frozen past the grace
+                  # period get an automatic "continue" (Tier 1), with the
+                  # framework's ctx.nudge() (kill + fw.msg_nudge.md) available
+                  # as the final attempt when wedge_soft_restart is enabled.
+                  # Scheduler TASK contexts are excluded — the scheduler
+                  # resumes its own task chats on its own cadence.
+                  wedge_count = int(prev.get('wedge_nudge_count', 0) or 0)
+                  last_wedge_dt = _parse_dt(prev.get('last_wedge_nudge_at', ''))
+                  wedge_cooldown_ok = _minutes_since(last_wedge_dt) >= wedge_cooldown
+                  if (
+                      wedge_max_remediations > 0
+                      and wedge_count < wedge_max_remediations
+                      and wedge_cooldown_ok
+                      and not _term_cooldown_active
+                      and frozen_minutes >= wedge_nudge_after
+                      and getattr(ctx, 'type', None) == AgentContextType.USER
+                  ):
+                      # Oldest freeze first; final ordering post-loop.
+                      wedge_queue.append((frozen_minutes, chat_id, ctx, entry, now_iso))
+              # v1.7.0 quiet bell: persistence-gated paging. A fresh episode starts
+              # the clock silently; the bell rings only once the chat has
+              # persistently needed human help for >= notify_after minutes
+              # (0 = page immediately). notify_rearm re-pages an ongoing
+              # episode (0 = one page per episode). Self-healed episodes (e.g.
+              # the wedge auto-continue worked) never page.
+              if notify_on_intervention:
+                  since_dt = _parse_dt(prev.get('intervention_since', ''))
+                  if since_dt is None:
+                      entry['intervention_since'] = now_iso
+                      since_dt = _parse_dt(now_iso)
+                  waited = _minutes_since(since_dt)
+                  if waited >= notify_after:
+                      notify_at_dt = _parse_dt(entry.get('intervention_notify_at', ''))
+                      rearm_ok = notify_at_dt is None or (
+                          notify_rearm > 0
+                          and _minutes_since(notify_at_dt) >= notify_rearm
+                      )
+                      if rearm_ok:
+                          if not _notify(
+                              'warning',
+                              f'Chat {fname!r} ({chat_id}) still needs human '
+                              f'intervention after {waited:.0f}m: {reason}',
+                              priority='high',
+                              cfg=cfg,
+                              ):
+                              summary['notify_failures'] += 1
+                          entry['intervention_notify_at'] = now_iso
+          elif new_status == STATUS_INTERRUPTED:
+              summary['interrupted'] += 1
+              if supervised:
+                  # v1.16.0 supervised mode: queue an editable draft for
+                  # human review instead of auto-resuming; nothing is
+                  # sent and the nudge budget stays untouched.
+                  if state_mod.add_draft(
+                      state, chat_id, 'restart_resume', reason=reason
+                  ):
+                      summary['drafted'] += 1
+              else:
+                  nudge_count = entry.get('nudge_count', 0)
+                  if nudge_count < max_nudges:
+                      minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
+                      resume_queue.append(
+                          (minutes_idle, chat_id, ctx, entry, now_iso, RESUME_TEXT)
+                      )
+          elif new_status == STATUS_IDLE:
+              summary['idle'] += 1
+        except Exception as e:
+            # Best-effort: keep the other chats supervised and make the
+            # failure visible instead of silently losing supervision.
+            summary['chat_errors'] = summary.get('chat_errors', 0) + 1
+            _debug_log('chat_tick_fail', chat_id + ' ' + repr(e))
 
     # P2: drain the nudge queue under the global per-tick throttle,
     # oldest stall first. Everything left keeps status `stalled` and is
@@ -1374,6 +1421,10 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 summary['notify_failures'] += 1
 
     for chat_id, entry in list(state.get('chats', {}).items()):
+        # v1.20.2: load_state() already repairs non-dict entries; this guard
+        # keeps the reset loop safe for any state mutated in-process.
+        if not isinstance(entry, dict):
+            continue
         if entry.get('status') in (STATUS_RUNNING, STATUS_AWAITING_USER, STATUS_PAUSED):
             # v1.18.2 fix (terminate-loop, part 3): a recent termination
             # stamp means the last "running" interval ended in a security

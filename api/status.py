@@ -96,6 +96,15 @@ class Status(ApiHandler):
         try:
             from agent import AgentContext
             for ctx in AgentContext.all():
+                # v1.20.2: apply the SAME real-chat predicate tick() uses.
+                # /status used to list every live AgentContext, so
+                # script-created throwaway contexts (verify-*, ctx-hook-1)
+                # appeared in the dashboard and counts even though the
+                # shepherd refuses to nudge or track them - the user then
+                # got "not a tracked chat" from /nudge for a row the UI
+                # had just offered them.
+                if not _is_tracked_chat(getattr(ctx, 'id', '')):
+                    continue
                 info = _serialize_context(ctx)
                 contexts[info['id']] = info
         except Exception:

@@ -47,7 +47,7 @@
 <body>
   <div x-data class="shepherd-container">
     <template x-if="$store.chatShepherdStore">
-      <div x-init="$store.chatShepherdStore.onOpen()" x-destroy="$store.chatShepherdStore.cleanup()">
+      <div x-init="$store.chatShepherdStore.onOpen()">
         <div class="shepherd-header">
           <h2>🐑 Chat Shepherd</h2>
           <button class="refresh-btn" @click="$store.chatShepherdStore.fetchStatus()">Refresh</button>
