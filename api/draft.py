@@ -44,6 +44,32 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+async def _restore_claimed_draft(claim: dict) -> None:
+    # v1.20.7: put a claimed draft back after a failed send so the review
+    # item is not lost. Best-effort: a failed restore leaves the send
+    # error response as the operator's signal to re-check the dashboard.
+    claimed = claim.get('draft')
+    if not isinstance(claimed, dict):
+        return
+
+    def _restore(st: dict) -> dict:
+        drafts = st.get('drafts')
+        if not isinstance(drafts, list):
+            drafts = []
+            st['drafts'] = drafts
+        if not any(
+            isinstance(d, dict) and d.get('id') == claimed.get('id')
+            for d in drafts
+        ):
+            drafts.append(claimed)
+        return {'success': True}
+
+    try:
+        await asyncio.to_thread(state_mod.state_transaction_apply, _restore)
+    except Exception:
+        pass
+
+
 class Draft(ApiHandler):
     async def process(self, input: dict, request: Request) -> dict | Response:
         body = input if isinstance(input, dict) else {}
@@ -97,28 +123,59 @@ class Draft(ApiHandler):
             return await asyncio.to_thread(state_mod.state_transaction_apply, _apply)
 
         # action == 'send': validate + communicate OUTSIDE the lock.
-        text = edited_text or str(draft.get('text') or '').strip()
-        if not text:
-            return {'success': False, 'error': 'draft text is empty'}
-
+        # v1.20.7: CLAIM the draft in its own transaction BEFORE communicating.
+        # The old code communicated first and only re-verified inside the
+        # bookkeeping transaction below - which it never actually did (only
+        # dismiss had the found check), so two racing sends (double-click /
+        # two tabs) both passed the lock-free peek, both delivered the message
+        # to the agent, and both bumped nudge_count/nudges_sent and journaled
+        # draft_sent. The claim is atomic under the state lock, so the second
+        # racer is rejected before it ever communicates.
         try:
             from agent import UserMessage
         except Exception as e:
             return {'success': False, 'error': f'Import error: {e}'}
 
+        def _claim(st: dict) -> dict:
+            claimed = next(
+                (d for d in st.get('drafts', [])
+                 if isinstance(d, dict) and d.get('id') == draft_id),
+                None,
+            )
+            if claimed is None:
+                return {'success': False, 'error': f'Draft {draft_id} not found'}
+            remove_draft(st, draft_id)
+            return {'success': True, 'draft': claimed}
+
+        claim = await asyncio.to_thread(state_mod.state_transaction_apply, _claim)
+        if not claim.get('success'):
+            return {'success': False, 'error': claim.get('error', 'Draft not found')}
+        # Prefer the claimed snapshot's text (the peek is stale by definition).
+        text = edited_text or str((claim.get('draft') or {}).get('text') or '').strip()
+        if not text:
+            return {'success': False, 'error': 'draft text is empty'}
+
         try:
             ctx = _get_context(chat_id)
         except Exception as e:
+            await _restore_claimed_draft(claim)
             return {'success': False, 'error': f'Context lookup failed: {e}'}
         if ctx is None:
+            await _restore_claimed_draft(claim)
             return {'success': False, 'error': f'Context {chat_id} not found'}
 
         try:
             ctx.communicate(UserMessage(message=text))
         except Exception as e:
+            # Restore the claimed draft: a transient send failure must not
+            # silently destroy the queued review item.
+            await _restore_claimed_draft(claim)
             return {'success': False, 'error': f'Send failed: {e}'}
 
         def _apply(st: dict) -> dict:
+            # The draft was already claimed/removed by _claim; this transaction
+            # is bookkeeping only (remove_draft below stays as an idempotent
+            # safety net).
             entry = get_chat(st, chat_id)
             now_iso = _now_iso()
             new_count = entry.get('nudge_count', 0) + 1

@@ -98,10 +98,15 @@ def _rollback(mod, snap: dict) -> None:
 
 def _preserve_locks(mod, snap: dict) -> None:
     # reload re-creates module-level locks; rebind the pre-reload objects
-    # so old and new function refs keep sharing one lock
+    # so old and new function refs keep sharing one lock.
+    # v1.20.7: plain threading.Lock instances are preserved too — the old
+    # isinstance check matched RLock only, so state._sig_lock (the
+    # v1.20.0 save-baseline lock) silently changed identity on every
+    # reload, briefly splitting baseline bookkeeping between two locks.
     rlock = type(threading.RLock())
+    lock = type(threading.Lock())
     for k, v in snap.items():
-        if 'lock' in k.lower() and isinstance(v, rlock):
+        if 'lock' in k.lower() and isinstance(v, (rlock, lock)):
             try:
                 setattr(mod, k, v)
             except Exception:

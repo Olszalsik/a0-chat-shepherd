@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.20.6 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-27 config no longer pins defaults (→ v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
+**Version:** 1.20.7 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
 
 ## Purpose
 
@@ -68,10 +68,10 @@ them, not here. Do not re-file them.
 
 ## Release readiness (v1.20.5)
 
-**What is verified.** 109 backend markers, 26 shared-store and 23 sidebar
-assertions, all green on Windows off-Docker; `node --check` and `py_compile`
-clean; the core sidebar contract tests pass; `config.json` fully merged 33/33
-against `KNOWN_KEYS`. Seven deliberate mutations (disabling the v1.20.4 guard,
+**What is verified.** 122 backend markers (112 + the 10 TEST44 audit-fix
+regressions), 26 shared-store and 23 sidebar assertions; `node --check` and
+`py_compile` clean; the core sidebar contract tests pass; `config.json`
+holds only explicitly-set values (v1.20.6). Seven deliberate mutations (disabling the v1.20.4 guard,
 retrying without `force`, restoring `status='nudged'`, removing the confirm
 branch, restoring the v1.20.5 silent key-drop, returning either `/config`
 branch to an inline read, and reusing export's 200-entry mirror) each fail the
@@ -269,6 +269,76 @@ User report after updating Agent Zero: chat status icons were missing from the r
 - **Idempotence**: `shepherd-sidebar.js` is a classic script inside the `sidebar-chats-list-start` HTML extension, and the component loader re-clones and re-executes it on every extension (re)load. A `window.__chatShepherdSidebar` guard now makes repeat loads a no-op that only calls `refresh()`, so the poll interval and MutationObserver can no longer stack.
 - **Robustness**: `injectBadges` reschedules instead of silently dropping a re-entrant pass and swallows per-run DOM errors so a transient row shape cannot kill the poll loop; `pointer-events: none` keeps the row fully clickable; `role="img"` + `aria-label` added.
 - **Tests**: new `tests/suite_sidebar.mjs` — a dependency-free DOM harness (no jsdom in this repo) that runs the real injector against the four row shapes Agent Zero actually renders, plus placement, repaint, idle/blank-icon clearing, observer anchoring, and repeat-load idempotence. 22 assertions, `node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs` green. `node --check` green on both plugin scripts; the Python suite still reports ALL_TESTS_PASSED.
+### v1.20.7 — independent audit fixes: 10 findings (2026-09-28)
+
+An off-DOX bug hunt (fresh reviewer, source-only) confirmed 10 real defects;
+all are small and all are fixed here. No roadmap item was needed.
+
+1. **Draft double-send race** (`api/draft.py`): two concurrent `send` calls
+   for one draft id both passed the "find draft → remove → communicate"
+   sequence on separate snapshots and the message was delivered twice. Send
+   now CLAIMS the draft first in a single `state_transaction_apply`
+   (find + `remove_draft` + return the claimed copy atomically); the second
+   caller is rejected `not found` before any communicate. A failed send
+   restores the claimed draft (best-effort transaction).
+2. **Non-dict bodies crashed three endpoints** (`api/nudge.py`,
+   `api/resolve.py`, `api/test_notify.py`): the framework passes the raw
+   parsed JSON through, so a JSON array/string/number body raised
+   `AttributeError` on `.get` → raw 500. All four write endpoints (incl.
+   `/config`, guarded in v1.20.5) now coerce non-dict bodies to `{}` first.
+3. **`/config` reported garbage as updated** (`api/config.py`):
+   `updated: sorted(readable)` listed keys whose values had FAILED coercion
+   (coerce_int falls back to the current value), so a "successful" save with
+   `poll_seconds: "abc"` reported the key as updated while persisting
+   nothing. The reply now diffs pre/post values and lists only keys that
+   actually changed.
+4. **Restart-resume burst starved the stalled queue** (`helpers/monitor.py`
+   tick): the resume drain runs first and increments `nudges_this_tick`, and
+   the stalled queue broke on that same counter — with
+   `max_nudges_per_tick: 1`, a restart burst (resume budget ≥ 3) left every
+   queued stalled chat unnudged for the tick and the dashboard showed a
+   false "capped". The stalled queue now has its OWN counter
+   (`stall_drained`); resume, stall, and wedge budgets are independent.
+5. **`_post_json` followed redirects** (`helpers/monitor.py`): webhook
+   delivery passed no `allow_redirects`, so a 307/308 could bounce a POST
+   onto a host the SSRF guard had already rejected. `allow_redirects=False`.
+6. **Rejected webhook URLs leaked into the debug log**
+   (`helpers/monitor.py` `_external_jobs`): the `webhook_skip` path logged
+   `repr(e)` of the SSRF validation error, which embeds the full URL
+   (querystring token included), defeating `_redact_text` at every other
+   site. The skip line is now redacted.
+7. **Timing knobs crashed the tick on hand-edited config**
+   (`helpers/monitor.py`): `classify_chat` and the tick header coerced
+   `stall_minutes`, `nudge_cooldown_minutes`, `max_auto_nudges`,
+   `max_nudges_per_tick`, `wedge_*` etc. with bare `int(...)`/`float(...)` —
+   a hand-edited `null`/string config.json raised inside the per-chat guard
+   and dropped that chat's supervision for the tick. All converted through
+   new `_as_float` (and the existing `_as_int`).
+8. **`/status` aggregates read a 200-entry mirror** (`api/status.py`):
+   `aggregates.compute(state['history'])` covered only the
+   `JOURNAL_READ_LIMIT` mirror `load_state` fills, so the advertised 7-day
+   window undercounted on a busy instance. Now `read_journal(JOURNAL_KEEP)`
+   — the full journal, mtime/size-cached, same source `api/export.py` uses.
+9. **Hot-reload dropped plain Locks** (`helpers/hotreload.py`
+   `_preserve_locks`): the isinstance check matched `_type(RLock)` only, so
+   `state._sig_lock` (a plain `Lock`, the v1.20.0 save-baseline lock)
+   silently changed identity on every reload, briefly splitting baseline
+   bookkeeping across two locks. Both lock types are preserved now.
+10. **Sidebar body-fallback observer repainted page-wide**
+    (`webui/shepherd-sidebar.js`): until the chat root appeared, the
+    MutationObserver on `document.body` called `scheduleInject()` on every
+    page mutation while `observedEl` stayed `null`, so the poll's re-scope
+    check never fired and the page-wide querySelectorAll + Alpine probes ran
+    for the whole session. The fallback now only re-scopes; the poll picks
+    the repaint back up and re-scopes on its own.
+
+**Tests**: TEST44A–H (10 new markers, 122 total) — double-send claim +
+restore-on-failure, non-dict bodies on all three endpoints, `/config`
+`updated` truthfulness, the stall-budget/resume-budget split, the
+redirect refusal (structural, TEST34-style), webhook-skip redaction, and
+plain-Lock preservation. `ALL_TESTS_PASSED` in the container;
+`suite_store.mjs` 26 + `suite_sidebar.mjs` 23 unchanged and green.
+
 ### v1.20.6 — config.json records only what the operator set (2026-09-27)
 
 Closes the forward-compatibility item deliberately deferred in v1.20.5, at the

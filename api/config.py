@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import datetime, timezone
 from typing import Any
 
@@ -90,7 +91,15 @@ class Config(ApiHandler):
         # v1.20.5: offloaded - get_plugin_config can touch disk, and this is a
         # request handler on the event loop (v1.18.1 contract).
         current = await asyncio.to_thread(_read_disk)
+        # v1.20.7: snapshot the pre-save values (deep-copied: apply_overrides
+        # mutates nested dicts like icons in place) so `updated` reports what
+        # ACTUALLY changed. coerce_int falls back to the current value when a
+        # raw value fails coercion, so the old `updated: sorted(readable)`
+        # answered a garbage value ("abc" for poll_seconds) as a successful
+        # update; now such keys simply don't appear in `updated`.
+        before = {k: copy.deepcopy(current.get(k)) for k in readable}
         current = apply_overrides(current, readable)
+        changed = sorted(k for k in readable if current.get(k) != before.get(k))
         # v1.20.6: write only the values the operator actually set. Persisting
         # the merged 33-key view pinned every shipped default into the file, so
         # a later release's new defaults could never reach this install.
@@ -112,7 +121,7 @@ class Config(ApiHandler):
         result = {
             "ok": True,
             "success": True,
-            "updated": sorted(readable.keys()),
+            "updated": changed,
             "config": await asyncio.to_thread(_read_disk),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }

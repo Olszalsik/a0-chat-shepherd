@@ -307,15 +307,19 @@
       obs = new MutationObserver(scheduleInject);
       obs.observe(target, { childList: true, subtree: true });
     } else {
-      // Temporary body fallback: its only job is to notice the sidebar
-      // appearing, then re-scope.
+      // Temporary body fallback: its ONLY job is to notice the sidebar
+      // appearing, then re-scope. v1.20.7: it no longer repaints on every
+      // page mutation (the 2.5 s poll already repaints) — on a busy page
+      // the old debounced scheduleInject per mutation ran querySelectorAll
+      // + Alpine scope probes page-wide for the whole session, because
+      // observedEl stayed null and the poll's re-scope check never fired.
       obs = new MutationObserver(function () {
         if (findChatRoot()) {
           attachObserver();
           return;
         }
-        scheduleInject();
       });
+      observedEl = document.body;
       obs.observe(document.body, { childList: true, subtree: true });
     }
     scheduleInject();
@@ -332,6 +336,9 @@
     if (s && s.data) scheduleInject();
     // A sidebar re-render replaced the observed root -> re-scope the observer.
     if (observedEl && !document.contains(observedEl)) attachObserver();
+    // v1.20.7: still on the body fallback (no chat root yet) — re-scope as
+    // soon as one appears, even without a fallback observer callback.
+    if (observedEl === document.body && findChatRoot()) attachObserver();
   }, POLL_MS);
 
   if (document.readyState === "loading") {

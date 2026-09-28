@@ -80,10 +80,14 @@ def _as_bool(val: Any) -> bool:
 
 class Nudge(ApiHandler):
     async def process(self, input: dict, request: Request) -> dict | Response:
-        chat_id = (input.get('chat_id') or '').strip()
-        text = (input.get('text') or '').strip() or None
+        # v1.20.7: the framework passes the raw JSON body through, so a
+        # non-dict body (list / string / number) raised AttributeError → raw
+        # 500. Same guard api/draft.py already applies.
+        body = input if isinstance(input, dict) else {}
+        chat_id = (body.get('chat_id') or '').strip()
+        text = (body.get('text') or '').strip() or None
         # v1.20.4: an explicit operator override of the fatal-stop guard.
-        force = _as_bool(input.get('force'))
+        force = _as_bool(body.get('force'))
 
         if not chat_id:
             return {'success': False, 'error': 'chat_id is required'}

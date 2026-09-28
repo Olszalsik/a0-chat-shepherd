@@ -13,8 +13,11 @@ from datetime import datetime, timezone
 
 class Resolve(ApiHandler):
     async def process(self, input: dict, request: Request) -> dict | Response:
-        chat_id = (input.get('chat_id') or '').strip()
-        action = (input.get('action') or 'resolve').strip()
+        # v1.20.7: non-dict bodies (list / string / number) reached .get and
+        # raised AttributeError → raw 500. Same guard api/draft.py applies.
+        body = input if isinstance(input, dict) else {}
+        chat_id = (body.get('chat_id') or '').strip()
+        action = (body.get('action') or 'resolve').strip()
 
         if not chat_id:
             return {'success': False, 'error': 'chat_id is required'}

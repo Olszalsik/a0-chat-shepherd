@@ -34,7 +34,10 @@ class TestNotify(ApiHandler):
     # the same failure logging as the real path - instead of when a real
     # intervention pages.
     async def process(self, input: dict, request: Request) -> dict | Response:
-        channel = str((input or {}).get('channel') or 'all').strip().lower()
+        # v1.20.7: a truthy non-dict body (list / string) passed the old
+        # `(input or {})` and still raised AttributeError on .get → raw 500.
+        body = input if isinstance(input, dict) else {}
+        channel = str(body.get('channel') or 'all').strip().lower()
         if channel not in ('framework', 'webhook', 'telegram', 'all'):
             return {'success': False, 'error': f'Unknown channel: {channel}'}
 

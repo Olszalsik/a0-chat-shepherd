@@ -6,8 +6,9 @@ from typing import Any
 
 from helpers.api import ApiHandler, Request, Response
 
-from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN
+from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN, JOURNAL_KEEP
 from usr.plugins.chat_shepherd.helpers.state import load_state
+from usr.plugins.chat_shepherd.helpers import state as state_mod
 from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers import hotreload
 from usr.plugins.chat_shepherd.helpers import adaptive
@@ -221,9 +222,17 @@ class Status(ApiHandler):
          }
         except Exception:
          pass
-        # R4: dashboard aggregates (pure journal-tail math, no extra I/O).
+        # R4: dashboard aggregates. v1.20.7: computed from the journal read
+        # directly, NOT from state['history'] — load_state() fills that
+        # mirror with JOURNAL_READ_LIMIT (200) entries, so on a busy instance
+        # the advertised 7-day window covered only a few hours and silently
+        # undercounted every metric. read_journal is (mtime,size)-keyed
+        # cached, so this costs no extra parse; JOURNAL_KEEP is the full
+        # journal (the same limit api/export.py uses).
         try:
-            aggregates_block = aggregates.compute(state.get('history'))
+            aggregates_block = aggregates.compute(
+                state_mod.read_journal(JOURNAL_KEEP)
+            )
         except Exception:
             aggregates_block = None
         counts: dict[str, int] = {}

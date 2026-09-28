@@ -2581,6 +2581,162 @@ def main():
             _cfg42._read_disk = _orig_rd42
         print('TEST42_SAVE_WRITES_ONLY_EXPLICIT_OK')
 
+        # ============ TEST 44: audit-fix regressions (v1.20.7) ============
+        # Covers the 2026-09-28 independent bug-hunt fixes: the draft
+        # double-send race, non-dict API bodies, /config reporting garbage as
+        # "updated", the resume burst eating the stall queue's budget, the
+        # webhook SSRF redirect hole + URL redaction, and hotreload lock
+        # preservation for plain Locks.
+        from usr.plugins.chat_shepherd.api import (
+            config as _cf44,
+            draft as _dr44,
+            nudge as _nu44,
+            resolve as _re44,
+            test_notify as _tn44,
+        )
+        from usr.plugins.chat_shepherd.helpers import hotreload as _hr44
+        # --- 44a: a second send of the same draft is rejected BEFORE it
+        # communicates (the old code delivered the message twice) ---
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 0, 'last_nudge_at': ''},
+        })
+        st44 = state_mod.load_state()
+        assert state_mod.add_draft(st44, FAKE_CHAT_A, 'stall_nudge', reason='unit stall 44')
+        did44 = st44['drafts'][0]['id']
+        state_mod.save_state(st44)
+        ctx44 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=5)
+        _orig_ctx44 = _dr44._get_context
+        try:
+            _dr44._get_context = lambda cid: ctx44
+            _h44 = _CSDraft17(None, None)
+            _r44a = _aio17.run(_h44.process({'draft_id': did44, 'action': 'send', 'text': 'once only'}, None))
+            assert _r44a.get('success') is True, _r44a
+            _r44b = _aio17.run(_h44.process({'draft_id': did44, 'action': 'send'}, None))
+            assert _r44b.get('success') is False, _r44b
+            assert len(ctx44.communicated) == 1, ctx44.communicated
+            st44b = read_state()
+            assert st44b.get('drafts', []) == [], st44b.get('drafts')
+            _rows44 = [h for h in st44b.get('history', []) if h.get('action') == 'draft_sent']
+            assert len(_rows44) == 1, _rows44
+            print('TEST44A_DRAFT_CLAIM_BLOCKS_DOUBLE_SEND_OK')
+            # --- 44b: a failed send restores the claimed draft ---
+            st44c = state_mod.load_state()
+            assert state_mod.add_draft(st44c, FAKE_CHAT_A, 'restart_resume', reason='boom 44')
+            did44c = st44c['drafts'][0]['id']
+            state_mod.save_state(st44c)
+            boom44 = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=5)
+
+            def _boom44(msg):
+                raise RuntimeError('cs_send_fail_probe')
+
+            boom44.communicate = _boom44
+            _dr44._get_context = lambda cid: boom44
+            _r44c = _aio17.run(_h44.process({'draft_id': did44c, 'action': 'send'}, None))
+            assert _r44c.get('success') is False, _r44c
+            st44d = read_state()
+            _back44 = [d for d in st44d.get('drafts', []) if d.get('id') == did44c]
+            assert len(_back44) == 1, st44d.get('drafts')
+            print('TEST44B_DRAFT_RESTORED_ON_SEND_FAILURE_OK')
+        finally:
+            _dr44._get_context = _orig_ctx44
+        # --- 44c: non-dict JSON bodies answer an error, never a raw 500 ---
+        for _body44 in ([1, 2], 'nope', 5):
+            _rn44 = _aio17.run(_nu44.Nudge(None, None).process(_body44, None))
+            assert isinstance(_rn44, dict) and _rn44.get('success') is False, _rn44
+            _rr44 = _aio17.run(_re44.Resolve(None, None).process(_body44, None))
+            assert isinstance(_rr44, dict) and _rr44.get('success') is False, _rr44
+            _rt44 = _aio17.run(_tn44.TestNotify(None, None).process(_body44, None))
+            assert isinstance(_rt44, dict), _rt44
+        print('TEST44C_NON_DICT_BODIES_GUARDED_OK')
+        # --- 44d: /config does not report a garbage value as updated ---
+        _disk44 = {'stall_minutes': 9}
+        _orig_h44 = _cf44.plugins_helper
+        _orig_rd44 = _cf44._read_disk
+
+        def _helper44():
+            return type('H44', (), {
+                'get_plugin_config': staticmethod(
+                    lambda name: _cd42.deep_merge_defaults(_disk44)),
+                'save_plugin_config': staticmethod(lambda n, p, a, s: s),
+                'clear_plugin_cache': staticmethod(lambda names: None),
+            })()
+
+        try:
+            _cf44.plugins_helper = _helper44()
+            _cf44._read_disk = lambda: _cd42.deep_merge_defaults(_disk44)
+            _run44 = lambda b: _aio17.run(_cf44.Config(None, None).process(b, None))
+            _r44e = _run44({'poll_seconds': 'garbage'})
+            assert _r44e.get('success') is True, _r44e
+            assert _r44e.get('updated') == [], _r44e
+            _r44f = _run44({'max_auto_nudges': 5})
+            assert _r44f.get('updated') == ['max_auto_nudges'], _r44f
+        finally:
+            _cf44.plugins_helper = _orig_h44
+            _cf44._read_disk = _orig_rd44
+        print('TEST44D_CONFIG_UPDATED_REPORTS_CHANGES_OK')
+        # --- 44e: a restart-resume burst does not eat the stall budget ---
+        # B's persisted status must sit OUTSIDE the restart-resume set
+        # (running/stalled/nudged/intervention) or B joins the resume
+        # queue; 'idle' plus a 40-minute-old last_message routes it through
+        # classify into the stalled queue. B's log tail must be a
+        # non-response entry ('response' would classify as awaiting_user).
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'running', 'nudge_count': 0, 'last_nudge_at': ''},
+            FAKE_CHAT_B: {'status': 'idle', 'nudge_count': 0,
+                          'last_nudge_at': (datetime.now(timezone.utc) - timedelta(minutes=40)).isoformat()},
+        })
+        ctxA44 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=20, running=False)
+        ctxB44 = FakeCtx(FAKE_CHAT_B, ['user', 'tool'], idle_minutes=40, running=False)
+        FakeAgentContext._all = [ctxA44, ctxB44]
+        try:
+            _s44 = monitor.tick(dict(cfg, max_nudges_per_tick=1))
+            assert _s44.get('resumed') == 1, _s44
+            assert _s44.get('nudged') == 1, _s44
+            assert len(ctxA44.communicated) == 1, ctxA44.communicated
+            # pre-fix this was 0: the resume burst consumed the stalled
+            # queue's whole per-tick budget and the dashboard showed "capped".
+            assert len(ctxB44.communicated) == 1, (_s44, ctxB44.communicated)
+            _th44 = read_state().get('throttle', {})
+            assert _th44.get('stalled_nudged') == 1, _th44
+            assert _th44.get('capped') is False, _th44
+        finally:
+            FakeAgentContext._all = []
+        print('TEST44E_STALL_BUDGET_INDEPENDENT_OF_RESUME_OK')
+        # --- 44f: _post_json refuses redirects (SSRF re-validation gap) ---
+        import inspect as _insp44
+        _src44 = _insp44.getsource(monitor._post_json)
+        assert 'allow_redirects=False' in _src44, _src44
+        print('TEST44F_POST_JSON_NO_REDIRECTS_OK')
+        # --- 44g: a rejected webhook URL never lands in the debug log ---
+        _cfg44g = {'webhook_url': 'http://127.0.0.1/hook?token=CSREDACT44',
+                   'webhook_allow_private': False}
+        assert monitor._external_jobs(_cfg44g, 'info', 'probe') == []
+        _dbg44 = files.get_abs_path('usr/plugins/chat_shepherd/data/debug-' +
+                                    datetime.now(timezone.utc).strftime('%Y-%m-%d') + '.log')
+        _tail44 = ''
+        try:
+            with open(_dbg44, 'r', encoding='utf-8') as f:
+                _tail44 = f.read()
+        except Exception:
+            pass
+        assert 'CSREDACT44' not in _tail44, 'webhook URL leaked into the debug log'
+        assert 'webhook_skip' in _tail44, 'webhook_skip was not logged at all'
+        print('TEST44G_WEBHOOK_SKIP_REDACTED_OK')
+        # --- 44h: hotreload preserves plain Locks too (state._sig_lock) ---
+        _m44h = types.ModuleType('cs_lock_test_44')
+        _m44h._rlock44 = threading.RLock()
+        _m44h._sig_lock44 = threading.Lock()
+        _orig44h = {'r': _m44h._rlock44, 's': _m44h._sig_lock44}
+        _snap44h = dict(vars(_m44h))
+        _m44h._rlock44 = threading.RLock()
+        _m44h._sig_lock44 = threading.Lock()
+        _hr44._preserve_locks(_m44h, _snap44h)
+        assert _m44h._rlock44 is _orig44h['r'], 'RLock identity not preserved'
+        assert _m44h._sig_lock44 is _orig44h['s'], (
+            'plain Lock identity not preserved (the v1.20.7 _sig_lock bug)')
+        print('TEST44H_LOCK_PRESERVATION_COVERS_PLAIN_LOCK_OK')
+        print('TEST44_AUDIT_FIXES_OK')
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file

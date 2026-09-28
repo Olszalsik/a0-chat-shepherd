@@ -72,6 +72,22 @@ def _parse_dt(value: Any) -> datetime | None:
     return dt
 
 
+def _as_float(val: Any, fallback: float) -> float:
+    # v1.20.7 companion to _as_int for the timing knobs: monitor._load_config()
+    # merges defaults but does NOT type-coerce (the sanitizer lives in the save
+    # paths only), so a hand-edited config.json carrying e.g.
+    # "nudge_cooldown_minutes": null raised float(None) at the top of
+    # _tick_impl — outside the per-chat guard — and took down the WHOLE tick
+    # every iteration (the extension only logged tick_fail to the debug log).
+    # A bad value degrades to the shipped default instead.
+    if isinstance(val, bool):
+        val = int(val)
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _minutes_since(dt: datetime | None) -> float:
     if dt is None:
         return 9999.0
@@ -468,8 +484,13 @@ def _redact_text(text: Any, *secrets: str) -> str:
 def _post_json(url: str, payload: dict, timeout: float = 5.0) -> bool:
     # R3: minimal JSON POST for external alert channels. Returns
     # True on 2xx; kept separate so tests can monkeypatch it.
+    # v1.20.7: redirects are refused. requests follows 3xx by default, and a
+    # 307/308 preserves the POST body — a public webhook URL that redirects to
+    # a private/link-local target would silently bypass the
+    # validate_public_http_url SSRF guard (which only ever saw the original
+    # URL). Legitimate webhook receivers answer in place; a 3xx is an error.
     import requests
-    resp = requests.post(url, json=payload, timeout=timeout)
+    resp = requests.post(url, json=payload, timeout=timeout, allow_redirects=False)
     return 200 <= resp.status_code < 300
 
 
@@ -486,7 +507,11 @@ def _external_jobs(cfg: dict, kind: str, message: str, priority: str = 'normal')
             from helpers.network import validate_public_http_url
             validate_public_http_url(webhook_url)
         except Exception as e:
-            _debug_log('webhook_skip', 'URL rejected: ' + repr(e) + ' :: ' + webhook_url)
+            # v1.20.7: redact the URL. Webhook URLs routinely embed
+            # credentials in the query string, and validation errors may quote
+            # the URL back - the v1.20.0 redaction contract applies here too
+            # (only _post_jobs followed it before).
+            _debug_log('webhook_skip', 'URL rejected: ' + _redact_text(repr(e), webhook_url))
             webhook_url = ''
     if webhook_url:
         jobs.append((
@@ -720,7 +745,10 @@ def classify_chat(
         # plain attribute write that drains at the agent's next safe point),
         # the same mechanics that make a manual "continue" unwedge these
         # chats. tick() runs the v1.2.0 remediation ladder on them.
-        stall_minutes = float(cfg.get('stall_minutes', 5))
+        # v1.20.7: _as_float — a hand-edited non-numeric stall_minutes used to
+        # raise inside classify_chat (per-chat guard caught it, but the chat
+        # then fell through unsupervised for the tick).
+        stall_minutes = _as_float(cfg.get('stall_minutes', 5), 5.0)
         if frozen_minutes >= stall_minutes:
             reason = (
                 f'Agent appears wedged: running but log frozen for {frozen_minutes:.0f}m'
@@ -778,7 +806,7 @@ def classify_chat(
     if last_log_type == 'response':
         return STATUS_AWAITING_USER, 'Agent finished response, waiting for user'
 
-    stall_minutes = float(cfg.get('stall_minutes', 5))
+    stall_minutes = _as_float(cfg.get('stall_minutes', 5), 5.0)
     nudge_count = _as_int(prev_entry.get('nudge_count', 0))
     max_nudges = _as_int(cfg.get('max_auto_nudges', 3), 3)
 
@@ -882,14 +910,14 @@ def _goal_gate_check(
     # True when a nudge was sent.
     if not bool(cfg.get('goal_gate_enabled', True)):
         return False
-    max_nudges = max(0, min(10, int(cfg.get(
+    max_nudges = max(0, min(10, _as_int(cfg.get(
         'goal_gate_max_nudges', GOAL_GATE_MAX_NUDGES
-    ))))
+    ), GOAL_GATE_MAX_NUDGES)))
     if max_nudges <= 0:
         return False
-    cooldown = float(cfg.get(
+    cooldown = _as_float(cfg.get(
         'goal_gate_cooldown_minutes', GOAL_GATE_COOLDOWN_MIN
-    ))
+    ), float(GOAL_GATE_COOLDOWN_MIN))
     goal = _active_goal(chat_id)
     if not goal:
         return False
@@ -973,29 +1001,35 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     state['last_tick'] = datetime.now(timezone.utc).isoformat()
 
-    nudge_cooldown = float(cfg.get('nudge_cooldown_minutes', 10))
-    max_nudges = int(cfg.get('max_auto_nudges', 3))
+    # v1.20.7: these conversions run OUTSIDE the per-chat try (they feed the
+    # whole tick), so they go through the never-raising _as_int/_as_float
+    # coercers. The save paths sanitize, but monitor._load_config() only
+    # deep-merges defaults - a hand-edited config.json with a null/string
+    # timing knob used to raise float(None) here and silently kill every
+    # tick (the extension only logged tick_fail to the debug log).
+    nudge_cooldown = _as_float(cfg.get('nudge_cooldown_minutes', 10), 10.0)
+    max_nudges = max(0, _as_int(cfg.get('max_auto_nudges', 3), 3))
     notify_on_intervention = bool(cfg.get('notify_on_intervention', True))
     # v1.7.0 quiet bell: persistence-gated intervention paging.
-    notify_after = float(cfg.get('notify_after_minutes', NOTIFY_AFTER_MIN))
-    notify_rearm = float(cfg.get('notify_rearm_minutes', NOTIFY_REARM_MIN))
+    notify_after = _as_float(cfg.get('notify_after_minutes', NOTIFY_AFTER_MIN), float(NOTIFY_AFTER_MIN))
+    notify_rearm = _as_float(cfg.get('notify_rearm_minutes', NOTIFY_REARM_MIN), float(NOTIFY_REARM_MIN))
     notify_on_resume = bool(cfg.get('notify_on_resume', False))
     supervised = bool(cfg.get('supervised_mode', False))
     # v1.8.0 goal completion gate (thresholds read inside the check).
     goal_gate_enabled = bool(cfg.get('goal_gate_enabled', True))
     # P2: global burst throttle — at most this many auto-nudges per tick,
     # oldest stall first. 0 disables auto-nudging entirely.
-    max_nudges_per_tick = max(0, min(10, int(cfg.get('max_nudges_per_tick', 1))))
+    max_nudges_per_tick = max(0, min(10, _as_int(cfg.get('max_nudges_per_tick', 1), 1)))
 
     # v1.2.0 wedge remediation ladder. wedge_max_remediations 0 disables
     # wedge auto-remediation entirely (chats stay intervention-only).
-    wedge_nudge_after = float(cfg.get('wedge_nudge_after_minutes', WEDGE_NUDGE_AFTER_MIN))
-    wedge_max_remediations = max(0, min(5, int(cfg.get(
+    wedge_nudge_after = _as_float(cfg.get('wedge_nudge_after_minutes', WEDGE_NUDGE_AFTER_MIN), float(WEDGE_NUDGE_AFTER_MIN))
+    wedge_max_remediations = max(0, min(5, _as_int(cfg.get(
         'wedge_max_remediations', WEDGE_MAX_REMEDIATIONS
-    ))))
-    wedge_cooldown = float(cfg.get(
+    ), WEDGE_MAX_REMEDIATIONS)))
+    wedge_cooldown = _as_float(cfg.get(
         'wedge_remediation_cooldown_minutes', WEDGE_REMEDIATION_COOLDOWN_MIN
-    ))
+    ), float(WEDGE_REMEDIATION_COOLDOWN_MIN))
     wedge_soft_restart = bool(cfg.get('wedge_soft_restart', False))
     # v1.10.0 liveness probe: classify wedges as hung (classic) vs
     # spinning dead loop via the log mutation counter. Off = legacy.
@@ -1336,12 +1370,20 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
 
     pre_drain_nudged = summary['nudged']
     nudge_queue_len = len(nudge_queue)
+    # v1.20.7: the stalled queue gets its OWN budget counter. It used to break
+    # on summary['nudges_this_tick'], which the restart-resume drain above
+    # also increments - a restart burst (resume budget >= 3) therefore
+    # consumed the stalled queue's whole per-tick budget (with
+    # max_nudges_per_tick: 1, three resume nudges left every queued stalled
+    # chat unnudged for that tick and the dashboard showed a false "capped").
+    # The wedge drain was already independent (its own counters below).
+    stall_drained = 0
     if nudge_queue and (supervised or max_nudges_per_tick > 0):
         nudge_queue.sort(key=lambda item: item[0], reverse=True)
         for minutes_idle, chat_id, ctx, entry, now_iso in nudge_queue:
             if (
                 not supervised
-                and summary['nudges_this_tick'] >= max_nudges_per_tick
+                and stall_drained >= max_nudges_per_tick
             ):
                 break
             if supervised:
@@ -1363,6 +1405,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 )
                 summary['nudged'] += 1
                 summary['nudges_this_tick'] += 1
+                stall_drained += 1
                 state_mod.append_history(state, {
                     'chat_id': chat_id,
                     'action': 'auto_nudge',
@@ -1533,7 +1576,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
       and (
        max_nudges_per_tick <= 0
        or (
-        summary['nudges_this_tick'] >= max_nudges_per_tick
+        stall_drained >= max_nudges_per_tick
         and nudge_queue_len > _stalled_delivered
        )
       )
