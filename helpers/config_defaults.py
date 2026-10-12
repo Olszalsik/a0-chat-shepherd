@@ -12,6 +12,7 @@ from typing import Any
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "watch_all": True,
+    "diagnose_enabled": True,
     "stall_minutes": 5,
     "max_auto_nudges": 3,
     "max_nudges_per_tick": 1,
@@ -143,6 +144,8 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
         current["enabled"] = coerce_bool(readable["enabled"])
     if "watch_all" in readable:
         current["watch_all"] = coerce_bool(readable["watch_all"])
+    if "diagnose_enabled" in readable:
+        current["diagnose_enabled"] = coerce_bool(readable["diagnose_enabled"])
     if "intervention_after_failed_nudges" in readable:
         current["intervention_after_failed_nudges"] = coerce_bool(
             readable["intervention_after_failed_nudges"]

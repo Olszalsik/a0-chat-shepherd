@@ -1,5 +1,9 @@
 enabled: true
 watch_all: true
+# v1.22.0 (stage 1): failure-diagnosis gates. Off disables the wedged-
+# completion classifier (response logged but housekeeping never finished)
+# and the later cause-gated remediation — the 1.21.3 timing ladder runs on.
+diagnose_enabled: true
 stall_minutes: 5
 max_auto_nudges: 3
 max_nudges_per_tick: 1

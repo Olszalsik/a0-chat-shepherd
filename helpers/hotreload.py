@@ -31,6 +31,7 @@ _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_WATCH = [
     ('usr.plugins.chat_shepherd.helpers.config_defaults', 'helpers/config_defaults.py'),
     ('usr.plugins.chat_shepherd.helpers.constants', 'helpers/constants.py'),
+    ('usr.plugins.chat_shepherd.helpers.diagnose', 'helpers/diagnose.py'),
     ('usr.plugins.chat_shepherd.helpers.state', 'helpers/state.py'),
     ('usr.plugins.chat_shepherd.helpers.adaptive', 'helpers/adaptive.py'),
     ('usr.plugins.chat_shepherd.helpers.aggregates', 'helpers/aggregates.py'),

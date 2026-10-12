@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 from datetime import datetime, timedelta, timezone
 
@@ -4074,6 +4075,150 @@ def main():
         state_mod._last_loaded_sig = ''
         state_mod._state_sig_cache = None
         print('TEST45AA_IDENTITY_IS_CONTENT_NOT_STAT_OK')
+
+        # ============ TEST 46: wedged-completion detection (stage 1) ============
+        # Ported from chat_shepherd2's 2026-10-09 fix: a turn whose completion
+        # path died after logging the response leaves an in-flight housekeeping
+        # marker as the newest log entry forever; it used to classify as
+        # awaiting_user and planned nothing.
+        _t46 = time.time()
+        cfg46 = dict(cfg)
+        cfg46.update({
+            'wedge_max_remediations': 2,
+            'wedge_remediation_cooldown_minutes': 0,
+            'wedge_nudge_after_minutes': 0,
+            'wedge_soft_restart': False,
+            'notify_on_intervention': False,
+        })
+
+        # TEST46A: old in-flight marker -> wedged completion (intervention).
+        ctx46a = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=3)
+        ctx46a.log.logs.append(types.SimpleNamespace(
+            type='util', heading='Memorizing new information...',
+            content='', timestamp=_t46 - 7200))
+        st46a, r46a = monitor.classify_chat(ctx46a, FAKE_CHAT_A, cfg46, {}, 0.0)
+        assert st46a == constants.STATUS_INTERVENTION, (st46a, r46a)
+        assert r46a.startswith(monitor.HK_REASON_PREFIX), r46a
+        print('TEST46A_WEDGED_COMPLETION_CLASSIFIED_OK')
+
+        # TEST46B: a FRESH marker (< stall_minutes) is within grace.
+        ctx46b = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        ctx46b.log.logs.append(types.SimpleNamespace(
+            type='util', heading='Memorizing new information...',
+            content='', timestamp=_t46 - 30))
+        st46b, _r46b = monitor.classify_chat(ctx46b, FAKE_CHAT_A, cfg46, {}, 0.0)
+        assert st46b == constants.STATUS_AWAITING_USER, (st46b, _r46b)
+        print('TEST46B_FRESH_MARKER_WITHIN_GRACE_OK')
+
+        # TEST46C: a COMPLETED housekeeping result carries content -> awaiting.
+        ctx46c = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        ctx46c.log.logs.append(types.SimpleNamespace(
+            type='util', heading='Memorizing new information...',
+            content='12 memories stored', timestamp=_t46 - 3600))
+        st46c, _r46c = monitor.classify_chat(ctx46c, FAKE_CHAT_A, cfg46, {}, 0.0)
+        assert st46c == constants.STATUS_AWAITING_USER, (st46c, _r46c)
+        print('TEST46C_COMPLETED_HOUSEKEEPING_AWAITING_OK')
+
+        # TEST46D: benign terminal labels with empty content ("Memory recall
+        # timed out") must never count as in-flight markers (donor contract).
+        ctx46d = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        ctx46d.log.logs.append(types.SimpleNamespace(
+            type='util', heading='Memory recall timed out',
+            content='', timestamp=_t46 - 3600))
+        st46d, _r46d = monitor.classify_chat(ctx46d, FAKE_CHAT_A, cfg46, {}, 0.0)
+        assert st46d == constants.STATUS_AWAITING_USER, (st46d, _r46d)
+        print('TEST46D_BENIGN_TERMINAL_LABEL_OK')
+
+        # TEST46E: automation transparency - the plugin's own prefix is
+        # recognized so its nudges can never read as a human turn (the gate
+        # the later release/block work builds on).
+        assert monitor.diag_mod.is_automation_entry(types.SimpleNamespace(
+            type='user', content='[chat_shepherd] You stopped unexpectedly...'))
+        assert not monitor.diag_mod.is_automation_entry(types.SimpleNamespace(
+            type='user', content='[other plugin] hello'))
+        assert not monitor.diag_mod.is_automation_entry(types.SimpleNamespace(
+            type='user', content='please continue'))
+        print('TEST46E_AUTOMATION_TRANSPARENCY_OK')
+
+        # TEST46F: diagnose gate off -> the 1.21.3 behaviour (awaiting_user).
+        cfg46f = dict(cfg46)
+        cfg46f['diagnose_enabled'] = False
+        st46f, _r46f = monitor.classify_chat(ctx46a, FAKE_CHAT_A, cfg46f, {}, 0.0)
+        assert st46f == constants.STATUS_AWAITING_USER, (st46f, _r46f)
+        print('TEST46F_DIAGNOSE_GATE_OFF_OK')
+
+        # TEST46G: end-to-end - a wedged completion rides the wedge ladder
+        # (tier-1 auto-continue, never a task kill: the context is NOT
+        # running, there is no hung task to kill).
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {
+                'status': 'running',
+                'nudge_count': 0,
+                'wedge_nudge_count': 0,
+                'last_wedge_nudge_at': '',
+            },
+        })
+        ctx46g = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=3)
+        ctx46g.log.logs.append(types.SimpleNamespace(
+            type='util', heading='Memorizing successful solutions...',
+            content='', timestamp=_t46 - 7200))
+        FakeAgentContext._all = [ctx46g]
+        s46g = monitor.tick(cfg46)
+        assert ctx46g.communicated, 'wedged completion must be auto-continued'
+        assert ctx46g.nudge_calls == 0, 'no task kill for a dead-task wedge'
+        stg = read_state()
+        eg = stg['chats'][FAKE_CHAT_A]
+        assert eg.get('wedge_nudge_count') == 1, eg
+        actions46g = [h.get('action') for h in stg['history']]
+        assert 'wedge_auto_continue' in actions46g, actions46g
+        print('TEST46G_WEDGED_COMPLETION_LADDER_OK')
+
+        # TEST46G2: the kill guard - even with wedge_soft_restart ON, the
+        # FINAL attempt of a wedged-completion episode stays a Tier-1
+        # continue; ctx.nudge() is reserved for hung RUNNING tasks.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {
+                'status': 'intervention',
+                'nudge_count': 0,
+                'wedge_nudge_count': 1,
+                'last_wedge_nudge_at': '',
+                'housekeeping_wedge': 'old marker',
+            },
+        })
+        cfg46g2 = dict(cfg46)
+        cfg46g2['wedge_soft_restart'] = True
+        ctx46g2 = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=3)
+        ctx46g2.log.logs.append(types.SimpleNamespace(
+            type='util', heading='Memorizing new information...',
+            content='', timestamp=_t46 - 7200))
+        FakeAgentContext._all = [ctx46g2]
+        monitor.tick(cfg46g2)
+        assert ctx46g2.nudge_calls == 0, (
+            'wedged-completion final attempt must never kill (no hung task)'
+        )
+        assert ctx46g2.communicated, 'final attempt still continues the chat'
+        print('TEST46G2_NO_KILL_FOR_HOUSEKEEPING_WEDGE_OK')
+
+        # TEST46H: the subclass mark expires on recovery - a stale
+        # housekeeping_wedge must NOT exempt a later run-context freeze
+        # from the tier-2 kill.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {
+                'status': 'running',
+                'nudge_count': 0,
+                'wedge_nudge_count': 0,
+                'last_wedge_nudge_at': '',
+                'housekeeping_wedge': 'old marker',
+            },
+        })
+        ctx46h = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=1, running=True)
+        FakeAgentContext._all = [ctx46h]
+        st46h = monitor.tick(cfg46)
+        sth = read_state()['chats'][FAKE_CHAT_A]
+        assert 'housekeeping_wedge' not in sth, (
+            'stale subclass mark must expire on recovery'
+        )
+        print('TEST46H_SUBCLASS_MARK_EXPIRES_OK')
 
         print('TEST45_V121_AUDIT_FIXES_OK')
 

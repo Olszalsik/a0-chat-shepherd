@@ -43,6 +43,12 @@ from usr.plugins.chat_shepherd.helpers.constants import (
 )
 from usr.plugins.chat_shepherd.helpers import state as state_mod
 from usr.plugins.chat_shepherd.helpers import adaptive as adaptive_mod
+from usr.plugins.chat_shepherd.helpers import diagnose as diag_mod
+
+# v1.22.0 (stage 1, ported from chat_shepherd2's 2026-10-09 fix): the
+# wedged-completion reason classify_chat stamps, and the age parser for it.
+HK_REASON_PREFIX = 'Response logged, but housekeeping never completed'
+_HK_AGE = re.compile(r'%s \((\d+)m' % re.escape(HK_REASON_PREFIX))
 
 # The job loop ticks roughly every 60s; a last_tick gap far beyond one
 # tick interval means the server process (or at least the job loop) was
@@ -923,6 +929,23 @@ def classify_chat(
         return STATUS_IDLE, 'New chat, no messages yet'
 
     if last_log_type == 'response':
+        # v1.22.0 (stage 1, ported from chat_shepherd2's 2026-10-09 fix):
+        # a turn whose completion path died after logging the response leaves
+        # an in-flight housekeeping marker ("Memorizing new information...")
+        # as the newest log entry forever. Without this check the chat is
+        # indistinguishable from a healthy finished chat - both end in a
+        # response entry. A marker older than stall_minutes classifies as a
+        # wedged completion (intervention) and routes into the wedge ladder;
+        # a fresh marker is within grace and stays awaiting_user.
+        if bool(cfg.get('diagnose_enabled', True)):
+            hk_stall = _as_float(cfg.get('stall_minutes', 5), 5.0) * 60.0
+            hk_heading, hk_age = diag_mod.pending_housekeeping(
+                view if view is not None else _log_snapshot(context)
+            )
+            if hk_heading and hk_age >= hk_stall:
+                return STATUS_INTERVENTION, (
+                    f'{HK_REASON_PREFIX} ({hk_age / 60.0:.0f}m, marker: {hk_heading})'
+                )
         return STATUS_AWAITING_USER, 'Agent finished response, waiting for user'
 
     stall_minutes = _as_float(cfg.get('stall_minutes', 5), 5.0)
@@ -1410,6 +1433,34 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   ):
                       # Oldest freeze first; final ordering post-loop.
                       wedge_queue.append((frozen_minutes, chat_id, ctx, entry, now_iso))
+              elif reason.startswith(HK_REASON_PREFIX):
+                  # v1.22.0 (stage 1): a wedged completion - the response was
+                  # logged but the post-response housekeeping never finished,
+                  # so the context is NOT running and there is no hung task
+                  # to kill. Same tier-1 ladder, donor semantics: auto-
+                  # continue only (the drain is marked housekeeping_wedge and
+                  # its kill branch is skipped for these); the queue urgency
+                  # is the marker age parsed back out of the reason.
+                  summary['wedged'] += 1
+                  summary['housekeeping_wedged'] = (
+                      summary.get('housekeeping_wedged', 0) + 1
+                  )
+                  entry['housekeeping_wedge'] = reason
+                  wedge_count = _as_int(prev.get('wedge_nudge_count', 0))
+                  last_wedge_dt = _parse_dt(prev.get('last_wedge_nudge_at', ''))
+                  wedge_cooldown_ok = _minutes_since(last_wedge_dt) >= wedge_cooldown
+                  if (
+                      wedge_max_remediations > 0
+                      and wedge_count < wedge_max_remediations
+                      and wedge_cooldown_ok
+                      and not _term_cooldown_active
+                      and getattr(ctx, 'type', None) == AgentContextType.USER
+                  ):
+                      hk_age = _as_float(
+                          _HK_AGE.search(reason).group(1) if _HK_AGE.search(reason) else 0.0,
+                          0.0,
+                      )
+                      wedge_queue.append((hk_age, chat_id, ctx, entry, now_iso))
               # v1.7.0 quiet bell: persistence-gated paging. A fresh episode starts
               # the clock silently; the bell rings only once the chat has
               # persistently needed human help for >= notify_after minutes
@@ -1604,7 +1655,11 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                         _debug_log('wedge_restart_fail', chat_id + ' ' + repr(e))
                 continue
             action = 'wedge_auto_continue'
-            if final_attempt and wedge_soft_restart:
+            if (
+                final_attempt
+                and wedge_soft_restart
+                and not prev.get('housekeeping_wedge')
+            ):
                 # Tier 2: kill_process() is a non-blocking future.cancel()
                 # (helpers/defer.py), safe to call from this thread; on a
                 # truly dead loop it is a harmless no-op and the chat stays
@@ -1676,6 +1731,11 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
             # happened in the frozen-clock reset above, when applicable).
             entry['wedge_nudge_count'] = 0
             entry['last_wedge_nudge_at'] = ''
+            # v1.22.0 (stage 1): the wedged-completion subclass mark expires
+            # with the recovery — the drain's no-kill guard reads it, so a
+            # stale True must never exempt a later run-context freeze from
+            # the tier-2 kill.
+            entry.pop('housekeeping_wedge', None)
 
     # P1: prune state entries that are neither live nor persisted chats
     # (the chat dir is gone and no context exists -> dead history), then cap
