@@ -16,6 +16,7 @@ from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN, JOURNAL
 # inside a single request, and the reload was silently a no-op for this
 # endpoint. Same fix in api/export.py and api/history.py.
 from usr.plugins.chat_shepherd.helpers import state as state_mod
+from usr.plugins.chat_shepherd.helpers import selfcheck as selfcheck_mod
 from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers import hotreload
 from usr.plugins.chat_shepherd.helpers import adaptive
@@ -417,6 +418,11 @@ class Status(ApiHandler):
                 'save_state_interval_seconds': _to_int(cfg.get('save_state_interval_seconds', 120)),
             },
             'last_tick': state.get('last_tick', ''),
+            # v1.22.0 (stage 3): the supervisor's own health stamp.
+            'health': selfcheck_mod.health_summary(
+                state.get('selfcheck') or {},
+                (state.get('selfcheck') or {}).get('findings') or [],
+            ),
     'hot_reload': hotreload.status(),
             'chats': chat_list,
             'counts': counts,

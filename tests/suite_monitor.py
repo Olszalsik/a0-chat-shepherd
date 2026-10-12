@@ -4454,6 +4454,162 @@ def main():
         assert read_state()['chats'][FAKE_CHAT_A]['status'] == 'blocked'
         print('TEST47K_BLOCKED_STAYS_BLOCKED_OK')
 
+        # ============ TEST 48: self-check (stage 3) ============
+        _sc = monitor.selfcheck_mod
+        _now48 = datetime.now(timezone.utc)
+
+        # TEST48A: first run is unknown (a real answer, never rendered ok);
+        # a stale tick is tick_late; loop_suspended suppresses tick_late and
+        # names the outage instead.
+        f48a = _sc.evaluate({}, dict(cfg, selfcheck_enabled=True))
+        assert any(r['kind'] == 'first_run' for r in f48a), f48a
+        assert _sc.health_verdict(f48a) == 'unknown'
+        f48b = _sc.evaluate({
+            'last_tick': (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),
+        }, dict(cfg, selfcheck_enabled=True))
+        assert any(r['kind'] == 'tick_late' and r['severity'] == 'warning' for r in f48b), f48b
+        f48c = _sc.evaluate({
+            'last_tick': (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),
+            'loop_suspended': True,
+        }, dict(cfg, selfcheck_enabled=True))
+        assert not any(r['kind'] == 'tick_late' for r in f48c), f48c
+        assert any(r['kind'] == 'loop_suspended' for r in f48c), f48c
+        print('TEST48A_EVALUATE_BASICS_OK')
+
+        # TEST48B: consecutive tick failures escalate to an error finding
+        # past the threshold; tracked_gap fires when live contexts exist but
+        # zero were supervised; save failures need >= 2.
+        f48d = _sc.evaluate({'consecutive_tick_failures': 3}, {
+            'notify_after_consecutive_failures': 3})
+        assert any(r['kind'] == 'tick_failed' and r['severity'] == 'error' for r in f48d), f48d
+        _scd = _sc.evaluate({
+            'live_contexts': 5, 'checked': 0,
+            'last_tick': (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+        }, dict(cfg, selfcheck_enabled=True))
+        assert any(r['kind'] == 'tracked_gap' for r in _scd), _scd
+        _sce = _sc.evaluate({'save_failures': 1}, cfg)
+        assert not any(r['kind'] == 'save_failing' for r in _sce), _sce
+        _scf = _sc.evaluate({'save_failures': 2}, cfg)
+        assert any(r['kind'] == 'save_failing' for r in _scf), _scf
+        print('TEST48B_CONSECUTIVE_AND_GAPS_OK')
+
+        # TEST48C: verdict/score rollups — broken on error, degraded on warn,
+        # info-only is ok; penalties stack.
+        assert _sc.health_verdict([]) == 'ok' and _sc.health_score([]) == 100
+        _warn_only = [{'kind': 'tick_late', 'severity': 'warning', 'detail': 'x'}]
+        assert _sc.health_verdict(_warn_only) == 'degraded' and _sc.health_score(_warn_only) == 88
+        _err = [{'kind': 'tick_failed', 'severity': 'error', 'detail': 'x'}]
+        assert _sc.health_verdict(_err) == 'broken' and _sc.health_score(_err) == 60
+        _info = [{'kind': 'first_run', 'severity': 'info', 'detail': 'x'}]
+        assert _sc.health_verdict(_info) == 'unknown'
+        print('TEST48C_VERDICT_SCORE_OK')
+
+        # TEST48D: paging — rearm checked FIRST, hard errors page at once,
+        # info-only never pages, notify_on_selfcheck false never pages.
+        _stamp48 = {'paged_at': datetime.now(timezone.utc).isoformat(), 'since': ''}
+        page48, reason48 = _sc.should_page(_err, _stamp48, cfg)
+        assert not page48, 'rearm must gate even hard errors'
+        _stamp48['paged_at'] = (datetime.now(timezone.utc) - timedelta(minutes=180)).isoformat()
+        page48, reason48 = _sc.should_page(_err, _stamp48, cfg)
+        assert page48 and 'tick_failed' in reason48
+        page48, _ = _sc.should_page(
+            _warn_only,
+            {'since': datetime.now(timezone.utc).isoformat()},
+            dict(cfg, notify_after_minutes=30))
+        assert not page48  # warning not yet persisted 30m
+        page48, _ = _sc.should_page(
+            _info, {},
+            dict(cfg, notify_on_selfcheck=False, notify_after_minutes=0))
+        assert not page48
+        page48, _ = _sc.should_page(
+            [{'kind': 'first_run', 'severity': 'info', 'detail': 'x'}], {},
+            dict(cfg, notify_after_minutes=0))
+        assert not page48
+        print('TEST48D_SHOULD_PAGE_GATES_OK')
+
+        # TEST48E: end-to-end happy tick — (a) a truly quiet tick with no
+        # prior stamp does NOT create a health stamp (the save gate stays
+        # quiet, TEST18A); (b) an existing stamp is refreshed and the failure
+        # counter cleared.
+        monitor._save_failures = 0
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={})
+        ctx48a = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        FakeAgentContext._all = [ctx48a]
+        s48a = monitor.tick(dict(cfg, notify_on_intervention=False))
+        st48 = read_state()
+        h48 = st48.get('selfcheck') or {}
+        assert not h48.get('last_at'), h48
+        files.write_file(TEST_STATE, json.dumps({
+            'chats': {},
+            'last_tick': (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+            'selfcheck': {'verdict': 'ok', 'score': 100, 'last_ok': True,
+                          'consecutive_failures': 0, 'findings': []},
+        }, ensure_ascii=False))
+        ctx48b = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        FakeAgentContext._all = [ctx48b]
+        monitor.tick(dict(cfg, notify_on_intervention=False))
+        st48 = read_state()
+        h48 = st48.get('selfcheck') or {}
+        assert h48.get('last_at') and h48.get('verdict') in ('unknown', 'ok', 'degraded'), h48
+        assert h48.get('consecutive_tick_failures', 0) == 0, h48
+        print('TEST48E_HAPPY_TICK_HEALTH_OK')
+
+        # TEST48F: recovery reports the outage then clears — a stamp carrying
+        # 3 prior failures surfaces tick_failed on the first healthy tick
+        # (broken verdict + journaled transition) and clears afterwards.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={})
+        _pre = read_state()
+        # write via file to control the stamp directly
+        files.write_file(TEST_STATE, json.dumps({
+            'chats': {},
+            'last_tick': (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+            'selfcheck': {'consecutive_tick_failures': 3, 'verdict': 'broken', 'score': 60},
+        }, ensure_ascii=False))
+        ctx48b = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        FakeAgentContext._all = [ctx48b]
+        monitor.tick(dict(cfg, notify_on_intervention=False, notify_on_selfcheck=False))
+        st48f = read_state()
+        h48f = st48f.get('selfcheck') or {}
+        assert h48f.get('verdict') == 'broken', h48f  # reported, not hidden
+        assert any(r['kind'] == 'tick_failed' for r in (h48f.get('findings') or [])), h48f
+        assert h48f.get('consecutive_tick_failures', -1) == 0, h48f
+        assert h48f.get('consecutive_failures', -1) == 1, h48f  # warn+error -> failed
+        acts48f = [h.get('action') for h in st48f.get('history', [])]
+        assert 'selfcheck_fail' in acts48f, acts48f
+        # the NEXT healthy tick clears (consecutive_failures back to 0)
+        ctx48c = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        FakeAgentContext._all = [ctx48c]
+        monitor.tick(dict(cfg, notify_on_intervention=False, notify_on_selfcheck=False))
+        h48g = read_state().get('selfcheck') or {}
+        assert h48g.get('verdict') in ('unknown', 'ok', 'degraded'), h48g
+        assert h48g.get('consecutive_failures', -1) == 0, h48g
+        print('TEST48F_RECOVERY_REPORTS_THEN_CLEARS_OK')
+
+        # TEST48G: repeated failing writes feed save_failing through the tick.
+        monitor._save_failures = 0
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={})
+        ctx48d = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        FakeAgentContext._all = [ctx48d]
+        _orig_save48 = state_mod.save_state
+        try:
+            def _boom48(st, signature=None):
+                raise OSError('disk wedged')
+            state_mod.save_state = _boom48
+            monitor.tick(dict(cfg, notify_on_intervention=False, notify_on_selfcheck=False))
+            assert monitor._save_failures == 1, monitor._save_failures
+            monitor.tick(dict(cfg, notify_on_intervention=False, notify_on_selfcheck=False))
+            assert monitor._save_failures == 2, monitor._save_failures
+            # The stamp that would record save_failing cannot reach disk (the
+            # write is the thing that is failing - inherent). The self-check
+            # sees the finding through the module counter on the next eval:
+            kinds48h = [r['kind'] for r in _sc.evaluate(
+                {'save_failures': monitor._save_failures}, cfg)]
+            assert 'save_failing' in kinds48h, kinds48h
+        finally:
+            state_mod.save_state = _orig_save48
+        monitor._save_failures = 0
+        print('TEST48G_SAVE_FAILURE_FEEDS_HEALTH_OK')
+
         print('TEST45_V121_AUDIT_FIXES_OK')
 
         print('ALL_TESTS_PASSED')

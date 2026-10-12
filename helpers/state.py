@@ -28,7 +28,16 @@ def _now_iso() -> str:
 
 
 def default_state() -> dict[str, Any]:
-    return {'chats': {}, 'history': [], 'drafts': [], 'last_tick': ''}
+    # v1.22.0 (stage 3): `selfcheck` is the supervisor-health stamp
+    # (findings, verdict, clocks); `channels`/`capabilities` arrive with the
+    # stage-4/5 ports and default empty until then.
+    return {
+        'chats': {},
+        'history': [],
+        'drafts': [],
+        'last_tick': '',
+        'selfcheck': {},
+    }
 
 
 # v1.21.0 (A1): persisted per-chat counters are hand-editable state that
@@ -289,6 +298,23 @@ def save_state(state: dict[str, Any], signature: str | None = None) -> None:
         )
 
 
+# v1.22.0 (stage 3): the per-tick mutable clock fields of the selfcheck
+# stamp — excluded from the durable signature (they churn every tick and
+# would defeat the quiet-tick save gate; see state_signature).
+SELFCHECK_VOLATILE_KEYS = frozenset(
+    ('last_at', 'since', 'paged_at', 'consecutive_tick_failures')
+)
+
+
+def selfcheck_signature(stamp: Any) -> dict[str, Any]:
+    """Semantic (churn-free) view of the supervisor-health stamp."""
+    if not isinstance(stamp, dict):
+        return {}
+    return {
+        k: v for k, v in stamp.items() if k not in SELFCHECK_VOLATILE_KEYS
+    }
+
+
 def state_signature(state: dict[str, Any]) -> str:
     """v1.17.0: stable fingerprint of the durable payload save_state
     writes. Volatile per-tick bookkeeping is excluded (per-chat
@@ -308,6 +334,14 @@ def state_signature(state: dict[str, Any]) -> str:
             'chats': chats,
             'drafts': state.get('drafts') if isinstance(state.get('drafts'), list) else [],
             'adaptive': state.get('adaptive'),
+            # v1.22.0 (stage 3): the supervisor-health stamp is durable
+            # semantic state — a recovery tick reports its outage even when
+            # nothing else in the chats changed, so it must force a save.
+            # Only the SEMANTIC parts take part: the per-tick mutable clocks
+            # (last_at, since, paged_at, the failure counter cleared after
+            # every persist) churn every tick and would defeat the whole
+            # point of the quiet-tick save gate (donor contract C9).
+            'selfcheck': selfcheck_signature(state.get('selfcheck')),
         }
         blob = json.dumps(basis, sort_keys=True, ensure_ascii=False, default=str)
         return hashlib.sha256(blob.encode('utf-8')).hexdigest()

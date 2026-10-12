@@ -46,6 +46,7 @@ from usr.plugins.chat_shepherd.helpers import state as state_mod
 from usr.plugins.chat_shepherd.helpers import adaptive as adaptive_mod
 from usr.plugins.chat_shepherd.helpers import diagnose as diag_mod
 from usr.plugins.chat_shepherd.helpers import planner as planner_mod
+from usr.plugins.chat_shepherd.helpers import selfcheck as selfcheck_mod
 
 # v1.22.0 (stage 1, ported from chat_shepherd2's 2026-10-09 fix): the
 # wedged-completion reason classify_chat stamps, and the age parser for it.
@@ -56,6 +57,13 @@ _HK_AGE = re.compile(r'%s \((\d+)m' % re.escape(HK_REASON_PREFIX))
 # tick interval means the server process (or at least the job loop) was
 # restarted and the in-memory contexts were rebuilt from disk.
 RESTART_GAP_MINUTES = 5.0
+
+# v1.22.0 (stage 3, ported from chat_shepherd2): consecutive failed state
+# writes, in this process. Deliberately a module global: when the blob cannot
+# be written, a counter inside the blob is useless. Fed to the self-check so
+# a disk that has stopped accepting writes becomes a visible finding instead
+# of a supervisor that quietly stops learning anything.
+_save_failures = 0
 
 
 def _now() -> datetime:
@@ -1124,8 +1132,6 @@ def _goal_gate_check(
 
 
 def tick(cfg: dict[str, Any]) -> dict[str, Any]:
-    # v1.18.0 (P7): the whole-tick read-modify-write holds the shared state
-    # lock so API transactions cannot interleave and lose updates.
     #
     # v1.20.3 (reviewed, NOT changed): the lock IS held across message
     # delivery (`_nudge_context` / `ctx.nudge()`), which looks inconsistent
@@ -1143,15 +1149,147 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
     #     built. That is a worse failure mode than a short lock hold.
     # TEST38 pins the invariant that actually matters: a manual API action
     # landing during a tick never loses the tick's updates.
-    with state_mod.state_lock():
-        return _tick_impl(cfg)
+    # v1.22.0 (stage 3): the wrapper now reports its own death — a tick that
+    # raises here must leave durable evidence (the failure counter + the
+    # loop-suspended self-check stamp), because the dashboard keeps showing
+    # the last good snapshot and the job loop only logs one line.
+    try:
+        with state_mod.state_lock():
+            return _tick_impl(cfg)
+    except Exception as exc:
+        _debug_log('tick_fail', repr(exc))
+        try:
+            state_mod.state_transaction_apply(
+                lambda st: _record_tick_failure(st, cfg)
+            )
+        except Exception:
+            pass
+        return {'skipped': True, 'reason': 'tick_failed', 'error': repr(exc)[:300]}
+
+
+def _record_tick_failure(state: dict[str, Any], cfg: dict[str, Any] | None = None) -> None:
+    # v1.22.0 (stage 3, ported from chat_shepherd2): increment the durable
+    # failure counter and evaluate the self-check inline with
+    # loop_suspended=True — a permanent failure is self-sustaining (the
+    # evaluating phase never arrives), so the death must write its own
+    # findings. Journal the event too.
+    stamp = state.get('selfcheck')
+    if not isinstance(stamp, dict):
+        stamp = {}
+        state['selfcheck'] = stamp
+    stamp['consecutive_tick_failures'] = selfcheck_mod.as_int(
+        stamp.get('consecutive_tick_failures'), 0
+    ) + 1
+    stamp['last_tick_failure_at'] = datetime.now(timezone.utc).isoformat()
+    try:
+        state_mod.append_history(state, {
+            'chat_id': '',
+            'action': 'tick_fail',
+            'timestamp': stamp['last_tick_failure_at'],
+        })
+    except Exception:
+        return
+    try:
+        findings = selfcheck_mod.evaluate(
+            {
+                # loop_suspended suppresses tick_late (one finding naming the
+                # outage beats two) and adds the loop_suspended finding.
+                'last_tick': '',
+                'loop_suspended': True,
+                'consecutive_tick_failures': selfcheck_mod.as_int(
+                    stamp.get('consecutive_tick_failures'), 0
+                ),
+                'inflight': [],
+                'channels': {},
+                'capabilities': {},
+                'live_contexts': 0,
+                'checked': 0,
+                'save_failures': _save_failures,
+            },
+            cfg if isinstance(cfg, dict) else {},
+            now=datetime.now(timezone.utc),
+        )
+        stamp['findings'] = findings
+        stamp['verdict'] = selfcheck_mod.health_verdict(findings)
+        stamp['score'] = selfcheck_mod.health_score(findings)
+        stamp['since_signature'] = '|'.join(sorted(
+            str(r.get('kind')) for r in selfcheck_mod.pageable(findings)))
+        if not stamp.get('since'):
+            stamp['since'] = stamp['last_tick_failure_at']
+    except Exception:
+        pass
+
+def _persist_selfcheck(
+    state: dict[str, Any], cfg: dict[str, Any], findings: list[dict[str, Any]]
+) -> None:
+    # v1.22.0 (stage 3, ported from chat_shepherd2): stamp, roll up, journal
+    # TRANSITIONS only. What counts as a FAILURE is "a human should look at
+    # this" (warn + error); keying the counter on the list instead of the
+    # severity made consecutive_failures climb forever on a healthy
+    # supervisor, so the health panel read "verdict ok, score 100, failures 3".
+    stamp = state.get('selfcheck')
+    # An ABSENT stamp is not distinguishable from a {}-backfilled one (load
+    # repairs merge default shapes), so treat both as "nothing recorded yet".
+    _stamp_absent = not isinstance(stamp, dict) or not stamp
+    if _stamp_absent:
+        if not findings:
+            # v1.22.0 (stage 3): a fully quiet tick with no prior stamp says
+            # nothing about nothing — creating a healthy stamp here would
+            # churn the durable signature on the first tick of every session
+            # and defeat the quiet-tick save gate (TEST18A). The dashboard
+            # derives ok/unknown from /status's default view instead; the
+            # FIRST tick (first_run finding) and any fault do stamp.
+            return
+        if not isinstance(stamp, dict):
+            stamp = {}
+            state['selfcheck'] = stamp
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pageable_rows = selfcheck_mod.pageable(findings)
+    failed = bool(pageable_rows)
+    previous_failures = selfcheck_mod.as_int(stamp.get('consecutive_failures'), 0)
+    stamp['last_at'] = now_iso
+    stamp['findings'] = findings
+    stamp['consecutive_failures'] = previous_failures + 1 if failed else 0
+    stamp['last_ok'] = not failed
+
+    previous_signature = str(stamp.get('since_signature') or '')
+    signature = '|'.join(sorted(str(row.get('kind')) for row in pageable_rows))
+    if signature != previous_signature:
+        stamp['since_signature'] = signature
+        stamp['since'] = now_iso if signature else ''
+
+    verdict = selfcheck_mod.health_verdict(findings)
+    previous_verdict = str(stamp.get('verdict') or '')
+    stamp['verdict'] = verdict
+    stamp['score'] = selfcheck_mod.health_score(findings)
+
+    if signature != previous_signature or verdict != previous_verdict:
+        stamp['findings'] = findings
+        state_mod.append_history(state, {
+            'chat_id': '',
+            'action': 'selfcheck_fail' if failed else 'selfcheck',
+            'verdict': verdict,
+            'kinds': sorted({str(row.get('kind')) for row in findings}),
+            'timestamp': now_iso,
+        })
+    stamp['findings'] = findings
+    # The failure counter is cleared only after persisting (T11C order).
+    stamp['consecutive_tick_failures'] = 0
+
 
 def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
+    # v1.22.0 (stage 3): the save-failure counter is a module global; the
+    # assignment below must not silently turn reads of it into a local
+    # (UnboundLocalError killed the self-check phase wholesale).
+    global _save_failures
     if not cfg.get('enabled', False):
         return {'skipped': True, 'reason': 'disabled'}
 
     state = state_mod.load_state()
     prev_last_tick = _parse_dt(state.get('last_tick', ''))
+    # v1.22.0 (stage 3): the self-check compares the PREVIOUS tick stamp;
+    # capture it before the tick overwrites it.
+    _prev_tick_iso = str(state.get('last_tick', '') or '')
     # Restart detection: a last_tick gap far beyond one tick interval
     # means the server (or job loop) restarted and contexts were
     # rebuilt from disk. A missing last_tick (first ever tick) is not
@@ -1996,6 +2134,55 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     # payload signature (chats minus volatile last_ticked, drafts,
     # adaptive overlay) differs from the last written one, so every
     # meaningful state transition persists immediately.
+    # v1.22.0 (stage 3): the self-check phase — judge this tick's facts and
+    # page a human when a fault persists (info findings never page). The
+    # failure counter is read HERE and cleared after persisting, so the
+    # recovery tick reports the failures that preceded it and only then
+    # clears them (T11C ordering from the donor).
+    _sc_prev_failed = selfcheck_mod.as_int(
+        (state.get('selfcheck') or {}).get('consecutive_tick_failures'), 0
+    ) if isinstance(state.get('selfcheck'), dict) else 0
+    try:
+        _findings = selfcheck_mod.evaluate(
+            {
+                'last_tick': _prev_tick_iso,
+                'consecutive_tick_failures': _sc_prev_failed,
+                'inflight': state.get('inflight') or [] if isinstance(
+                    state.get('inflight'), list) else [],
+                'channels': state.get('channels') or {},
+                'capabilities': state.get('capabilities') or {},
+                'live_contexts': len(live_contexts),
+                'checked': summary.get('checked', 0),
+                'save_failures': _save_failures,
+                'action_cap_reached': False,
+            },
+            cfg,
+        )
+        _persist_selfcheck(state, cfg, _findings)
+        # (the counter reset lives inside _persist_selfcheck so a tick that
+        # did not stamp cannot conjure a stamp of zeros)
+    except Exception as _sc_exc:
+        _debug_log('selfcheck_fail', repr(_sc_exc))
+        _findings = []
+    if _findings:
+        page_ok, page_reason = selfcheck_mod.should_page(
+            _findings, state.get('selfcheck') or {}, cfg
+        )
+        if page_ok:
+            if not _notify(
+                'error' if any(
+                    str(r.get('severity')) == selfcheck_mod.SEVERITY_ERROR
+                    for r in _findings
+                ) else 'warning',
+                'Chat Shepherd self-check: ' + page_reason,
+                priority='high',
+                cfg=cfg,
+            ):
+                summary['notify_failures'] += 1
+            sc_stamp = state.get('selfcheck')
+            if isinstance(sc_stamp, dict):
+                sc_stamp['paged_at'] = datetime.now(timezone.utc).isoformat()
+
     # save_state_interval_seconds=0 restores legacy write-every-tick.
     # state.py gates fail safe: any error there forces a write.
     _save_interval = 120.0
@@ -2017,5 +2204,12 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     state['throttle']['state_save_skipped'] = not _do_save
     summary['state_save_skipped'] = not _do_save
     if _do_save:
-        state_mod.save_state(state)
+        # v1.22.0 (stage 3): a failing write feeds the self-check (module
+        # global - the blob holding the counter cannot hold its own failure).
+        try:
+            state_mod.save_state(state)
+            _save_failures = 0
+        except Exception as e:
+            _save_failures += 1
+            _debug_log('state_save_fail', repr(e))
     return summary

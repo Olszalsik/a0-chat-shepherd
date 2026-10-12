@@ -4,6 +4,17 @@ watch_all: true
 # completion classifier (response logged but housekeeping never finished)
 # and the later cause-gated remediation — the 1.21.3 timing ladder runs on.
 diagnose_enabled: true
+# v1.22.0 (stage 3): the supervisor's health check on itself. stale_tick_minutes
+# is the "previous tick is too old" liveness threshold (the job loop sleeps a
+# hard 60s, so 10 means "the tick overran or never finished"); notify_on_selfcheck
+# pages via the framework notification when a fault persists
+# (notify_after_minutes) with the re-arm window (notify_rearm_minutes).
+selfcheck_enabled: true
+selfcheck_every_minutes: 15
+stale_tick_minutes: 10
+notify_after_consecutive_failures: 3
+notify_on_selfcheck: true
+notify_degraded_after_failures: 3
 # v1.22.0 (stage 2): the causes the remediation ladder may act on. A stall
 # whose newest failure classifies rate_limit / context_length / model_refusal
 # is HELD, not nudged (visible on the dashboard, no auto-action), and a

@@ -13,6 +13,12 @@ DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "watch_all": True,
     "diagnose_enabled": True,
+    "selfcheck_enabled": True,
+    "selfcheck_every_minutes": 15,
+    "stale_tick_minutes": 10,
+    "notify_after_consecutive_failures": 3,
+    "notify_on_selfcheck": True,
+    "notify_degraded_after_failures": 3,
     "stall_minutes": 5,
     "max_auto_nudges": 3,
     "max_nudges_per_tick": 1,
@@ -153,6 +159,30 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
         current["watch_all"] = coerce_bool(readable["watch_all"])
     if "diagnose_enabled" in readable:
         current["diagnose_enabled"] = coerce_bool(readable["diagnose_enabled"])
+    if "selfcheck_enabled" in readable:
+        current["selfcheck_enabled"] = coerce_bool(readable["selfcheck_enabled"])
+    if "notify_on_selfcheck" in readable:
+        current["notify_on_selfcheck"] = coerce_bool(readable["notify_on_selfcheck"])
+    if "selfcheck_every_minutes" in readable:
+        current["selfcheck_every_minutes"] = coerce_int(
+            readable["selfcheck_every_minutes"],
+            current["selfcheck_every_minutes"], 0, 1440,
+        )
+    if "stale_tick_minutes" in readable:
+        current["stale_tick_minutes"] = coerce_int(
+            readable["stale_tick_minutes"],
+            current["stale_tick_minutes"], 2, 240,
+        )
+    if "notify_after_consecutive_failures" in readable:
+        current["notify_after_consecutive_failures"] = coerce_int(
+            readable["notify_after_consecutive_failures"],
+            current["notify_after_consecutive_failures"], 1, 20,
+        )
+    if "notify_degraded_after_failures" in readable:
+        current["notify_degraded_after_failures"] = coerce_int(
+            readable["notify_degraded_after_failures"],
+            current["notify_degraded_after_failures"], 1, 20,
+        )
     if "intervention_after_failed_nudges" in readable:
         current["intervention_after_failed_nudges"] = coerce_bool(
             readable["intervention_after_failed_nudges"]
