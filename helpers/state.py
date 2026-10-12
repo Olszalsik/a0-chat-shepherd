@@ -48,6 +48,11 @@ def default_state() -> dict[str, Any]:
         'selfcheck': {},
         # v1.22.0 (stage 4): write-ahead intents for remediation deliveries.
         'inflight': [],
+        # v1.22.0 (stage 5): continuity bookkeeping, capability probes and
+        # per-day action counters.
+        'continuity': {},
+        'capabilities': {},
+        'daily': {},
     }
 
 

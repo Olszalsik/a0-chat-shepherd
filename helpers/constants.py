@@ -105,6 +105,36 @@ CATEGORY_LABELS = {
     CATEGORY_EXTERNAL_BLOCK: 'blocked by another plugin',
 }
 
+# v1.22.0 (stage 5, ported from chat_shepherd2): the continuity wake verb.
+# Every message this module injects is stamped into context.data so the
+# supervisor can recognise its own watchdog and never watch itself (a wake
+# context is otherwise a real context with a real id and a chat dir).
+CTX_SHEPHERD = '_shepherd_wake'
+CTX_WAKE_PROMPT = '_shepherd_wake_prompt'
+CTX_WAKE_ISOLATED = '_shepherd_wake_isolated'
+CTX_WAKE_MANUAL = '_shepherd_wake_manual'
+CTX_WAKE_TARGET = '_shepherd_wake_target'
+
+WAKE_OK_TOKEN = 'SHEPHERD_OK'
+
+CONTINUITY_PROMPT_DEFAULT = (
+    'You are a night watch for an Agent Zero installation. Check whether '
+    'anything needs a human right now: chats that stalled mid-task, chats '
+    'that failed for a reason no retry will fix, and work that has been '
+    'waiting on an answer for a long time. Use the Chat Shepherd status '
+    'endpoint and the journals under usr/plugins/chat_shepherd/data/ to look. '
+    'If nothing needs attention, reply with exactly {token}. If something '
+    'does, explain it in at most three sentences, name the chat, and do '
+    'not include the token.'
+)
+
+# v1.22.0 (stage 5): foreign plugins whose own state may block a chat for
+# reasons of their own. The supervisor reads these read-only and never
+# auto-remediates a chat another parked deliberately.
+EXTERNAL_BLOCK_SOURCES = (
+    ('paperclip_zero', 'usr/plugins/paperclip_zero/data/state.json'),
+)
+
 NUDGE_TEXT = (
     '[chat_shepherd] You stopped unexpectedly mid-task. '
     'If your work is not finished, continue now from where you left off. '

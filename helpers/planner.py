@@ -122,3 +122,105 @@ def block_budget(already_blocked: int) -> int:
     tick cannot block half the fleet; the next tick picks it up again.
     """
     return max(1, min(5, 10 - max(0, int(already_blocked or 0))))
+
+
+# v1.22.0 (stage 5, ported from chat_shepherd2): the continuity-wake decision.
+# The due check and the *reason* are separate: a wake that is on schedule but
+# has nothing to report is the common case, and spending a full investigation
+# on it is how a health check becomes the biggest cost on the box. A reason is
+# required unless `continuity_always` is set.
+
+ACTION_WAKE = 'wake'
+
+
+def wakes_used(state: dict[str, Any], now: Any = None) -> int:
+    continuity = state.get('continuity') or {}
+    if not isinstance(continuity, dict):
+        return 0
+    now_dt = now if isinstance(now, datetime) else None
+    day = (now_dt or datetime.now(timezone.utc)).strftime('%Y-%m-%d')
+    try:
+        return int(continuity.get('wakes_' + day) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def plan_wake(
+    chats: list[dict[str, Any]],
+    state: dict[str, Any],
+    cfg: dict[str, Any],
+    *,
+    due: bool = False,
+    within_active_hours: bool = True,
+    grace_ok: bool = True,
+) -> dict[str, Any]:
+    """Decide whether the continuity wake should fire, and why.
+
+    Returns ``{action, reason, skipped}``. ``skipped`` is non-empty when the
+    wake was deliberately not fired — that string is the audit trail (the
+    monitor journals it only when the reason CHANGES, to keep the journal
+    quiet).
+    """
+    from usr.plugins.chat_shepherd.helpers.clock import as_float, as_int
+
+    out: dict[str, Any] = {'action': None, 'reason': '', 'skipped': ''}
+
+    if not bool(cfg.get('continuity_enabled')):
+        out['skipped'] = 'continuity disabled'
+        return out
+    if not grace_ok:
+        out['skipped'] = 'startup grace period'
+        return out
+    if not due:
+        out['skipped'] = 'not due'
+        return out
+    if not within_active_hours:
+        out['skipped'] = 'outside active hours'
+        return out
+
+    ceiling = as_int(cfg.get('continuity_max_wakes_per_day'), 12)
+    # `0` means disabled, like every other budget in this config. A truthiness
+    # test here read `0` as "no ceiling" — the exact inverse of the documented
+    # convention — so the disabled case has its own branch.
+    if ceiling <= 0:
+        out['skipped'] = 'daily wake ceiling disabled (0)'
+        return out
+    if wakes_used(state) >= ceiling:
+        out['skipped'] = f'daily wake ceiling reached ({ceiling})'
+        return out
+
+    for chat in chats:
+        status = str(chat.get('status') or '')
+        if (
+            bool(cfg.get('continuity_on_goal'))
+            and status == 'awaiting_user'
+            and chat.get('goal_open')
+        ):
+            out['action'] = ACTION_WAKE
+            out['reason'] = f'open goal is waiting for a human ({chat.get("chat_id")})'
+            return out
+        if (
+            bool(cfg.get('continuity_on_nudge_exhaustion'))
+            and status == 'stalled'
+            and as_int(chat.get('nudge_count'), 0) >= as_int(cfg.get('max_auto_nudges'), 3)
+        ):
+            out['action'] = ACTION_WAKE
+            out['reason'] = f'chat exhausted its nudge budget ({chat.get("chat_id")})'
+            return out
+        if (
+            bool(cfg.get('continuity_on_intervention'))
+            and status in ('intervention', 'error', 'blocked')
+            and as_float(chat.get('minutes_frozen'), 0.0)
+            >= as_float(cfg.get('continuity_intervention_minutes'), 30.0)
+        ):
+            out['action'] = ACTION_WAKE
+            out['reason'] = f'chat has been unresolved too long ({chat.get("chat_id")})'
+            return out
+
+    if bool(cfg.get('continuity_always')):
+        out['action'] = ACTION_WAKE
+        out['reason'] = 'continuity_always'
+        return out
+
+    out['skipped'] = 'no wake reason'
+    return out

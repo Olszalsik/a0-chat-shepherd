@@ -21,6 +21,24 @@ DEFAULTS: dict[str, Any] = {
     "notify_degraded_after_failures": 3,
     "inflight_enabled": True,
     "inflight_timeout_minutes": 5,
+    "startup_grace_ticks": 3,
+    "active_hours_enabled": False,
+    "active_hours_start": "09:00",
+    "active_hours_end": "22:00",
+    "active_hours_timezone": "",
+    "goal_integration": True,
+    "external_block_integration": True,
+    "continuity_enabled": False,
+    "continuity_every_minutes": 30,
+    "continuity_max_wakes_per_day": 12,
+    "continuity_isolated": True,
+    "continuity_ack_max_chars": 300,
+    "continuity_prompt": "",
+    "continuity_on_goal": True,
+    "continuity_on_nudge_exhaustion": True,
+    "continuity_on_intervention": True,
+    "continuity_intervention_minutes": 30,
+    "continuity_always": False,
     "stall_minutes": 5,
     "max_auto_nudges": 3,
     "max_nudges_per_tick": 1,
@@ -182,6 +200,54 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
         )
     if "inflight_enabled" in readable:
         current["inflight_enabled"] = coerce_bool(readable["inflight_enabled"])
+    if "startup_grace_ticks" in readable:
+        current["startup_grace_ticks"] = coerce_int(
+            readable["startup_grace_ticks"], current["startup_grace_ticks"], 0, 20)
+    if "continuity_enabled" in readable:
+        current["continuity_enabled"] = coerce_bool(readable["continuity_enabled"])
+    if "continuity_always" in readable:
+        current["continuity_always"] = coerce_bool(readable["continuity_always"])
+    if "continuity_isolated" in readable:
+        current["continuity_isolated"] = coerce_bool(readable["continuity_isolated"])
+    if "continuity_on_goal" in readable:
+        current["continuity_on_goal"] = coerce_bool(readable["continuity_on_goal"])
+    if "continuity_on_nudge_exhaustion" in readable:
+        current["continuity_on_nudge_exhaustion"] = coerce_bool(
+            readable["continuity_on_nudge_exhaustion"])
+    if "continuity_on_intervention" in readable:
+        current["continuity_on_intervention"] = coerce_bool(
+            readable["continuity_on_intervention"])
+    if "active_hours_enabled" in readable:
+        current["active_hours_enabled"] = coerce_bool(readable["active_hours_enabled"])
+    if "goal_integration" in readable:
+        current["goal_integration"] = coerce_bool(readable["goal_integration"])
+    if "external_block_integration" in readable:
+        current["external_block_integration"] = coerce_bool(
+            readable["external_block_integration"])
+    if "continuity_every_minutes" in readable:
+        current["continuity_every_minutes"] = coerce_int(
+            readable["continuity_every_minutes"],
+            current["continuity_every_minutes"], 1, 1440)
+    if "continuity_max_wakes_per_day" in readable:
+        current["continuity_max_wakes_per_day"] = coerce_int(
+            readable["continuity_max_wakes_per_day"],
+            current["continuity_max_wakes_per_day"], 0, 200)
+    if "continuity_ack_max_chars" in readable:
+        current["continuity_ack_max_chars"] = coerce_int(
+            readable["continuity_ack_max_chars"],
+            current["continuity_ack_max_chars"], 100, 2000)
+    if "continuity_intervention_minutes" in readable:
+        current["continuity_intervention_minutes"] = coerce_int(
+            readable["continuity_intervention_minutes"],
+            current["continuity_intervention_minutes"], 1, 720)
+    if "continuity_prompt" in readable:
+        current["continuity_prompt"] = str(readable["continuity_prompt"] or "")[:4000]
+    if "active_hours_start" in readable:
+        current["active_hours_start"] = str(readable["active_hours_start"] or "").strip()[:5]
+    if "active_hours_end" in readable:
+        current["active_hours_end"] = str(readable["active_hours_end"] or "").strip()[:5]
+    if "active_hours_timezone" in readable:
+        current["active_hours_timezone"] = str(readable["active_hours_timezone"] or "").strip()[:40]
     if "inflight_timeout_minutes" in readable:
         current["inflight_timeout_minutes"] = coerce_int(
             readable["inflight_timeout_minutes"],

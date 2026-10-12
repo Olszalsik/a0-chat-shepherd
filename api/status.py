@@ -420,6 +420,10 @@ class Status(ApiHandler):
             },
             'last_tick': state.get('last_tick', ''),
             # v1.22.0 (stage 3): the supervisor's own health stamp.
+            'continuity': state.get('continuity') if isinstance(
+                state.get('continuity'), dict) else {},
+            'capabilities': state.get('capabilities') if isinstance(
+                state.get('capabilities'), dict) else {},
             'channels': _notify_mod.channel_view(
                 state,
                 _to_int(cfg.get('notify_degraded_after_failures', 3)),

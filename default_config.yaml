@@ -22,6 +22,32 @@ notify_degraded_after_failures: 3
 # is how long an undelivered intent can linger before it is reaped.
 inflight_enabled: true
 inflight_timeout_minutes: 5
+# v1.22.0 (stage 5): the operating window and the continuity wake.
+# startup_grace_ticks holds auto-actions for the first N ticks after process
+# start (a cold boot must not escalate immediately). active_hours suppress
+# every automated action outside the window (start==end means always on;
+# classification and blocking still run — the window gates execution only).
+# continuity wake: the periodic health check that can bring work INTO
+# existence (answer 'SHEPHERD_OK' quietly, alert otherwise). Off by default —
+# it spends tokens on every fire.
+startup_grace_ticks: 3
+active_hours_enabled: false
+active_hours_start: "09:00"
+active_hours_end: "22:00"
+active_hours_timezone: ""
+goal_integration: true
+external_block_integration: true
+continuity_enabled: false
+continuity_every_minutes: 30
+continuity_max_wakes_per_day: 12
+continuity_isolated: true
+continuity_ack_max_chars: 300
+continuity_prompt: ""
+continuity_on_goal: true
+continuity_on_nudge_exhaustion: true
+continuity_on_intervention: true
+continuity_intervention_minutes: 30
+continuity_always: false
 # v1.22.0 (stage 2): the causes the remediation ladder may act on. A stall
 # whose newest failure classifies rate_limit / context_length / model_refusal
 # is HELD, not nudged (visible on the dashboard, no auto-action), and a

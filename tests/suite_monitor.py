@@ -186,6 +186,10 @@ def main():
         cfg = {
             'enabled': True,
             'watch_all': True,
+            # v1.22.0 (stage 5): the startup-grace window is off in tests -
+            # the whole suite relies on tick-#1 actions. TEST51F pins the
+            # withheld behaviour with its own fixture.
+            'startup_grace_ticks': 0,
             'stall_minutes': 5,
             'max_auto_nudges': 3,
             'max_nudges_per_tick': 5,
@@ -4540,7 +4544,9 @@ def main():
         h48 = st48.get('selfcheck') or {}
         assert not h48.get('last_at'), h48
         files.write_file(TEST_STATE, json.dumps({
-            'chats': {},
+            # different chats content so this tick changes the durable
+            # signature and the refreshed stamp actually reaches disk
+            'chats': {FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 2}},
             'last_tick': (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
             'selfcheck': {'verdict': 'ok', 'score': 100, 'last_ok': True,
                           'consecutive_failures': 0, 'findings': []},
@@ -4710,6 +4716,166 @@ def main():
         sig_c = state_mod.state_signature({'chats': {}, 'inflight': [{'id': 'a'}]})
         assert sig_c != sig_a
         print('TEST50D_COUNT_ONLY_SIGNATURE_OK')
+
+
+        # ============ TEST 51: wake / active hours / capabilities (stage 5) ==
+        from usr.plugins.chat_shepherd.helpers import clock as clock_mod
+        from usr.plugins.chat_shepherd.helpers import capabilities as caps_mod
+        from usr.plugins.chat_shepherd.helpers import wake as wake_mod
+
+        # TEST51A: clock - duration parsing, due, midnight wrap windows
+        assert clock_mod.parse_duration('90s') is not None
+        assert clock_mod.parse_duration('0m') is None  # zero = off, not broken
+        try:
+            clock_mod.parse_duration('nonsense')
+            raise AssertionError('bad duration must raise')
+        except ValueError:
+            pass
+        assert clock_mod.is_due('2020-01-01T00:00:00+00:00', '5m')
+        assert not clock_mod.is_due(datetime.now(timezone.utc).isoformat(), '5m')
+        assert clock_mod.is_due('', '5m')  # never run -> due
+        # a malformed interval never fires (no hot loop)
+        assert not clock_mod.is_due('', 'nonsense')
+        cfg_w = {'active_hours_enabled': True, 'active_hours_start': '09:00',
+                 'active_hours_end': '22:00', 'active_hours_timezone': 'UTC'}
+        import datetime as _dt51
+        noon = _dt51.datetime(2026, 1, 5, 12, 0, tzinfo=_dt51.timezone.utc)
+        assert clock_mod.in_active_hours(cfg_w, noon)
+        night = _dt51.datetime(2026, 1, 5, 3, 0, tzinfo=_dt51.timezone.utc)
+        assert not clock_mod.in_active_hours(cfg_w, night)
+        # midnight wrap: 22:00-06:00 covers 23:00 and blocks 12:00
+        cfg_wrap = dict(cfg_w, active_hours_start='22:00', active_hours_end='06:00')
+        assert clock_mod.in_active_hours(cfg_wrap, night)
+        assert not clock_mod.in_active_hours(cfg_wrap, noon)
+        # start == end means ALWAYS on (never "never")
+        cfg_always = dict(cfg_w, active_hours_start='22:00', active_hours_end='22:00')
+        assert clock_mod.in_active_hours(cfg_always, noon)
+        # disabled window is always open
+        assert clock_mod.in_active_hours({}, noon)
+        print('TEST51A_CLOCK_WINDOWS_OK')
+
+        # TEST51B: the wake plan's skips, ceilings (0 = disabled) and reasons
+        from usr.plugins.chat_shepherd.helpers import planner as planner_mod_51
+        chats51 = [
+            {'chat_id': 'aaWkGoal1', 'status': 'awaiting_user', 'goal_open': True},
+            {'chat_id': 'aaWkStal1', 'status': 'stalled', 'nudge_count': 3},
+            {'chat_id': 'aaWkBloc1', 'status': 'blocked', 'minutes_frozen': 999},
+        ]
+        assert planner_mod_51.plan_wake([], {}, {'continuity_enabled': False})['skipped'] == 'continuity disabled'
+        assert planner_mod_51.plan_wake([], {}, dict(cfg, continuity_enabled=True))['skipped'] == 'not due'
+        # goal trigger
+        pw = planner_mod_51.plan_wake(chats51, {}, dict(cfg, continuity_enabled=True, continuity_on_goal=True), due=True)
+        assert pw['action'] == 'wake' and 'goal' in pw['reason'], pw
+        # nudge-exhaustion trigger (no-goal list)
+        pw = planner_mod_51.plan_wake(
+            [{'chat_id': 'aaWkStal1', 'status': 'stalled', 'nudge_count': 3}], {},
+            dict(cfg, continuity_enabled=True, continuity_on_goal=False,
+                 continuity_on_nudge_exhaustion=True), due=True)
+        assert pw['action'] == 'wake' and 'nudge budget' in pw['reason'], pw
+        # intervention-age trigger
+        pw = planner_mod_51.plan_wake(
+            [{'chat_id': 'aaWkBloc1', 'status': 'blocked', 'minutes_frozen': 999}], {},
+            dict(cfg, continuity_enabled=True, continuity_on_goal=False,
+                 continuity_on_nudge_exhaustion=False, continuity_on_intervention=True),
+            due=True)
+        assert pw['action'] == 'wake' and 'unresolved too long' in pw['reason'], pw
+        # ceiling 0 disables even when a reason exists
+        pw = planner_mod_51.plan_wake(
+            [{'chat_id': 'aaWkStal1', 'status': 'stalled', 'nudge_count': 3}], {},
+            dict(cfg, continuity_enabled=True, continuity_on_goal=False,
+                 continuity_on_nudge_exhaustion=True,
+                 continuity_max_wakes_per_day=0), due=True)
+        assert pw['action'] is None and 'disabled (0)' in pw['skipped'], pw
+        # daily ceiling reached
+        st_c = {'continuity': {'wakes_2026-01-01': 12}}
+        st_c['continuity']['wakes_' + clock_mod.day_key(None)] = 2
+        pw = planner_mod_51.plan_wake(
+            [{'chat_id': 'aaWkStal1', 'status': 'stalled', 'nudge_count': 3}], st_c,
+            dict(cfg, continuity_enabled=True, continuity_on_goal=False,
+                 continuity_on_nudge_exhaustion=False, continuity_max_wakes_per_day=2),
+            due=True)
+        assert 'ceiling reached' in pw['skipped'], pw
+        # outside active hours / grace
+        pw = planner_mod_51.plan_wake(
+            [{'chat_id': 'aaWkStal1', 'status': 'stalled', 'nudge_count': 3}], {},
+            dict(cfg, continuity_enabled=True, continuity_on_goal=False), due=True, within_active_hours=False)
+        assert 'outside active hours' in pw['skipped'], pw
+        pw = planner_mod_51.plan_wake(
+            [{'chat_id': 'aaWkStal1', 'status': 'stalled', 'nudge_count': 3}], {},
+            dict(cfg, continuity_enabled=True, continuity_on_goal=False), due=True, grace_ok=False)
+        assert 'grace' in pw['skipped'], pw
+        print('TEST51B_PLAN_WAKE_OK')
+
+        # TEST51C: wake stamping and exclusion from live contexts (the
+        # supervisor must never watch its own watchdog)
+        class _Ctx51:
+            id = 'aaWkCtxAA'
+            def __init__(self):
+                # per-instance data: a class-level dict would be shared and
+                # one stamp would leak to every fresh instance
+                self.data = {}
+        c51 = _Ctx51()
+        wake_mod._stamp(c51, prompt='p', isolated=True, manual=False, target='none')
+        assert wake_mod.is_shepherd_context(c51)
+        assert c51.data[wake_mod.CTX_SHEPHERD] is True
+        assert not wake_mod.is_shepherd_context(_Ctx51())
+        print('TEST51C_WAKE_STAMP_EXCLUSION_OK')
+
+        # TEST51D: quiet-token classification - a short remainder is a quiet
+        # check-in; a long one is an alert; no token is an alert
+        q = wake_mod.classify_response('SHEPHERD_OK', 300)
+        assert q['status'] == 'suppressed', q
+        q = wake_mod.classify_response('SHEPHERD_OK also the disk light is blinking oddly but fine', 300)
+        assert q['status'] == 'suppressed', q
+        q = wake_mod.classify_response('x' * 400, 300)
+        assert q['status'] == 'alert' and len(q['summary']) <= 160, (q, len(q['summary']))
+        q = wake_mod.classify_response('chat aaWkStal1 needs a human: stuck 2 days', 300)
+        assert q['status'] == 'alert' and 'aaWkStal1' in q['summary'], q
+        print('TEST51D_QUIET_TOKEN_OK')
+
+        # TEST51E: capabilities - probes are soft, regression is the finding
+        probed51 = caps_mod.probe_all()
+        st51e = {}
+        regressed51 = caps_mod.merge_into_state(st51e, probed51)
+        assert regressed51 == [], regressed51  # first observation never degrades
+        fake51 = {name: dict(rec, available=False) for name, rec in st51e.get('capabilities', {}).items()
+                  if rec.get('available')}
+        if fake51:
+            regressed51 = caps_mod.merge_into_state(st51e, fake51)
+            assert regressed51, 'an observed-then-broken probe must degrade'
+        print('TEST51E_CAPABILITY_PROBES_OK')
+
+        # TEST51F: end-to-end grace hold - actions withheld, classification
+        # still runs, blocking still runs (the window gates execution only)
+        monitor._save_failures = 0
+        monitor._TICKS_SINCE_START = 0
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 0, 'last_nudge_at': ''},
+        })
+        ctx51f = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=60)
+        FakeAgentContext._all = [ctx51f]
+        s51f = monitor.tick(dict(cfg, startup_grace_ticks=999, max_nudges_per_tick=5))
+        assert s51f.get('actions_withheld'), s51f
+        assert len(ctx51f.communicated) == 0, 'grace must withhold actions'
+        st51f = read_state()['chats'][FAKE_CHAT_A]
+        assert st51f['status'] == 'stalled', st51f  # classified, just not acted on
+        monitor._TICKS_SINCE_START = 99
+        monitor.tick(dict(cfg, max_nudges_per_tick=5, notify_on_intervention=False))
+        monitor._TICKS_SINCE_START = 0
+        print('TEST51F_GRACE_WITHHOLDS_OK')
+
+        # TEST51G: the wake phase journals skip reasons on CHANGE only
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={})
+        FakeAgentContext._all = []
+        cfg51g = dict(cfg, notify_on_intervention=False)
+        monitor.tick(cfg51g)
+        monitor.tick(cfg51g)  # same skip reason: no second row
+        skips51 = [h.get('continuity', '') for h in ()]
+        rows51 = [h for h in read_state().get('history', [])
+                  if str(h.get('action', '')).startswith('continuity_')]
+        reasons51 = [h.get('reason') for h in rows51]
+        assert len(set(reasons51)) == len(reasons51), reasons51
+        print('TEST51G_SKIP_REASONS_DEDUPED_OK')
 
         print('TEST45_V121_AUDIT_FIXES_OK')
 

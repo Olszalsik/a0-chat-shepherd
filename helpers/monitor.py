@@ -48,6 +48,9 @@ from usr.plugins.chat_shepherd.helpers import diagnose as diag_mod
 from usr.plugins.chat_shepherd.helpers import planner as planner_mod
 from usr.plugins.chat_shepherd.helpers import selfcheck as selfcheck_mod
 from usr.plugins.chat_shepherd.helpers import notify as notify_mod
+from usr.plugins.chat_shepherd.helpers import wake as wake_mod
+from usr.plugins.chat_shepherd.helpers import capabilities as caps_mod
+from usr.plugins.chat_shepherd.helpers import clock as clock_mod
 
 # v1.22.0 (stage 1, ported from chat_shepherd2's 2026-10-09 fix): the
 # wedged-completion reason classify_chat stamps, and the age parser for it.
@@ -76,6 +79,10 @@ RESTART_GAP_MINUTES = 5.0
 # a disk that has stopped accepting writes becomes a visible finding instead
 # of a supervisor that quietly stops learning anything.
 _save_failures = 0
+
+# v1.22.0 (stage 5): ticks completed since this process started the loop -
+# the startup-grace window (`startup_grace_ticks`) reads this.
+_TICKS_SINCE_START = 0
 
 
 def _now() -> datetime:
@@ -1217,9 +1224,12 @@ def tick(cfg: dict[str, Any]) -> dict[str, Any]:
     # raises here must leave durable evidence (the failure counter + the
     # loop-suspended self-check stamp), because the dashboard keeps showing
     # the last good snapshot and the job loop only logs one line.
+    global _TICKS_SINCE_START
     try:
         with state_mod.state_lock():
-            return _tick_impl(cfg)
+            _result = _tick_impl(cfg)
+            _TICKS_SINCE_START += 1
+            return _result
     except Exception as exc:
         _debug_log('tick_fail', repr(exc))
         try:
@@ -1427,6 +1437,11 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     live_contexts: dict[str, Any] = {}
     try:
         for ctx in AgentContext.all():
+            # v1.22.0 (stage 5): the supervisor must never watch its own
+            # watchdog - a wake context is a real context with a real id and
+            # a persisted chat dir; only its data stamp says whose it is.
+            if wake_mod.is_shepherd_context(ctx):
+                continue
             if not _has_chat_dir(ctx.id):
                 continue
             if allowed_chat_ids and ctx.id not in allowed_chat_ids:
@@ -1464,6 +1479,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
         'blocked_released': 0,
         'held': 0,
         'inflight_abandoned': 0,
+        'actions_withheld': '',
+        'wakes': 0,
     }
     summary['adaptive'] = adaptive_tag
 
@@ -1480,6 +1497,24 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     inflight_timeout = _as_float(cfg.get('inflight_timeout_minutes', 5), 5.0)
     inflight_timeout = max(0.5, min(120.0, inflight_timeout))
     inflight_blocked = 0
+    # v1.22.0 (stage 5): the operating window and the continuity wake. The
+    # window gates EXECUTION (the three drains) while classification and
+    # blocking still run — a suppressed window is visible, not blind. The
+    # startup grace holds auto-actions for the first N ticks after process
+    # start so a cold boot does not escalate immediately.
+    _grace_ticks = max(0, int(_as_float(cfg.get('startup_grace_ticks', 3), 3)))
+    _within_hours = clock_mod.in_active_hours(cfg)
+    _grace_ok = _TICKS_SINCE_START >= _grace_ticks
+    _can_act = _within_hours and _grace_ok
+    _interval_txt = str(int(_as_float(cfg.get('continuity_every_minutes', 30), 30))) + 'm'
+    _continuity = state.get('continuity') if isinstance(
+        state.get('continuity'), dict) else {}
+    _continuity_due = clock_mod.is_due(
+        _continuity.get('last_at', ''), _interval_txt)
+    # v1.22.0 (stage 5): foreign plugins may have parked a chat for their own
+    # reasons; the fingerprint treats that as the strongest signal.
+    _ext_blocks = caps_mod.external_blocks() if bool(
+        cfg.get('external_block_integration', True)) else {}
     # v1.22.0 (stage 4): reconcile the in-flight write-ahead intents. A
     # delivery that crashed between "recorded" and "delivered" is reaped
     # here and CHARGES the budget of the action it claimed (never replayed).
@@ -1625,6 +1660,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   chat_id,
                   error_text=_error_txt,
                   fatal=diag_mod.fatal_text(view),
+                  external_block=_ext_blocks.get(chat_id, ''),
               )
               _cat = _fp['category']
               _cat_sig = _fp['signature']
@@ -1700,6 +1736,18 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               and new_status in (STATUS_STALLED, STATUS_INTERRUPTED, STATUS_INTERVENTION)
           ):
               summary['held'] += 1
+          # v1.22.0 (stage 5): the operating window gates EXECUTION only —
+          # classification and blocking above still ran. Withheld actions are
+          # visible in the summary, never silent.
+          if (
+              not _can_act
+              and new_status in (STATUS_STALLED, STATUS_INTERRUPTED, STATUS_INTERVENTION)
+              and not summary.get('actions_withheld')
+          ):
+              summary['actions_withheld'] = (
+                  'outside active hours' if not _within_hours
+                  else 'startup grace period'
+              )
 
           fname = _chat_display_name(chat_id, ctx, prev)
           entry = state_mod.update_chat(
@@ -1761,6 +1809,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   and not _term_cooldown_active
                   and nudge_count < max_nudges
                   and gate_verdict == planner_mod.ACT
+                  and _can_act
               ):
                   # v1.22.0 (stage 2): the diagnosis gate (hold/block)
                   # precedes the ladder — a non-allowlisted cause is held,
@@ -1790,6 +1839,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                       and frozen_minutes >= wedge_nudge_after
                       and getattr(ctx, 'type', None) == AgentContextType.USER
                       and gate_verdict == planner_mod.ACT
+                      and _can_act
                   ):
                       # Oldest freeze first; final ordering post-loop.
                       wedge_queue.append((frozen_minutes, chat_id, ctx, entry, now_iso))
@@ -1820,7 +1870,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                           _HK_AGE.search(reason).group(1) if _HK_AGE.search(reason) else 0.0,
                           0.0,
                       )
-                      if gate_verdict == planner_mod.ACT:
+                      if gate_verdict == planner_mod.ACT and _can_act:
                           wedge_queue.append((hk_age, chat_id, ctx, entry, now_iso))
               # v1.7.0 quiet bell: persistence-gated paging. A fresh episode starts
               # the clock silently; the bell rings only once the chat has
@@ -1868,6 +1918,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   if (
                       nudge_count < max_nudges
                       and gate_verdict == planner_mod.ACT
+                      and _can_act
                   ):
                       minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
                       resume_queue.append(
@@ -2259,6 +2310,65 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     # payload signature (chats minus volatile last_ticked, drafts,
     # adaptive overlay) differs from the last written one, so every
     # meaningful state transition persists immediately.
+    # v1.22.0 (stage 5): the continuity wake — the one action that can bring
+    # work into existence instead of reacting to what it can already see.
+    _wake_plan = {'action': None, 'reason': '', 'skipped': ''}
+    try:
+        if bool(cfg.get('continuity_enabled', False)):
+            _wake_obs = []
+            _wake_c = state.get('continuity') if isinstance(
+                state.get('continuity'), dict) else {}
+            for _wcid, _went in state.get('chats', {}).items():
+                if not isinstance(_went, dict):
+                    continue
+                _wst = _went.get('status')
+                if _wst in (STATUS_AWAITING_USER, STATUS_STALLED,
+                            STATUS_INTERVENTION, STATUS_ERROR, STATUS_BLOCKED):
+                    _wo = {
+                        'chat_id': _wcid,
+                        'status': _wst,
+                        'nudge_count': _went.get('nudge_count', 0),
+                        'minutes_frozen': 0.0,
+                    }
+                    if (
+                        bool(cfg.get('goal_integration', True))
+                        and _wst == STATUS_AWAITING_USER
+                    ):
+                        _wo['goal_open'] = caps_mod.active_goal(_wcid) is not None
+                    _wake_obs.append(_wo)
+            _wake_plan = planner_mod.plan_wake(
+                _wake_obs, state, cfg,
+                due=_continuity_due, within_active_hours=_within_hours,
+                grace_ok=_grace_ok,
+            )
+            _skip_reason = str(_wake_plan.get('skipped') or '')
+            if _skip_reason:
+                if _skip_reason != str(_wake_c.get('last_skip') or ''):
+                    _wake_c['last_skip'] = _skip_reason
+                    state_mod.append_history(state, {
+                        'chat_id': '',
+                        'action': 'continuity_skipped',
+                        'reason': _skip_reason,
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                    })
+            else:
+                _wake_c['last_skip'] = ''
+                _wd = wake_mod.fire_wake(cfg)
+                wake_mod.record_wake(state, _wd, str(_wake_plan.get('reason') or ''))
+                state_mod.append_history(state, {
+                    'chat_id': '',
+                    'action': ('continuity_wake' if _wd.get('status') == 'waked'
+                               else 'continuity_skipped'),
+                    'status': str(_wd.get('status') or ''),
+                    'via': str(_wd.get('via') or ''),
+                    'reason': str(_wake_plan.get('reason') or ''),
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                })
+                if _wd.get('status') == 'waked':
+                    summary['wakes'] = summary.get('wakes', 0) + 1
+    except Exception as _wk_exc:
+        _debug_log('wake_phase_fail', repr(_wk_exc))
+
     # v1.22.0 (stage 3): the self-check phase — judge this tick's facts and
     # page a human when a fault persists (info findings never page). The
     # failure counter is read HERE and cleared after persisting, so the
@@ -2280,6 +2390,12 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 'checked': summary.get('checked', 0),
                 'save_failures': _save_failures,
                 'action_cap_reached': False,
+                'blocked_external': len(_ext_blocks),
+                'wake_cap_reached': bool(cfg.get('continuity_enabled', False))
+                and planner_mod.wakes_used(state)
+                >= max(0, int(_as_float(cfg.get('continuity_max_wakes_per_day'), 12))),
+                'wake_ceiling': max(0, int(_as_float(
+                    cfg.get('continuity_max_wakes_per_day'), 12))),
             },
             cfg,
         )
