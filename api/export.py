@@ -7,7 +7,11 @@ from datetime import datetime, timezone
 from helpers.api import ApiHandler, Request, Response
 
 from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME, JOURNAL_KEEP
-from usr.plugins.chat_shepherd.helpers.state import load_state, read_journal
+# v1.21.0 (A8): state is reached through the MODULE, not through pinned
+# `from ...state import` bindings - those survive a `helpers/state.py`
+# hot-reload, so /export served the pre-patch state code until a plugin
+# refresh, i.e. the reload was silently a no-op for this endpoint.
+from usr.plugins.chat_shepherd.helpers import state as state_mod
 
 
 def _snapshot() -> dict:
@@ -22,7 +26,7 @@ def _snapshot() -> dict:
     export and must use JOURNAL_KEEP (1000), so the reuse would have silently
     truncated every export to 200 entries. Kept as JOURNAL_KEEP below.
     """
-    state = load_state()
+    state = state_mod.load_state()
     return {
         'success': True,
         'plugin': PLUGIN_NAME,
@@ -31,7 +35,7 @@ def _snapshot() -> dict:
             'chats': state.get('chats', {}),
             'last_tick': state.get('last_tick', ''),
         },
-        'history': read_journal(JOURNAL_KEEP),
+        'history': state_mod.read_journal(JOURNAL_KEEP),
     }
 
 

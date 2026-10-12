@@ -25,11 +25,16 @@ const SOURCE = await readFile(
 let checks = 0;
 function ok(condition, message) { assert.ok(condition, message); checks += 1; }
 
-// Track live intervals so "no stacked timers" is observable. A real
-// setInterval keeps the Node process alive, so every block stops polling.
+// Track live timers so "no stacked timers" is observable. v1.21.0 replaced
+// setInterval with a self-scheduling setTimeout chain plus an in-flight latch
+// (a slow snapshot must not queue another poll behind itself), so both timer
+// kinds are shimmed here. Real timers would keep the Node process alive, so
+// every block stops polling.
 const intervals = { created: 0, live: new Set() };
 const realSetInterval = globalThis.setInterval;
 const realClearInterval = globalThis.clearInterval;
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
 globalThis.setInterval = (fn, ms) => {
   const t = realSetInterval(fn, ms);
   intervals.created += 1;
@@ -39,6 +44,16 @@ globalThis.setInterval = (fn, ms) => {
 globalThis.clearInterval = (t) => {
   intervals.live.delete(t);
   return realClearInterval(t);
+};
+globalThis.setTimeout = (fn, ms) => {
+  const t = realSetTimeout(fn, ms);
+  intervals.created += 1;
+  intervals.live.add(t);
+  return t;
+};
+globalThis.clearTimeout = (t) => {
+  intervals.live.delete(t);
+  return realClearTimeout(t);
 };
 
 // The store is an ES module, so load it as one. Each load gets a unique URL
@@ -230,6 +245,100 @@ const OK_RESP = () => ({
     "a merely stalled chat does not warn");
   ok(!/ask for confirmation/.test(store.nudgeHint(null)),
     "a missing chat does not warn");
+  store.stopPolling();
+}
+
+// 7. Overlapping polls are dropped (v1.21.0 A11). setInterval used to fire on
+//    schedule regardless of whether the previous snapshot had landed, so a slow
+//    backend queued concurrent /status requests - each contending for the state
+//    lock - and the sidebar icons showed a snapshot several generations old.
+{
+  const pending = [];
+  const slow = () => new Promise((r) => { pending.push(r); });
+  const { store, apiCalls } = await loadStore({ api: slow });
+  const first = store.fetchStatus();
+  ok(store._inFlight === true, "a poll in progress must latch _inFlight");
+  const second = store.fetchStatus();
+  await second;
+  ok(apiCalls.length === 1,
+    "a second poll while one is in flight must be dropped, saw " + apiCalls.length);
+  pending[0](OK_RESP());
+  await first;
+  ok(store._inFlight === false, "the latch must clear when the poll lands");
+  const third = store.fetchStatus();
+  pending[pending.length - 1](OK_RESP());
+  await third;
+  ok(apiCalls.length === 2, "polling resumes once the latch is clear");
+  store.stopPolling();
+}
+
+// 8. Re-arming from inside a poll must not leave an orphan chain (A11).
+//    applyPollFromConfig() calls startPolling() when poll_seconds changes,
+//    which happens WHILE fetchStatus() is awaiting: without the generation
+//    guard the in-flight chain would reschedule itself on top of the fresh one.
+{
+  let answers = [
+    { success: true, chats: [], counts: {}, config: { poll_seconds: 5 }, history: [] },
+    { success: true, chats: [], counts: {}, config: { poll_seconds: 9 }, history: [] },
+  ];
+  const { store } = await loadStore({ api: () => answers.shift() || OK_RESP() });
+  store.startPolling();
+  const before = intervals.live.size;
+  await store.fetchStatus();
+  await store.fetchStatus();
+  ok(store.pollInterval === 9000, "the poll interval follows the config");
+  ok(intervals.live.size === before,
+    "a poll_seconds change must leave exactly one live timer, live=" + intervals.live.size);
+  store.stopPolling();
+}
+
+// 9. A degraded snapshot is surfaced once and never blanks the dashboard (A2).
+//    The backend now answers with a valid payload instead of a 500, so the
+//    store must tell the operator once rather than silently keeping stale data.
+{
+  let degraded = true;
+  const { store, toasts } = await loadStore({
+    api: () => (degraded
+      ? { success: true, degraded: true, error: "division by zero", chats: [], counts: {}, config: { poll_seconds: 5 }, history: [] }
+      : OK_RESP()),
+  });
+  await store.fetchStatus();
+  await store.fetchStatus();
+  ok(toasts.length === 1, "a degraded snapshot must toast once, got " + toasts.length);
+  ok(/degraded/i.test(toasts[0].message), String(toasts[0].message));
+  ok(store.data === null, "a degraded payload must not overwrite good state with blanks");
+  degraded = false;
+  await store.fetchStatus();
+  ok(store._fetchFailed === false, "recovery clears the latch");
+  store.stopPolling();
+}
+
+// 10. timelines is pruned to the tracked chat set (A10) - the draftEdits leak
+//     class, missed for the per-chat timeline payloads.
+{
+  // NB: read the outer `ids` at CALL time - passing it as a parameter would
+  // capture the first array and the reassignment below would be invisible.
+  const withChats = () => () => ({
+    success: true, chats: ids.map((id) => ({ chat_id: id, status: "stalled" })),
+    counts: {}, config: { poll_seconds: 5 }, history: [],
+  });
+  let ids = ["chat0001", "chat0002", "chat0003"];
+  const { store, apiCalls } = await loadStore({ api: withChats() });
+  store.timelines = { chat0001: { entries: [] }, chat0002: { entries: [] }, chat0003: { entries: [] } };
+  await store.fetchStatus();
+  await store.toggleTimeline("chat0001");
+  ok(store.timelines.chat0001, "the opened timeline is cached");
+  ok(Object.keys(store.timelines).length === 3,
+    "tracked chats keep their cache, got " + Object.keys(store.timelines).length);
+  ids = ["chat0001"];
+  await store.fetchStatus();
+  store.timelineOpen = "";            // close, so the next toggle re-opens
+  await store.toggleTimeline("chat0001");
+  const keys = Object.keys(store.timelines);
+  ok(!("chat0002" in store.timelines) && !("chat0003" in store.timelines),
+    "timelines for untracked chats must be dropped, left: " + keys.join(","));
+  ok("chat0001" in store.timelines, "the chat being viewed must survive the prune");
+  ok(apiCalls.some(([url]) => url.endsWith("/history")), "the timeline still loads history");
   store.stopPolling();
 }
 

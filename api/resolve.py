@@ -16,11 +16,24 @@ class Resolve(ApiHandler):
         # v1.20.7: non-dict bodies (list / string / number) reached .get and
         # raised AttributeError → raw 500. Same guard api/draft.py applies.
         body = input if isinstance(input, dict) else {}
-        chat_id = (body.get('chat_id') or '').strip()
-        action = (body.get('action') or 'resolve').strip()
+        # v1.21.0 (A3): `helpers/api.py:79-83` already normalizes a non-dict
+        # BODY to `{}` before the handler runs, but a dict field VALUE still
+        # arrives raw - `{"chat_id": 123}` raised AttributeError on `.strip()`
+        # and became a bare 500 for a merely mistyped request. Coerce both.
+        chat_id = str(body.get('chat_id') or '').strip()
+        # v1.21.0 (A3): also lowercase + validate. `action` used to be matched
+        # raw and anything that was not "dismiss" fell through to the resolve
+        # branch, so a typo (`"dismiss "`, `"Dismiss"`, `"resolv"`) silently
+        # cleared the chat's nudge budget instead of erroring.
+        action = str(body.get('action') or 'resolve').strip().lower()
 
         if not chat_id:
             return {'success': False, 'error': 'chat_id is required'}
+        if action not in ('resolve', 'dismiss'):
+            return {
+                'success': False,
+                'error': f"unknown action '{action}' (expected 'resolve' or 'dismiss')",
+            }
 
         def _apply(st: dict) -> dict:
             now_iso = datetime.now(timezone.utc).isoformat()

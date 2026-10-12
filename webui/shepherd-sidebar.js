@@ -34,6 +34,21 @@
   var injecting = false;
   var obs = null;
   var observedEl = null;
+  // v1.21.0 (O11): container -> {id, badge}. WeakMap so a re-keyed or removed
+  // row is collected with its element; a plain object would leak one entry per
+  // row ever rendered for the whole page session.
+  var ROW_MEMO = typeof WeakMap === "function" ? new WeakMap() : null;
+
+  function memoFor(container) {
+    if (!ROW_MEMO) return null;
+    var hit = ROW_MEMO.get(container);
+    return hit || null;
+  }
+
+  function setMemo(container, chatId, badge) {
+    if (!ROW_MEMO) return;
+    ROW_MEMO.set(container, { id: chatId || "", badge: badge || null });
+  }
 
   var DEFAULT_ICONS = {
     running: "🏃",
@@ -75,6 +90,10 @@
   var SCOPE_KEYS = ["context", "child", "item", "task"];
   // Row attributes published by core/community list views.
   var ROW_ID_ATTRS = ["data-folder-thread", "data-context-id", "data-chat-id"];
+  // v1.21.0 (A13): hard ceiling on the ancestor walk for a row id. Core rows
+  // publish their id on the .chat-container element itself, so the walk is
+  // one hop in practice; the ceiling only matters for third-party views.
+  var ROW_WALK_MAX_HOPS = 6;
   // Badge host candidates, in preference order. The badge belongs next to the
   // chat name: appending it to `.chat-container` put it after the hover-only
   // action buttons, so the icon jumped sideways on every hover.
@@ -145,11 +164,25 @@
     if (!container) return null;
 
     // 1. Explicit row attributes published by the list view (most stable).
+    //    v1.21.0 (A13): the walk is BOUNDED. It used to climb to <html>, so a
+    //    row deep inside someone else's subtree could reach an ancestor
+    //    `data-folder-thread` / `data-context-id` and be painted with another
+    //    chat's status. Two guards now: a hard hop ceiling
+    //    (ROW_WALK_MAX_HOPS) and a stop at any enclosing LI/UL/TABLE. Note the
+    //    honest limit - when the row's OWN owner is the `li` (the
+    //    _sidebar_folders shape) that `li` must still be readable, so the
+    //    boundary is checked after its own attributes; a row that publishes no
+    //    id and sits within the hop budget of an id-bearing wrapper is
+    //    genuinely indistinguishable from a folder row in DOM terms. The
+    //    ceiling bounds that exposure instead of making it unbounded.
     var node = container;
-    while (node && node.getAttribute) {
+    var hops = 0;
+    while (node && node.getAttribute && hops < ROW_WALK_MAX_HOPS) {
       var attr = idFromAttributes(node);
       if (attr) return attr;
+      if (node.tagName === "LI" || node.tagName === "UL" || node.tagName === "TABLE") break;
       node = node.parentElement;
+      hops++;
     }
 
     // 2. The row's own inherited Alpine scope. This is the fix for folder
@@ -231,6 +264,18 @@
       }
     }
 
+    // v1.21.0 (O11): memoized DOM handles. A repaint used to redo ~4 queries per
+    // row per pass - anchorFor (two querySelector calls) plus a
+    // .cs-badge lookup - with ~300 rows every 2.5 s plus every debounced
+    // mutation. The memo holds only the resolved ELEMENTS (host + badge),
+    // never the chat id.
+    //
+    // The id is deliberately re-resolved every pass (one getAttribute on core
+    // rows). Caching it looked free and is NOT: Alpine's keyed x-for REUSES
+    // elements across a key change and patches the bound data in place, so a
+    // cached id would survive a re-key and keep painting the old chat's status
+    // on a row that now shows another one. Correctness of the id beats the
+    // microseconds.
     var containers = document.querySelectorAll(".chat-container");
     for (var j = 0; j < containers.length; j++) {
       var container = containers[j];
@@ -239,17 +284,33 @@
       var chatId = chatIdFromContainer(container);
       if (!chatId) continue;
 
+      var memo = memoFor(container);
       var status = map[chatId];
-      var existing = container.querySelector(".cs-badge");
       if (!status) {
-        if (existing) existing.remove();
+        if (memo && memo.badge && memo.badge.parentNode) memo.badge.remove();
+        setMemo(container, chatId, null);
         continue;
       }
 
       var glyph = iconFor(s, status);
       // Configurable "no pictogram" for this state.
       if (!glyph) {
-        if (existing) existing.remove();
+        if (memo && memo.badge && memo.badge.parentNode) memo.badge.remove();
+        setMemo(container, chatId, null);
+        continue;
+      }
+
+      var label = "Chat Shepherd: " + (LABELS[status] || status);
+      var color = colorFor(s, status);
+      var existing = memo && memo.badge;
+      // Fast path: this row is already painted for exactly this status. The
+      // container's own data-cs-status is the cross-check that a stale memo
+      // can never hide a real change.
+      if (existing && existing.parentNode
+          && container.getAttribute("data-cs-status") === status
+          && existing.textContent === glyph
+          && existing.getAttribute("aria-label") === label) {
+        if (existing.style.color !== color) existing.style.color = color;
         continue;
       }
 
@@ -257,9 +318,9 @@
       // Alpine may have re-keyed the row; never steal another chat's badge.
       if (existing && !anchor.host.contains(existing)) existing = null;
       var badge = existing || makeBadge();
-      applyBadge(badge, status, glyph, colorFor(s, status),
-        "Chat Shepherd: " + (LABELS[status] || status));
+      applyBadge(badge, status, glyph, color, label);
       if (!existing) placeBadge(badge, anchor);
+      setMemo(container, chatId, badge);
     }
   }
 
@@ -273,9 +334,28 @@
     try {
       paintRows(store());
     } catch (e) {
-      /* a transient DOM shape must not kill the poll loop */
+      // v1.21.0 (A14): report, do not disappear. This catch exists so a
+      // transient DOM shape cannot kill the poll loop - but swallowing the
+      // error outright meant a genuinely broken injector (a renamed helper, a
+      // null row model) showed up as "the icons just stopped updating" with
+      // nothing in the console. Rate-limited to one line per minute so a
+      // persistent failure cannot flood the console every 2.5 s.
+      reportOnce("paintRows failed: " + ((e && e.stack) || e));
     } finally {
       injecting = false;
+    }
+  }
+
+  // v1.21.0 (A14): one console line per distinct failure per minute.
+  var lastReportAt = 0;
+  function reportOnce(text) {
+    try {
+      var now = Date.now();
+      if (now - lastReportAt < 60000) return;
+      lastReportAt = now;
+      console.error("[chat_shepherd] " + text);
+    } catch (e) {
+      /* console unavailable */
     }
   }
 

@@ -155,7 +155,13 @@ def _check(cfg: Any, force: bool, modules) -> dict[str, Any]:
     cur: dict[str, float] = {}
     for name, rel in watch:
         try:
-            cur[name] = os.stat(p(rel)).st_mtime
+            # v1.21.0 (O13): st_mtime_ns, not the float st_mtime. The float is
+            # coarse on some mounts and quantized on others, so two edits
+            # inside one mtime tick compared equal and the patch was silently
+            # ignored - the reload reported "clean" for a file the operator
+            # had just saved. A missing file still maps to -1.0, and priming
+            # runs the same path, so a file that appears later is still seen.
+            cur[name] = os.stat(p(rel)).st_mtime_ns
         except OSError:
             cur[name] = -1.0
 

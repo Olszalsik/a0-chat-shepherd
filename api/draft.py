@@ -26,6 +26,7 @@ from typing import Any
 from helpers.api import ApiHandler, Request, Response
 
 from usr.plugins.chat_shepherd.helpers import state as state_mod
+from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers.state import (
     get_chat,
     update_chat,
@@ -79,33 +80,30 @@ class Draft(ApiHandler):
 
         if not draft_id:
             return {'success': False, 'error': 'draft_id is required'}
-
-        # Lock-free peek for cheap early returns only; the transaction
-        # below re-finds the draft on a fresh locked snapshot.
-        # v1.18.1: sync file reads stay off the request event loop.
-        peek = await asyncio.to_thread(state_mod.load_state)
-        draft = None
-        for d in peek.get('drafts', []):
-            if isinstance(d, dict) and d.get('id') == draft_id:
-                draft = d
-                break
-        chat_id = str(draft.get('chat_id') or '') if draft else ''
-
-        if draft is None:
-            return {'success': False, 'error': f'Draft {draft_id} not found'}
-        if not chat_id:
-            return {'success': False, 'error': 'draft has no chat_id'}
+        # v1.21.0 (O7): action is validated BEFORE any state read, and the
+        # full `load_state()` peek is gone. It existed only to give cheap
+        # early returns, but it re-read and re-parsed the whole state file
+        # (and the journal) on every single review action, and the transaction
+        # below then did the same work again - so a send cost two full state
+        # loads to move one draft. The claim transaction now returns the draft
+        # (with its chat_id) and the dismiss transaction finds the draft
+        # itself, so nothing needs the peek. The atomic-claim race fix from
+        # v1.20.7 is unaffected: it lived in `_claim`, not in the peek.
         if action not in ('send', 'dismiss'):
             return {'success': False, 'error': f'Unknown action {action!r}'}
 
         if action == 'dismiss':
             def _apply(st: dict) -> dict:
-                found = any(
-                    isinstance(d, dict) and d.get('id') == draft_id
-                    for d in st.get('drafts', [])
+                draft = next(
+                    (d for d in st.get('drafts', [])
+                     if isinstance(d, dict) and d.get('id') == draft_id),
+                    None,
                 )
-                if not found:
+                if draft is None:
                     return {'success': False, 'error': f'Draft {draft_id} not found'}
+                chat_id = str(draft.get('chat_id') or '')
+                if not chat_id:
+                    return {'success': False, 'error': 'draft has no chat_id'}
                 now_iso = _now_iso()
                 update_chat(st, chat_id,
                     draft_dismissed_at=now_iso,
@@ -150,9 +148,15 @@ class Draft(ApiHandler):
         claim = await asyncio.to_thread(state_mod.state_transaction_apply, _claim)
         if not claim.get('success'):
             return {'success': False, 'error': claim.get('error', 'Draft not found')}
-        # Prefer the claimed snapshot's text (the peek is stale by definition).
-        text = edited_text or str((claim.get('draft') or {}).get('text') or '').strip()
+        # v1.21.0 (O7): chat_id now comes from the claimed draft itself.
+        draft = claim.get('draft') or {}
+        chat_id = str(draft.get('chat_id') or '')
+        if not chat_id:
+            await _restore_claimed_draft(claim)
+            return {'success': False, 'error': 'draft has no chat_id'}
+        text = edited_text or str(draft.get('text') or '').strip()
         if not text:
+            await _restore_claimed_draft(claim)
             return {'success': False, 'error': 'draft text is empty'}
 
         try:
@@ -178,9 +182,13 @@ class Draft(ApiHandler):
             # safety net).
             entry = get_chat(st, chat_id)
             now_iso = _now_iso()
-            new_count = entry.get('nudge_count', 0) + 1
+            # v1.21.0 (A1): coerce the persisted counters before the arithmetic
+            # - a string counter here raised out of the transaction AFTER the
+            # draft had been delivered, so the operator saw a 500 for a send
+            # that worked, with the draft already gone.
+            new_count = monitor._as_int(entry.get('nudge_count', 0)) + 1
             update_chat(st, chat_id,
-                nudges_sent=entry.get('nudges_sent', 0) + 1,
+                nudges_sent=monitor._as_int(entry.get('nudges_sent', 0)) + 1,
                 nudge_count=new_count,
                 last_nudge_at=now_iso,
                 status='nudged',

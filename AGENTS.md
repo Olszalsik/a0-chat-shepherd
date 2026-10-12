@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.20.7 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
+**Version:** 1.21.3 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
 
 ## Purpose
 
@@ -12,7 +12,7 @@ Agent monitoring: a `job_loop` extension ticks periodically, classifies every li
 
 - `extensions/python/job_loop/_30_chat_shepherd.py` — `ChatShepherdTick(Extension)`; calls `helpers.monitor.tick(cfg)` synchronously each loop iteration (guarded, respects `enabled`); since v1.9.0 it resolves `monitor`/`hotreload` via module attributes and calls `hotreload.check_and_reload(cfg)` before every tick
 - `helpers/monitor.py` — `classify_chat()` (pure classifier: paused → running → error.txt → last-log-type → idle-minutes ladder) + `tick()` (state mutation, auto-nudge via `context.communicate(UserMessage(NUDGE_TEXT))`, intervention notification via `helpers.notification.NotificationManager`, nudge-counter reset when a chat runs/answers/pauses).
-- `helpers/state.py` — JSON persistence at `usr/plugins/chat_shepherd/data/state.json` (`{chats: {chat_id: entry}, last_tick}`; history lives in the append-only journal `data/history.jsonl` since v1.6.0); defensive `default_state()` on any parse failure; `cap_chats(state, keep, protected=...)` caps the dict to `MAX_TRACKED_CHATS` by `last_ticked` (v1.1.0) and, since v1.20.0, **never evicts an id in `protected`** (the tick passes the live-context set), so `keep` bounds only the dead/persisted-only surplus.
+- `helpers/state.py` — JSON persistence at `usr/plugins/chat_shepherd/data/state.json` (`{chats: {chat_id: entry}, last_tick}`; history lives in the append-only journal `data/history.jsonl` since v1.6.0); defensive `default_state()` on any parse failure; `load_state()` repairs unusable per-chat COUNTERS at the load boundary next to the v1.20.2 non-dict-entry drop (v1.21.0), and a repairing load deliberately does not adopt the saved baseline so exactly one write persists the repair; `read_journal()` parses incrementally from a cached byte offset with a head fingerprint guarding against an in-place rewrite (v1.21.0) and does its I/O outside `_journal_lock`; `save_state(state, signature=None)` writes compact JSON through a retrying atomic replace (v1.21.0); `cap_chats(state, keep, protected=...)` caps the dict to `MAX_TRACKED_CHATS` by `last_ticked` (v1.1.0) and, since v1.20.0, **never evicts an id in `protected`** (the tick passes the live-context set), so `keep` bounds only the dead/persisted-only surplus — see the size caveat in *Known limitations*.
 - `helpers/constants.py` — `PLUGIN_NAME`, status string constants, `NUDGE_TEXT` (the auto-nudge prompt), `HISTORY_LIMIT`.
 - `helpers/hotreload.py` (v1.9.0) — `check_and_reload(cfg)`: mtime watch on the helper modules, compile gate, all-or-nothing reload with rollback, RLock preservation, 60s backoff, never raises; `status()` feeds the `/status` `hot_reload` block.
 - `api/export.py` (v1.6.0) — full JSON export (merged chat state + journal tail).
@@ -36,7 +36,54 @@ Agent monitoring: a `job_loop` extension ticks periodically, classifies every li
 - **Badge identity**: repaint is keyed on `data-cs-status`, not on the glyph — two statuses may share one pictogram and must still update colour, tooltip, and `aria-label`. A badge already inside the current host is reused, never recreated; one found in a stale host is dropped.
 - **Extension script idempotence**: the file is a classic script inside the `sidebar-chats-list-start` HTML extension, and the component loader re-executes it on every extension (re)load. The `window.__chatShepherdSidebar` guard makes repeat loads a no-op that only re-runs `refresh()`, so timers and observers cannot stack.
 - The core sidebar exposes no per-row content extension point, so the badge is injected DOM. Keep it inside the row's own label host so Alpine re-renders (row add/remove/reorder) simply drop it and the 2.5 s poll repaints.
-- **Shared store lifecycle (v1.20.2)**: `webui/shepherd-store.js` is ONE store shared by the sidebar injector and the dashboard modal, so its poll is page-scoped. `cleanup()` must stay a no-op — the dashboard's `x-destroy` used to stop the poll and froze the sidebar icons on stale data for the rest of the page session. The sidebar's 2.5 s loop re-arms `startPolling()` if it ever finds `_started && !pollTimer`, so no surface can silently freeze the icons. `startPolling()` always calls `stopPolling()` first, so repeated `onOpen()` never stacks timers.
+- **Shared store lifecycle (v1.20.2)**: `webui/shepherd-store.js` is ONE store shared by the sidebar injector and the dashboard modal, so its poll is page-scoped. `cleanup()` must stay a no-op — the dashboard's `x-destroy` used to stop the poll and froze the sidebar icons on stale data for the rest of the page session. The sidebar's 2.5 s loop re-arms `startPolling()` if it ever finds `_started && !pollTimer`, so no surface can silently freeze the icons. **v1.21.0: `startPolling()` is a self-scheduling `setTimeout` chain, not `setInterval`** — never more than one poll in flight (`_inFlight`), and a `_pollGen` generation counter makes re-arming from inside an in-flight poll safe (`applyPollFromConfig()` does exactly that when `poll_seconds` changes); without the counter the in-flight chain would reschedule on top of the fresh one and two chains would poll forever. `fetchStatus()` returns early while a poll is in flight and treats a `degraded: true` payload as a latched failure that does NOT overwrite `this.data`.
+- **One log snapshot per chat per pass (v1.21.0)**: `monitor._log_snapshot(context)` takes `context.log._lock` exactly once and returns a `_LogView` (length, updates, bounded tail, last entry type). Every scanner — `_last_log_type`, `_last_log_fatal`, `_scan_log_for_termination`, `_last_response_text`, `_last_entry_type`, `_log_len`, `_log_updates` — plus `classify_chat` and `_wedge_minutes` takes an optional `view` and must never touch `context.log.logs` itself (TEST34 pins this structurally). A missing `log.updates` degrades that field to -1 ("unknown", disables the liveness probe) instead of sinking the whole snapshot. Blocking the agent's own log writer is the cost that matters here, which is why the lock count is the thing to protect.
+- **Persisted counters must survive coercion (v1.21.0)**: anything read out of
+  `state.json` and used in an int comparison or an `+ 1` goes through
+  `state._repair_counters` (load boundary, `monitor._as_int`, or the handler's
+  `_to_int`). The three drains that run after the per-chat loop have NO exception guard, so a raw read there aborts the whole tick — that is the failure mode v1.20.2 believed it had closed by fixing one call site.
+- **The state fingerprint is cached by CONTENT, never by stat (v1.21.3).**
+  `_state_signature_cached` keys a one-entry cache on a sha256 of the bytes
+  `load_state` just read, and `state_transaction_apply` baselines on
+  `_last_loaded_sig`. Do **not** key this cache on `(mtime_ns, size)` the way
+  the journal cache does — `state.json` is rewritten in whole on every save, so
+  two payloads of identical length written inside the filesystem's timestamp
+  granularity share a stat key, and a stale fingerprint does not slow anything
+  down, it silently disarms the quiet-tick save gate (that is exactly how the
+  first attempt failed, caught by TEST30). Likewise do not baseline the
+  transaction on `_last_saved_sig`: its adoption is conditional (skipped when a
+  save raced the read, or when the load repaired something), so it can describe
+  different bytes — `_last_loaded_sig` exists to be the unconditional
+  alternative. TEST45AA pins both, the second structurally (the transaction
+  holds `_state_lock` and re-loads, so no behavioural test can tell them apart).
+- **Coercion seams must catch OverflowError AND reject non-finite values
+  (v1.21.1)** — every int/float seam in this plugin (`state._as_int`,
+  `monitor._as_int`, `monitor._as_float`, `adaptive._num`, `api/status._to_int`,
+  `/history`'s limit) catches `(TypeError, ValueError, OverflowError)` and
+  returns its fallback, never a non-finite result. Three separate incidents in
+  three release cycles, all the same shape: `int()`/`float()` reject non-finite
+  *floats* but `int(float('inf'))` and `float(10**400)` raise **OverflowError**,
+  which a two-arm handler does not catch, and `float('inf')`/`float('nan')`
+  *succeed* — an inf stall threshold makes every chat instantly stalled, so the
+  value silently inverts the supervision policy instead of degrading. JSON
+  bodies and hand-edited config/state files can all carry these (Python's
+  `json.loads` accepts `Infinity`, `NaN` and arbitrary-precision integers).
+  Prefer routing new reads through an existing seam over adding a bare
+  `int(...)`/`float(...)`; TEST45S/45W and the two structural source checks pin
+  the arms. Note also the fallback discipline: a seam that must distinguish
+  "unusable" from a legitimate `0` (a throttle `budget` of 0 means auto-nudging
+  off) needs an explicit `fallback` argument, never `or <default>`.
+- **Row id must not be cached in the sidebar memo (v1.21.1)**: the WeakMap in
+  `webui/shepherd-sidebar.js` holds DOM handles only (`{badge}`). Alpine's
+  keyed `x-for` reuses elements across a key change and patches the bound data
+  in place, so a memoized id survives a re-key and keeps painting the old
+  chat's status on a row that now shows another one. The chat id is
+  re-resolved every pass (one `getAttribute` on core rows); the container's own
+  `data-cs-status` is the cross-check on the fast path.
+- **The poll's in-flight latch belongs to the request, not the timer
+  (v1.21.1)**: `stopPolling()` must NOT clear `_inFlight`. `fetchStatus`'s
+  `finally` owns it; clearing it on a re-arm lets a second poll start while a
+  slow snapshot is still awaiting.
 - **Poll-failure toast latch (v1.20.2)**: `_fetchFailed` is a latch, not a flag. Set it **after** the `if (!this._fetchFailed)` check on both failure paths, and clear it only on a successful response. It was previously only ever assigned `false`, so the "toast once, not every 5 s" contract was dead code and a wedged backend toasted every poll.
 
 - **Extension point**: `job_loop` fires on the framework's periodic loop; the extension is a `helpers.extension.Extension` subclass with `async execute(**kwargs)` — plain functions are never loaded (see [[extension-synthetic-class-gotcha]]).
@@ -52,7 +99,7 @@ Agent monitoring: a `job_loop` extension ticks periodically, classifies every li
 - **Cross-thread `communicate()` (v1.1.0, P4 — audited, safe)**: `tick()` runs on the JobLoop thread but calls `context.communicate()` on other contexts. Verified safe: if the target task is alive it sets `agent.intervention` (plain attribute write); otherwise `DeferredTask.start_task` → `EventLoopThread.run_coroutine` = `asyncio.run_coroutine_threadsafe` onto the context's name-keyed shared loop (`helpers/defer.py`). No nudge executes inline on the JobLoop thread.
 - **Restart recovery (v1.1.x)**: a `last_tick` gap > `RESTART_GAP_MINUTES` (5) flags a server/job-loop restart. USER-type contexts that were active before it, are not running after it, and whose log doesn't end with `response`, become `interrupted` (🔌) and get a `RESUME_TEXT` nudge from a dedicated resume queue (budget ≥ 3/tick, bypasses per-chat cooldown, still respects `max_auto_nudges`). Scheduler (`AgentContextType.TASK`) chats are excluded — the scheduler resumes its own chats. History gets a `restart_detected` entry.
 
-## Known limitations (verified true as of v1.20.5)
+## Known limitations (verified true as of v1.21.3)
 
 Every bullet here was re-checked against the code on 2026-09-27. Earlier
 versions of this list carried three entries that had already been fixed
@@ -61,21 +108,28 @@ predicate) - they are recorded in the changelog under the release that fixed
 them, not here. Do not re-file them.
 
 - `tick()` runs synchronously on the JobLoop thread (blocking `state.json` I/O + log scans). A filesystem wedge there freezes only shepherding, not chats, and `files.exists` is globally bounded. **As of v1.20.5 every request handler reads off the event loop** — `/status` and `/draft` (v1.18.1) plus `/config`, `/history` and `/export` (v1.20.5), so a slow 9p stat in a plugin request can no longer stall the rest of the server. What remains is the JobLoop side, which is by design: the tick is the shepherd's own work.
-- `api/*` handlers keep their `from`-import bindings until the next plugin refresh, so an endpoint change needs a refresh or restart. The helper/tick path hot-reloads on its own (v1.9.0) and the `hot_reload` block in `/status` reports the last result.
+- `api/*` handlers keep their `from`-import bindings until the next plugin refresh, so an endpoint change needs a refresh or restart. The helper/tick path hot-reloads on its own (v1.9.0) and the `hot_reload` block in `/status` reports the last result. **v1.21.0: the three `state` bindings that made this matter for hot reload are gone** (`api/status.py`, `api/export.py`, `api/history.py` now call `state_mod.*`, pinned by TEST45J), so a `helpers/state.py` patch now reaches those endpoints too; anything else they still pin is a smaller surface than before.
+- `state.json` grows with the number of LIVE contexts, not with `MAX_TRACKED_CHATS` (v1.21.0, recorded rather than fixed). Since v1.20.0 a live context is never evicted, so the 100 cap bounds only the dead surplus: the audit host carried 298 entries / 295 KB with 278 live-or-persisted and 20 already prunable. Every poll reads that file and every durable change rewrites it. **v1.21.3 measured this properly: the size was never the cost.** Profiling the 298-entry file gives read 1.1 ms + parse 2.5 ms, and `load_state()` ~19 ms of which **50% was the fingerprint** — which scales with entry count and runs on every poll and every transaction, while the file read does not. The signature is now cached by a digest of the bytes just read (**19 ms → 6 ms**), the transaction baselines on the loaded fingerprint instead of re-serializing, and serialization is compact (v1.21.0). The remaining per-poll cost is the read + parse, which is inherent. If an instance ever passes a *thousand* live contexts, split cold bookkeeping into a second file then — not before.
 - Wedge detection compares the log ENTRY count (plus a mutation counter since v1.10.0, which separates an actively-streaming call from a fully hung one). A long legitimate tool call that emits no entries for `stall_minutes` can still classify as `intervention`. Mitigations: the immediate task-kill requires `wedge_soft_restart: true` (off by default), and the flag drains when the call returns.
 - `watch_all: false` skips any context with an empty log. The per-chat watch list (`allowed_chat_ids`) is implemented and enforced in `tick()`.
 - `state.json` and `config.json` are deliberately NOT removed by `hooks.uninstall()` - a reinstall resumes monitoring with its history intact. Only the debug logs are deleted.
 
-## Release readiness (v1.20.5)
+## Release readiness (v1.21.3)
 
-**What is verified.** 122 backend markers (112 + the 10 TEST44 audit-fix
-regressions), 26 shared-store and 23 sidebar assertions; `node --check` and
-`py_compile` clean; the core sidebar contract tests pass; `config.json`
-holds only explicitly-set values (v1.20.6). Seven deliberate mutations (disabling the v1.20.4 guard,
-retrying without `force`, restoring `status='nudged'`, removing the confirm
-branch, restoring the v1.20.5 silent key-drop, returning either `/config`
-branch to an inline read, and reusing export's 200-entry mirror) each fail the
-suite, so those tests are not vacuous.
+**What is verified.** 148 backend markers (122 shipped + 26 audit
+regressions), 41 shared-store and 35 sidebar assertions; `py_compile` and
+`node --check` clean; an AST undefined-name sweep over all 19 modules clean;
+`config.json` holds only explicitly-set values (v1.20.6) and `DEFAULTS` matches
+`default_config.yaml` exactly (33/33, zero drift). Forty-one deliberate
+mutations across the audit each fail the suite, so those tests are not vacuous
+— and finding that six gaps escaped them is why the count is reported with the
+caveat below rather than as a blanket guarantee.
+
+**Open items: none.** All three carried from v1.21.2 are closed (scratch-dir
+hygiene, the stale `TEST16C` container caveat, and the state-cost item — which
+was measured rather than assumed, and turned out to be the fingerprint rather
+than the file size). The remaining bullet under *Known limitations* about a
+thousand live contexts is a scale threshold, not a task.
 
 **What is NOT certified.** "Bug free" is not a claim this repo can make, and
 the following are genuinely outside what the suites prove:
@@ -83,9 +137,17 @@ the following are genuinely outside what the suites prove:
 - Multi-day unattended runtime behaviour, and real 9p/network-filesystem
   latency. The suites are seconds-long and run against fake contexts.
 - Real Telegram/webhook delivery (only the send path's shape is tested).
-- `TEST16C` needs the framework runtime (`/opt/venv-a0/bin/python`), because
-  it exercises the `/status` handler's lazy `pathspec` import; it cannot run
-  in the plain Windows venv. Run it in the Docker container.
+- ~~`TEST16C` needs the framework runtime~~ — **RESOLVED (v1.21.3): stale since
+  v1.15.0, closed here.** The old caveat said this marker could only run under
+  `/opt/venv-a0/bin/python` because the `/status` handler's lazy
+  `get_plugin_config` → `helpers/projects.py` → `pathspec` import only exists
+  in the container runtime. Verified directly: the project venv
+  (`.venv/Scripts/python.exe`) has `pathspec`, the bare interpreter does not,
+  and TEST16C runs and asserts green there — including proof that the import
+  really is exercised (`"pathspec" in sys.modules` is `True` after the call, and
+  the aggregates block is computed from the journal, not stubbed). The whole
+  suite is now verified on this host. The container runtime is still the only
+  place to test genuine 9p mount latency (see *What is NOT certified*).
 - Third-party sidebar row views that do not reuse the core components and
   publish no id attribute (they lose badges - the `nudgeHint`/tooltip and the
   dashboard remain fully usable).
@@ -93,8 +155,8 @@ the following are genuinely outside what the suites prove:
   they were confirmed identical before and after every plugin change.
 
 **Verdict: production-ready**, with the five limitations above accepted by
-design rather than outstanding as defects. Ongoing work is tracked in the
-changelog, not here.
+design rather than outstanding as defects. **No open items remain** as of
+v1.21.3. Ongoing work is tracked in the changelog, not here.
 
 ## Roadmap — v1.1.0 "repair after the 2026-09-09 loop freeze" (IMPLEMENTED 2026-09-10)
 
@@ -146,8 +208,8 @@ Context: the plugin was being built by an agent whose chat died in the three 9p 
 
 ## Verification
 
-- `node usr/plugins/chat_shepherd/tests/suite_store.mjs` — shared-store regression suite (v1.20.4; 26 assertions, data-URL module harness — stubs `showConfirmDialog` + `toastFrontendSuccess` to exercise the guarded-nudge confirm flow).
-- `node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs` — badge-injector DOM regression suite (v1.20.1; 23 assertions, no external deps).
+- `node usr/plugins/chat_shepherd/tests/suite_store.mjs` — shared-store regression suite (v1.21.0; 41 assertions, data-URL module harness — stubs `showConfirmDialog` + `toastFrontendSuccess` to exercise the guarded-nudge confirm flow, and covers the poll in-flight latch, the re-arm generation guard, the degraded-snapshot path and timeline pruning).
+- `node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs` — badge-injector DOM regression suite (v1.21.0; 31 assertions, no external deps — adds the bounded row-id walk and the reported-paint-failure cases).
 - `node --check usr/plugins/chat_shepherd/webui/shepherd-sidebar.js` and `.../shepherd-store.js`.
 - `python -m py_compile` over every plugin module.
 - `GET/POST /api/plugins/chat_shepherd/status` returns live classified chats + counts + config snapshot.
@@ -269,6 +331,322 @@ User report after updating Agent Zero: chat status icons were missing from the r
 - **Idempotence**: `shepherd-sidebar.js` is a classic script inside the `sidebar-chats-list-start` HTML extension, and the component loader re-clones and re-executes it on every extension (re)load. A `window.__chatShepherdSidebar` guard now makes repeat loads a no-op that only calls `refresh()`, so the poll interval and MutationObserver can no longer stack.
 - **Robustness**: `injectBadges` reschedules instead of silently dropping a re-entrant pass and swallows per-run DOM errors so a transient row shape cannot kill the poll loop; `pointer-events: none` keeps the row fully clickable; `role="img"` + `aria-label` added.
 - **Tests**: new `tests/suite_sidebar.mjs` — a dependency-free DOM harness (no jsdom in this repo) that runs the real injector against the four row shapes Agent Zero actually renders, plus placement, repaint, idle/blank-icon clearing, observer anchoring, and repeat-load idempotence. 22 assertions, `node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs` green. `node --check` green on both plugin scripts; the Python suite still reports ALL_TESTS_PASSED.
+### v1.21.3 — the three open items closed, and one measured wrong (2026-10-05)
+
+The three open items from v1.21.2. Two closed as expected; the third turned
+out to have been diagnosed incorrectly, which was the most useful outcome of
+the pass.
+
+**1. P6.2 scratch-dir hygiene — CLOSED.** The suite now redirects
+`monitor._CHAT_DIR_BASE` to `tmp/chat_shepherd_suite_chats` for the whole run
+(one assignment, courtesy of the v1.21.2 `_chat_dir` seam) and clears the
+listing / error-file / name caches on entry and exit, so nothing resolved
+against the real base is reused. Fixture chats — including the `chat.json`
+files the name resolver reads, which the suite previously lacked, meaning the
+v1.21.0 LRU eviction had only ever run against a missing file — now live under
+the scratch base. TEST45Y asserts the behavioural half: no `csTst*`/`nme45q*`
+directory may exist under the real `usr/chats`, the base must still be
+redirected, and the fixtures must resolve. Mutation-tested: dropping the
+redirect, or making `make_chat_dirs` bypass the base, both fail the suite —
+and the second one *leaked into the live tree during that battery*, which is
+the residue TEST45Y exists to prevent (removed; it was empty).
+
+**2. `TEST16C` — the caveat was STALE, closed.** v1.15.0 recorded that this
+marker could only run under `/opt/venv-a0/bin/python` because `/status`'s lazy
+`get_plugin_config` → `helpers/projects.py` → `pathspec` import exists only in
+the container runtime. Verified directly instead of taken on faith: the project
+venv has `pathspec` (the bare interpreter does not), the marker runs and
+asserts green here, and the import is genuinely exercised —
+`"pathspec" in sys.modules` is `True` after the call and the aggregates block is
+computed from real journal rows. The whole suite is now verified on this host.
+The container runtime remains the only place that can exercise real 9p mount
+latency, which stays under *What is NOT certified*.
+
+**3. The state-size item — I HAD DIAGNOSED IT WRONG, and the fix was better
+than the plan.** The recorded plan was "split cold bookkeeping into a second
+file". Profiling first showed that would have been wasted work: with 298
+entries / 295 KB, the file read is 1.1 ms and the parse 2.5 ms, but
+`load_state()` costs ~19 ms — and **50% of it is `state_signature`**, which
+`load_state` computes only to adopt the saved baseline. That cost scales with
+entry count and runs on *every* `/status` poll per open tab plus every
+transaction; file size was never the bottleneck. So the fix targets the
+signature instead:
+
+- `load_state` keys a one-entry cache on a **sha256 of the file bytes it just
+  read** and skips the recompute on an unchanged load: **19 ms → 6 ms** here.
+  `state_transaction_apply` then baselines on `_last_loaded_sig` — the
+  fingerprint of what the load read — instead of re-serializing the file.
+- **The cache is keyed on CONTENT, not on `(mtime_ns, size)`** — and that is
+  not a stylistic choice. My first attempt used the stat key, mirroring the
+  journal cache, and TEST30 failed immediately: `state.json` is rewritten in
+  whole on every save, and two payloads of identical length written inside the
+  filesystem's timestamp granularity share a stat key. The cache then served a
+  stale fingerprint, which does not slow anything down — it silently disarms
+  the quiet-tick save gate. A digest of the bytes already read is an exact
+  identity and still ~6× cheaper than the signature it avoids. TEST45AA
+  constructs two same-length payloads on purpose; mutation-testing a stat-keyed
+  cache now fails the suite with `clean load lost the baseline`.
+- `_last_loaded_sig` is deliberately distinct from `_last_saved_sig`: the
+  latter's adoption is *conditional* (skipped when a save raced the read or
+  when the load repaired something), so it can describe different bytes. The
+  first draft of this change read back the conditional one — the race in v1.20.0
+  P8, re-introduced.
+
+**Two mutation escapes, and why one of them stayed.** Of five cache mutations,
+two escaped: baseline on the conditional save baseline, and recompute the
+signature anyway. The first is now caught by a **structural** TEST45AA(b)
+assertion (source-level, `ast`), because `state_transaction_apply` holds
+`_state_lock` and calls `load_state()` itself — it re-establishes both values,
+so no behavioural test can distinguish them; two attempts confirmed that, and
+neutering the structural guard makes the race escape again, which is the
+proof the assertion does the work. The second (recompute anyway) is
+*correct, only slow*, so it needed a call-count assertion rather than a
+correctness one.
+
+**Verification.** 148 backend markers, 41 store, 35 sidebar assertions;
+`py_compile` + `node --check` clean; AST undefined-name sweep clean.
+Mutation coverage across the whole audit: **41**, each confirmed to fail the
+suite.
+
+### v1.21.2 — post-audit pass: one seam for the chat-dir base (2026-10-05)
+
+A last consistency sweep while answering "is anything left?". `config_defaults.DEFAULTS`
+and `default_config.yaml` were checked for drift (33/33 keys, zero value
+differences) and `prune_to_explicit` re-verified for idempotence, unknown-key
+preservation and secret retention — all clean.
+
+One real latent inconsistency did turn up. `_CHAT_DIR_BASE` existed only for the
+scandir in `_chat_dir_ids()`, while **four sites interpolated `'usr/chats/'`
+inline** — and one of them was the fallback probe *inside* `_has_chat_dir`,
+the exact predicate that decides whether a chat is supervised at all. If the
+base and the listing ever disagreed, `_has_chat_dir` swallows the exception and
+returns `False`, so a real chat stops being nudged with no visible signal. All
+four now go through `monitor._chat_dir(chat_id)`, and TEST45X pins it
+structurally with `ast` (docstrings mention the literal legitimately, so a text
+check would either miss a real concatenation or exempt prose by hand).
+
+Side effect: the chat-dir base is now redirectable in one place, which is what
+the long-deferred **P6.2 scratch-dir hygiene** item needed. The suite still
+creates real `usr/chats/csTstA01..C` dirs (they match `CHAT_ID_PATTERN`, so a
+live tick can briefly track them if a run dies mid-test); redirecting
+`_CHAT_DIR_BASE` to `tmp/` in the suite's `main()` would close that. Verified
+that the redirect works end to end (predicate, title and display name all follow
+it) — **not applied here**, because doing so is a test-layout decision, not a
+production fix, and it belongs with whoever next touches the suite.
+
+**Verification.** 147 backend markers, 41 store, 35 sidebar assertions;
+`py_compile` + `node --check` clean; the AST undefined-name sweep clean. Three
+mutations of the new seam each fail the suite (inline fallback probe, inline
+title path, seam ignoring the base), so TEST45X is not vacuous. Cumulative
+mutation coverage across the audit: **36**.
+
+### v1.21.1 — audit cycles 2 and 3: boundary coercion, memo staleness, poll latch (2026-10-05)
+
+The v1.21.0 remediation was followed by two further full audit+remediation
+cycles over the *resulting* code, as the audit process requires. Cycle 2 used
+three techniques the first cycle had not: an AST-based undefined-name sweep
+over all 19 modules, a hostile-input boundary probe that feeds every endpoint
+the shapes a JSON body can actually carry, and reference-counting to find
+runtime-dead helpers. Cycle 3 re-reviewed every v1.21.0 and cycle-2 change
+adversarially and probed the handlers end to end.
+
+**Cycle 2 findings (6 fixed)**
+
+1. **`int(float('inf'))` raises OverflowError, which the two-arm coercion
+   handlers did not catch** (`state._as_int`, `monitor._as_int`). This was the
+   same hole as A1 in a place the fix had not reached: on the LOAD path it
+   meant `load_state()` itself raised, and `load_state` has NO exception guard,
+   so one hand-edited non-finite counter reproduced exactly the whole-tick
+   blindness the v1.21.0 repair exists to prevent. Now caught, with the guard
+   kept deliberately minimal (TEST45S): a mutation that removed a
+   post-hoc non-finite filter proved such a filter is unreachable, because
+   `int()` already rejects every non-finite input.
+2. **`read_journal` silently dropped entries for a non-positive limit.**
+   `selected[-limit]` with a negative limit returns nothing for a short
+   journal and everything-minus-five for a long one. No caller passes a
+   non-positive limit today; the fix makes "no tail trimming" explicit instead
+   of accidental (TEST45T).
+3. **The sidebar repaint memo cached the CHAT ID, not just DOM handles.** My
+   own O11 optimization: Alpine's keyed `x-for` REUSES elements across a key
+   change and patches the bound data in place, so a cached id survives a
+   re-key and keeps painting the old chat's status on a row now showing another
+   one. The memo now holds only element handles and re-resolves the id every
+   pass; TEST45 pins the re-key case. An O11-shaped fix that is only correct
+   for a fresh page.
+4. **`stopPolling()` cleared the in-flight latch**, so a re-arm happening while
+   a slow snapshot was still awaiting could start a second concurrent poll —
+   the exact thing the latch (v1.21.0 A11) exists to prevent. The latch belongs
+   to the request lifecycle and is cleared by `fetchStatus`'s `finally`.
+5. **`_log_updates` became runtime-dead** after the O5 snapshot refactor (the
+   tick and `/status` read `view.updates` directly). Kept deliberately as the
+   documented standalone equivalent, with a comment warning against "optimizing"
+   the two call sites back to it, plus the live rationale that the tick header
+   legitimately reads the log before the per-chat snapshot exists.
+6. **`/history` was the one endpoint with no `isinstance(input, dict)` guard**
+   (v1.20.7 added it to four handlers and missed this one) and its `limit`
+   coercion had the same two-arm handler. Both closed (TEST45V).
+
+**Cycle 3 findings (5 fixed)**
+
+7. **`float(10**400)` raises OverflowError, and `float('inf')`/`float('nan')`
+   SUCCEED** — in `monitor._as_float` and `adaptive._num`, both of which guard
+   the tick header outside the per-chat guard. The raise is the v1.20.7 hole
+   again; the success is worse than a raise, because an inf cooldown makes
+   every chat instantly off-cooldown and an inf stall threshold makes every
+   chat instantly stalled — a hand-edited value silently INVERTS the
+   supervision policy instead of degrading. Both seams now catch OverflowError
+   and reject non-finite results (TEST45W).
+8. **`/status`'s throttle budget had its own inline `try/except` with the
+   two-arm handler**, inside the block the v1.21.0 degrade guard covers — so
+   the seam's own guard was firing on its unguarded neighbour and a
+   non-finite persisted budget produced `degraded: true`. It now goes through
+   `_to_int`, which also gained a `fallback` argument because this key must
+   distinguish "unusable" from a legitimate 0 (0 = auto-nudging off; replacing
+   it with the default would paint a false "capped" reading).
+9. **`poll_seconds` had the same inline pattern and the same arm**, and an
+   `or 5` I introduced in cycle 3's first cut collapsed a legitimate 0 to the
+   default instead of clamping it up to the 2 s floor. Caught by the test
+   written in the same commit; fixed with the same explicit-fallback
+   approach.
+10. **`_to_int` also guarded `poll_seconds` from a config value** that the
+    framework merges without type coercion — a hand-edited
+    `poll_seconds: Infinity` in `config.json` degraded every dashboard poll.
+
+**Techniques worth repeating.** The AST undefined-name sweep (built because
+v1.21.0 shipped a stale `tail` reference inside a `try/except` that swallowed
+the NameError and silently disabled the durable termination stamp) reports zero
+across all 19 modules. The hostile-input probe found three of the six cycle-2/3
+findings that reading did not, because Python's `json.loads` accepts
+`Infinity`/`NaN` and arbitrary-precision integers — shapes a hand-edited file
+or a curious client can send but that never appear in a code review. Runtime
+reference counting found the dead `_log_updates`.
+
+**Verification.** 145 backend markers (up from 140), 41 store, 35 sidebar
+assertions (up from 31). `py_compile` + `node --check` clean; the static
+undefined-name sweep clean. **Mutation-tested: 33 mutations across the three
+cycles, every one confirmed to fail the suite**; three gaps found this way were
+closed (the resume drain had no coverage, the journal tail needed a
+bytes-read proof, and `status poll coercion` escaped a battery because the test
+for it did not exist yet). Every battery ends with a green restore run.
+
+### v1.21.0 — audit remediation: 15 defects + 14 optimizations (2026-10-05)
+
+A source-only technical audit (findings filed verbatim further down this file)
+followed by remediation. Three defects were bugs in the *previous* fixes rather
+than in new code, and two of the four implementation bugs below were caught by
+this plugin's own suite while the fixes were being written — recorded here
+because that is the argument for keeping the suite at this size.
+
+**Defects closed**
+
+1. **Persisted counters are coerced at the load boundary** (A1). v1.20.2 added
+   `monitor._as_int` and claimed it made "any state counter" safe, but wired it
+   into `classify_chat` only. Every other read was raw, and three of those sites
+   run in the drains AFTER the per-chat loop: a string in `nudges_sent` or
+   `wedge_nudges_sent` raised `TypeError` and killed the entire tick — no nudges,
+   no prune, no cap, no throttle snapshot for any chat, traceable only in the
+   rotated debug log. A string in `nudge_count` silently stopped that chat being
+   nudged again while the dashboard still showed "nudge 3/3 used".
+   `state.load_state` now repairs every counter of every surviving entry (next
+   to the v1.20.2 non-dict repair), a repaired payload is deliberately NOT
+   adopted as the saved baseline so exactly one write persists the repair, and
+   all 14 remaining raw sites coerce locally so an in-process writer cannot hit
+   the same hole. `/nudge` had the sharpest version of this: it raised AFTER
+   `communicate()`, so the operator got a 500 for a nudge that went out.
+2. **`/status` degrades instead of 500ing** (A2). Per-chat classification was
+   guarded; the effectiveness / adaptive / throttle / payload blocks were not, so
+   one malformed field froze every sidebar icon on stale data for the rest of the
+   page session. `_snapshot_sync` is now a guarded wrapper over `_build_snapshot`
+   and returns a valid `degraded: true` payload; the store toasts it once and
+   keeps its last good data.
+3. **Request fields are coerced, and `resolve` validates `action`** (A3).
+   `helpers/api.py:79-83` normalizes a non-dict body, but dict *values* arrive
+   raw: `{"chat_id": 123}` raised `AttributeError` on `.strip()` → bare 500.
+   `nudge`/`resolve` now `str()` their fields like the other handlers do, and an
+   unknown `resolve` action is rejected instead of silently clearing the budget.
+4. **`adaptive.configured_values` cannot raise** (A4) — the v1.20.7 `_as_float`
+   treatment never reached this module, so a hand-edited knob degraded the whole
+   adaptive overlay to `adaptive_tag='error'` in the tick and deleted the
+   `/status` reflection, both invisibly. Also drops an `or 10` that turned a
+   legitimate configured `0` into 10.
+5. **`/config` writes off the event loop** (A5). v1.20.5 offloaded both read
+   seams and left the write inline; TEST41 only pinned the reads.
+6. **`capped` means suppressed** (A6) — supervised mode with a zero budget queues
+   editable drafts and suppresses nothing, yet reported a red "capped" badge.
+7. **Dead `pre_drain_nudged` removed** (A7) — `summary['nudged']` only ever moves
+   inside that drain, so the snapshot was always 0.
+8. **Endpoints reach state through the module** (A8). `api/status.py`,
+   `api/export.py` and `api/history.py` pinned `load_state`/`read_journal` with
+   from-imports, which survive a `helpers/state.py` hot-reload — so a state
+   patch silently did nothing for those endpoints, and `/status` could mix two
+   generations of state code in one request. TEST41 and the new TEST45J pin this.
+9. **`_notify` no longer reads the framework config directly** (A9) — the
+   `cfg=None` fallback bypassed the v1.20.3 seam and would have silently dropped
+   every external alert; TEST45K now asserts the seam is the only caller.
+10. **A2-adjacent UI work**: the store's `timelines` map is pruned to the tracked
+    chat set (A10, the `draftEdits` leak class), polling is a self-scheduling
+    `setTimeout` chain with an in-flight latch and a generation counter so a slow
+    snapshot can no longer stack requests or leave an orphan chain (A11), the
+    settings modal reuses the store's payload instead of firing its own
+    `/status` (A12), the sidebar row-id walk is bounded (A13) and a failing
+    paint is reported to the console once a minute instead of vanishing (A14).
+11. **The suite no longer writes into live production state** (A15). It
+    redirected `STATE_FILE`/`JOURNAL_FILE` but not `_debug_log`, so every run
+    appended test events to the shipped `debug-*.log` (confirmed on disk) and its
+    newest-7 rotation could evict a real day. TEST24A/TEST44G now assert against
+    the run's scratch sink, and TEST45R pins the redirect.
+
+**Optimizations shipped**
+
+12. **Journal reads are incremental** (O1) — the parse cache carries the byte
+    offset past the last complete line, so an unchanged poll does no journal I/O
+    at all and an appended row is read as a tail instead of re-parsing 379 KB per
+    poll. Growth alone is not proof of an append (compaction rewrites the file
+    in place and can end up *larger*), so a 512-byte head fingerprint must match
+    too; TEST8C caught that, and TEST45G proves the path by BYTES READ, since a
+    full re-parse returns identical entries and would pass a result-only
+    assertion.
+13. **The journal parse no longer holds `_journal_lock`** (O8) — the tick appends
+    while holding `_state_lock`, so a slow parse stalled the tick and every API
+    transaction behind it.
+14. **One log snapshot per chat per pass** (O5). `_log_snapshot()` takes the
+    agent's log lock once and returns a `_LogView` (length, updates, bounded
+    tail, last type); all seven scanners and `classify_chat` read it, instead of
+    up to 8 lock acquisitions and 5 tail copies per chat per tick and again per
+    poll. TEST34 now asserts the new invariant (the slice lives in exactly one
+    place) — a missing `log.updates` degrades to -1 instead of sinking the whole
+    snapshot, which is how the first cut of this broke TEST1.
+15. **`state_signature` computed once per save** (O3), **`state.json` serialized
+    compact** (O4, ~40% fewer bytes per durable write), **`os.replace` retried
+    briefly on lock contention** (a lost durable write is worse than 150 ms of
+    waiting; found by TEST45H on Windows), **aggregates cached per journal stat
+    key** (O2), **`/draft` reads state twice instead of three times** (O7 — the
+    lock-free peek existed only for early returns the transaction now provides),
+    **debug-log rotation once per UTC day** (O9), **`_NAME_CACHE` is a real LRU**
+    (O10: a full flush at 120 entries against ~345 chats meant a burst of
+    `chat.json` re-reads), redundant `get_chat` re-lookups dropped (O12), and
+    hot-reload keys on `st_mtime_ns` (O13, a float mtime can miss an edit).
+16. **Sidebar repaint memo** (O11) — `container -> {id, badge}` in a `WeakMap`,
+    so a repaint resolves nothing it already resolved and skips rows whose status
+    already matches.
+
+**Not changed, on purpose (O6).** `MAX_TRACKED_CHATS = 100` bounds only the dead
+surplus since v1.20.0's live-protection fix, so `state.json` scales with the
+number of live contexts (298 entries / 295 KB on the audit host, 20 of them
+already prunable). Evicting bookkeeping for a live chat would break its nudge
+budget, so the size is reduced where it can be (compact serialization, the
+signature gate, fewer needless writes) rather than by re-introducing a total cap.
+This is now stated in *Known limitations* instead of being implied by the
+constant.
+
+**Verification.** `python usr/plugins/chat_shepherd/tests/suite_monitor.py`
+ALL_TESTS_PASSED, including the new TEST45A–R block (18 markers). Store suite 41
+assertions (was 26), sidebar suite 31 (was 23). **Mutation-tested:** 16 targeted
+mutations of the new guards were each confirmed to FAIL the suite; four gaps
+found that way were closed (the resume drain had no coverage, the journal tail
+needed a bytes-read proof, and two of my own mutations were malformed and had
+proved nothing). Every mutation run was followed by a green restore run.
+
 ### v1.20.7 — independent audit fixes: 10 findings (2026-09-28)
 
 An off-DOX bug hunt (fresh reviewer, source-only) confirmed 10 real defects;
@@ -505,3 +883,232 @@ Whole-plugin read of every module (`helpers/*`, `api/*`, `webui/*`, the tick and
 ## v1.17.1 (2026-09-15) — review pass: webui notifications + log retention
 
 Full plugin audit (manifest/structure/patterns/security): PASS with 2 fixes shipped. Dashboard fetch/nudge/resolve/dismiss/draft/history failures previously rendered a persistent inline error div — replaced by the framework notification system (toastFrontendError), inline template + .shepherd-error css removed, store error field dropped (7 call sites, 16-point patch, node --check green). Poll-failure toasts guard on _fetchFailed so a wedged backend toasts once, not every 5s. helpers/monitor.py _debug_log now prunes daily logs beyond the newest 7 (probe-verified: 9→7 fixtures). hooks.py gains uninstall() removing debug logs only — state.json + config.json survive for reinstall continuity (live smoke: logs removed, STATE_PRESERVED). Advisories unchanged: LICENSE absent (community-only blocker), P7 read-modify-write race open. **(Both cleared in v1.18.0: LICENSE added in 47f0f76; RMW race fixed — reconciled 2026-09-18.)** Suite ALL_TESTS_PASSED (64 markers) on this tree; both modified modules import clean in the framework runtime.
+
+## Technical audit 2026-10-04 — read-only review (no code changed)
+
+Source-only audit of every module (`helpers/*`, `api/*`, `webui/*`, `hooks.py`, the
+job_loop extension) against the framework contracts in `helpers/api.py`,
+`helpers/plugins.py`, `webui/vendor/alpine/alpine.min.js` and the plugin's own
+data files. **No code was modified** (the hot-reload watcher only watches
+`helpers/*.py`, so nothing here can land in a live instance). Findings are
+filed below for a future release; severities are impact-based, not effort-based.
+
+Verification anchors used: framework input normalization
+(`helpers/api.py:79-83` turns a non-dict JSON body into `{}` BEFORE `process`,
+so the per-handler `isinstance(input, dict)` guards added in v1.20.7 are dead
+code, while dict field VALUES are still passed through raw); `ApiHandler`
+turns any handler exception into a plain-text 500 (`helpers/api.py:98-107`);
+Alpine `x-for` clones only `content.firstElementChild`
+(`webui/vendor/alpine/alpine.min.js`, x-for directive) — verified the
+dashboard table keeps a single root, so the timeline panel is fine; live data
+on this instance: 298 state entries / 295 KB `state.json`, 2779 journal lines /
+379 KB, 345 chat dirs under `usr/chats`.
+
+### Defects
+
+- **A1 (medium-high) — state counters are only coerced inside `classify_chat`.**
+  v1.20.2 added `monitor._as_int` and claimed it coerces "any state counter
+  without raising", but it was wired into `classify_chat` only. Every other
+  read of a persisted counter is raw: `monitor.py:631` and `:656`
+  (`entry.get('nudge_count', 0) <= 0`), `:1247` / `:1319` (`nudge_count <
+  max_nudges`), `:1353` / `:1399` / `:1428`, `:1354` / `:1400`
+  (`nudges_sent ... + 1`), `:1441` / `:1477` (`wedge_nudges_sent ... + 1`),
+  plus `api/nudge.py:139`, `api/draft.py:181` and the whole effectiveness block
+  in `api/status.py:190-206`. A string counter in `state.json` (hand-edit,
+  legacy write, half-migrated file) raises `TypeError` with two different
+  blast radii:
+  - inside the per-chat guard (`:631`, `:1247`, `:1319`, `:1267`): that one chat
+    is silently unsupervised for the tick and again on every following tick —
+    permanently, with no visible signal. `classify_chat` still reports
+    `Stalled for Nm, nudge 3/3 used` (it coerces), so the dashboard shows a
+    stalled chat with budget left while the drain refuses to queue it.
+  - inside the drains (`:1354`, `:1400`, `:1441`, `:1477`): those run after the
+    per-chat loop with NO guard, so `tick()` dies whole — no nudges, no prune,
+    no cap, no throttle snapshot for ANY chat, with only a `tick_fail` line in
+    the rotating debug log. This is precisely the failure v1.20.7 fixed for
+    config knobs (`_as_float`) and v1.20.2 fixed for one state field; the class
+    is still open.
+  - in `api/nudge.py` the exception escapes `state_transaction_apply` AFTER
+    `ctx.communicate()` already delivered the message: the operator gets a 500
+    although the nudge went out, and no counter or journal row is written.
+  - in `api/status.py` one bad counter 500s the whole dashboard/sidebar poll.
+  Fix: coerce at the load boundary (`load_state` normalizes every counter
+  field, the way it already drops non-dict entries), and use `_to_int` /
+  `_as_int` at each read. Add a suite marker per counter field.
+- **A2 (medium) — `/status` has no top-level guard.** `_snapshot_sync` wraps
+  per-chat classification (`api/status.py:124-132`) but not the effectiveness,
+  adaptive, throttle or return-building code, so any exception above becomes a
+  500 for the sidebar icons and the dashboard. With A1 present this is a live
+  path. Wrap the body (or each block) and degrade to a partial payload.
+- **A3 (low-medium) — uncoerced `chat_id` in `/nudge` and `/resolve`.**
+  `api/nudge.py:87-88` and `api/resolve.py:19-20` do
+  `(body.get('chat_id') or '').strip()`; a JSON body with `{"chat_id": 123}`
+  (or a numeric `text`/`action`) raises `AttributeError` → 500. `draft.py`,
+  `history.py` and `test_notify.py` already use `str(...)`. `resolve.py` also
+  does not validate `action`: anything other than `dismiss` silently resolves.
+- **A4 (low-medium) — `adaptive.configured_values()` was missed by the v1.20.7
+  coercion fix.** `helpers/adaptive.py:89-98` uses bare
+  `float(cfg.get(k, 10) or 10)` on the three timing knobs. A hand-edited
+  `"nudge_cooldown_minutes": "abc"` raises inside `evaluate()` (the tick catches
+  it and silently degrades the whole overlay to `adaptive_tag='error'`) and
+  inside `/status` (caught, and the entire `effectiveness.adaptive` reflection
+  disappears). `or 10` also turns a legitimate `0` into `10`. Reuse
+  `monitor._as_float` (or a local clone) instead.
+- **A5 (low-medium) — `/config` writes on the event loop.** v1.20.5 offloaded
+  both read seams, but `plugins_helper.save_plugin_config(...)` and
+  `clear_plugin_cache(...)` still run inline (`api/config.py:111-119`). The
+  save hook does `find_plugin_assets` + a JSON read + a write, so one slow 9p
+  write stalls every request in the server — the exact failure TEST41 exists to
+  prevent, pinned only for the read branches. Move the save into the same
+  `asyncio.to_thread` body.
+- **A6 (low) — `capped` misreports in supervised mode.** `helpers/monitor.py`
+  `:1574-1583` ORs `max_nudges_per_tick <= 0` into `capped` unconditionally, so
+  with `supervised_mode: true` and `max_nudges_per_tick: 0` — where the stall
+  queue is drained into editable drafts and nothing is suppressed (v1.16.0 made
+  supervised mode explicitly budget-free) — the dashboard shows a red
+  "capped" badge. Gate the budget branch on `not supervised`.
+- **A7 (low) — `pre_drain_nudged` is dead code.** `summary['nudged']` is only
+  incremented at `:1406`, inside the stalled drain, so the snapshot taken at
+  `:1371` is always `0` and `_stalled_delivered` is just `summary['nudged']`.
+  Vestige of the pre-v1.20.7 shared budget; delete it or make it meaningful.
+- **A8 (low-medium) — `api/*` pin pre-reload `state` functions while the rest
+  of those files use module-attr access.** `api/status.py:10`,
+  `api/export.py:10` and `api/history.py:8` do
+  `from ...state import load_state, read_journal`, so after a
+  `helpers/state.py` hot-reload those endpoints keep running the OLD function
+  bodies while the tick runs the new ones — `api/status.py` mixes both
+  generations in a single request (pinned `load_state()` at `:94`,
+  `state_mod.read_journal()` at `:234`). Use `state_mod.load_state` /
+  `state_mod.read_journal` so the v1.9.0 hot-reload contract holds for the
+  endpoints too. This also makes the "api/* handlers keep their from-import
+  bindings" limitation in *Known limitations* mostly stale: the remaining
+  pinned names are only these three.
+- **A9 (low, latent) — `_notify(cfg=None)` bypasses the config seam.**
+  `helpers/monitor.py:615-619` calls `plugins.get_plugin_config` directly,
+  against the v1.20.3 "no runtime path may call it directly" rule. Both current
+  call sites pass `cfg=cfg`, so it is dead — but a future caller would get a
+  partial config with no `webhook_url`/`telegram_bot_token` and silently lose
+  all external alerting. Call `_load_config()` in the fallback.
+- **A10 (low) — the store's `timelines` map grows without bound.**
+  `webui/shepherd-store.js:254` caches a full `/history` payload per chat id
+  and never prunes. This is the same leak class v1.20.2 fixed for
+  `draftEdits` (`initDraftEdits`) and was missed for timelines.
+- **A11 (low-medium) — `/status` polls can stack.** `fetchStatus` runs on
+  `setInterval` with no in-flight guard, so a slow snapshot (journal read +
+  aggregates + per-chat log scans) lets requests pile up. Use a
+  self-scheduling `setTimeout` or an `_inFlight` latch.
+- **A12 (low) — the settings modal issues a full `/status` snapshot on open.**
+  `webui/config.html:306` calls the heaviest endpoint just to render two
+  counts; on top of the dashboard poll that doubles the snapshot cost whenever
+  the settings card mounts.
+- **A13 (low-medium) — the sidebar row-id walk is unbounded.**
+  `webui/shepherd-sidebar.js:149-153` climbs to `<html>` looking for
+  `data-folder-thread` / `data-context-id` / `data-chat-id`. A third-party row
+  view that publishes no id inside a wrapper that does will inherit the
+  ANCESTOR's id and be painted with another chat's status. Core rows are safe
+  (`sidebar/chats/chat-tree.html` publishes `:data-context-id` on the
+  `.chat-container` element itself, so the walk stops on the first hop); bound
+  the walk to the row boundary anyway.
+- **A14 (low) — `injectBadges` swallows errors with no trace**
+  (`webui/shepherd-sidebar.js:275-277`). A broken injector would be invisible,
+  against the framework rule that a failed hook must be reported.
+- **A15 (low) — the test suite writes into the live production data dir.**
+  `tests/suite_monitor.py` redirects `state_mod.STATE_FILE` /
+  `JOURNAL_FILE` (`:114-120`) but never `monitor._debug_log`, so every run
+  injects test entries into `usr/plugins/chat_shepherd/data/debug-*.log` —
+  confirmed in the shipped logs (`hot_reload reloaded cs_hr_test_mod`,
+  `auto_nudge_fail ... cs_nudge_fail_probe`, `chat_tick_fail csTstA01`) — and
+  its newest-7 rotation can push a real day out of the window. It also still
+  creates real `usr/chats/csTstA01..C` directories (the known P6.2 deferral;
+  they match `CHAT_ID_PATTERN`, so a live tick tracks them), and it
+  `os.chdir(_REPO_ROOT)`s at import. Stub `_debug_log` in `main()` the way
+  `_post_json` is stubbed.
+
+### Optimization opportunities
+
+- **O1 (high) — `read_journal` re-parses the whole journal after every
+  append.** `helpers/state.py:320-373` keys its cache on
+  `(st_mtime_ns, st_size)`, and every `append_journal` changes both, so the
+  `/status` poll (every `poll_seconds`, per open tab) re-reads and re-parses
+  the entire file — currently 379 KB / 2779 lines, up to `JOURNAL_MAX_BYTES`
+  1 MB. Cache `(mtime_ns, size, byte_offset, parsed)` and parse only the
+  appended tail (the per-line `try/except` already tolerates a torn last
+  line). This is the single largest win in the plugin.
+- **O2 (medium-high) — aggregates are recomputed per poll.**
+  `api/status.py:233-235` runs `aggregates.compute(read_journal(JOURNAL_KEEP))`
+  — up to 1000 entries parsed, filtered and sorted on every poll. Cache the
+  block by the journal stat key; recompute only when it changes.
+- **O3 (medium) — `state_signature` is computed 2-3x per save.**
+  `state_transaction_apply` computes it before and after the apply-fn,
+  `save_state` computes it a third time, and every `load_state` computes it
+  once more. Each call is `json.dumps` of ~226 KB plus a sha256. Compute once
+  per operation and pass it into `save_state(state, sig=...)`.
+- **O4 (medium) — `save_state` serializes with `indent=2`.**
+  `state.json` is 295 KB today; compact separators would cut roughly 40% of the
+  bytes written on every durable change. This is a machine-managed file —
+  `config.json` is the hand-edited one.
+- **O5 (medium) — up to 8 log-lock acquisitions and 5 tail copies per chat per
+  pass.** `_last_log_type` alone runs TWICE per chat per tick
+  (`classify_chat` at `:799` and `update_chat` at `:1205`), plus
+  `_last_log_fatal`, `_scan_log_for_termination`, `_last_response_text`,
+  `_last_entry_type`, `_log_len`, `_log_updates` — each taking
+  `context.log._lock` and slicing a 50-item tail, again for every `/status`
+  poll. Take one snapshot per chat per pass (single lock, single slice) and
+  pass it to the scanners; the v1.20.2 fix bounded the copy, it did not
+  deduplicate it.
+- **O6 (medium) — `state.json` is no longer size-bounded.**
+  `MAX_TRACKED_CHATS = 100` bounds only the DEAD surplus after the v1.20.0
+  live-protection fix, so the dict grows with the number of live contexts: this
+  instance carries 298 entries / 295 KB (278 still have a chat dir, 20 are
+  already prunable). Every poll pays the read + signature and every durable
+  save pays a 295 KB rewrite. Options: lower the dead surplus cap, split cold
+  bookkeeping out of the hot file, or store a compact per-chat record. At
+  minimum, state in *Known limitations* that file size scales with live
+  contexts, not with `MAX_TRACKED_CHATS`.
+- **O7 (low-medium) — `/draft` reads state twice for nothing.**
+  `api/draft.py:86` does a full `load_state()` peek before every action, then
+  the transaction reads state again (`:150`, and a third time for the
+  bookkeeping apply). The claim transaction already returns the draft with its
+  `chat_id`, so the peek is redundant: drop it, or keep only a cheap 404 fast
+  path via `state.read_chat_entry`.
+- **O8 (medium) — the journal parse runs under `_journal_lock`.**
+  `helpers/state.py:323-361` holds the lock across the whole file read and
+  parse. The tick holds `_state_lock` while appending history, so a slow parse
+  (or slow 9p read) stalls the tick and, through it, every API transaction.
+  The file is append-only and the parse is idempotent — do it outside the lock.
+- **O9 (low) — `_debug_log` globs the data dir on every call** and imports
+  `glob`/`os` inside the function (`helpers/monitor.py:394-418`). Rotate at
+  most once per day (the timestamp is already computed there) and hoist the
+  imports.
+- **O10 (low) — `_NAME_CACHE` flushes completely at 120 entries**
+  (`helpers/monitor.py:465-466`). With 345 chats that means repeated full
+  clears plus re-reads of `chat.json`. Evict the oldest key instead
+  (`OrderedDict.move_to_end` + `popitem(last=False)`).
+- **O11 (low) — the sidebar repaint re-resolves every row from scratch.**
+  `paintRows` does a page-wide `querySelectorAll('.chat-container')` and then,
+  per row, an ancestor walk, `Alpine.$data`, two `querySelector` calls in
+  `anchorFor` and one `.cs-badge` lookup — with ~300 rows, every 2.5 s plus
+  debounced mutation passes. Cache `container -> {chatId, host, badge}` in a
+  `WeakMap` and skip rows whose `data-cs-status` already matches.
+- **O12 (low) — redundant `state_mod.get_chat` re-lookups** at
+  `helpers/monitor.py:1352`, `:1398` and `:1427` fetch the very dict the caller
+  already holds (`entry`), purely to re-read the same object.
+- **O13 (low) — hot-reload mtime uses `st_mtime` (float).**
+  `helpers/hotreload.py:158` — use `st_mtime_ns` so two saves inside one
+  filesystem mtime tick cannot be missed.
+- **O14 (low, optional) — `/status` re-classifies every context per poll**
+  although the tick classified them at most `job_loop`-interval ago. The
+  freshness is deliberate; only the cheap statuses need recomputing, and the
+  wedge clock could be served from the state entry.
+
+### Accepted risks worth recording (no change proposed)
+
+- `/config` returns `telegram_bot_token` in plaintext to any authenticated,
+  CSRF-valid caller (needed because the settings modal binds `config.*`).
+  `/status` correctly omits secrets; the asymmetry is deliberate but should be
+  stated rather than discovered.
+- `resolve action=dismiss` only deletes the state entry; a live chat is
+  re-created by the next tick, so dismiss is transient for live contexts.
+- The per-handler `isinstance(input, dict)` guards (v1.20.7) duplicate
+  `helpers/api.py:79-83`; they are harmless but the v1.20.7 changelog entry
+  overstates what the framework left to the plugin.

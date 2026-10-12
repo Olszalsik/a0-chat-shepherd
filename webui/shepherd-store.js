@@ -43,6 +43,8 @@ async function callApi(path, body) {
 export const store = createStore("chatShepherdStore", {
   data: null,
   _fetchFailed: false,
+  _inFlight: false,
+  _pollGen: 0,
   statusFilter: '',
   timelineOpen: '',
   timelines: {},
@@ -74,24 +76,67 @@ export const store = createStore("chatShepherdStore", {
 
   startPolling() {
     this.stopPolling();
-    this.pollTimer = setInterval(() => this.fetchStatus(), this.pollInterval);
+    // v1.21.0 (A11): SELF-SCHEDULING timeout chain instead of setInterval, plus
+    // an in-flight latch. setInterval fires on its schedule no matter whether
+    // the previous poll finished, so a slow snapshot (state.json + journal +
+    // aggregates + one log scan per tracked chat) let requests pile up behind
+    // each other; with several tabs open that is several concurrent snapshots,
+    // each contending for the state lock. Now: never more than one poll in
+    // flight, and the next poll is scheduled after the previous one lands.
+    //
+    // The generation counter is what keeps this honest: applyPollFromConfig()
+    // calls startPolling() from INSIDE a fetch (when poll_seconds changes),
+    // which would otherwise leave the in-flight chain to reschedule itself on
+    // top of the fresh one - two live chains. A stale generation simply stops
+    // rescheduling, so re-arming mid-flight is safe and still stacks nothing.
+    const gen = ++this._pollGen;
+    const tick = async () => {
+      await this.fetchStatus();
+      if (this._pollGen === gen) {
+        this.pollTimer = setTimeout(tick, this.pollInterval);
+      }
+    };
+    this.pollTimer = setTimeout(tick, this.pollInterval);
   },
 
   stopPolling() {
+    this._pollGen = (this._pollGen || 0) + 1;
     if (this.pollTimer) {
-      clearInterval(this.pollTimer);
+      clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
+    // v1.21.0: deliberately does NOT touch `_inFlight`. The latch belongs to
+    // the request lifecycle and is cleared by fetchStatus's `finally`; clearing
+    // it here would let a re-arm that happens while a slow snapshot is still
+    // awaiting start a second concurrent poll - the exact thing the latch is
+    // for.
   },
 
   async fetchStatus() {
+    // v1.21.0 (A11): drop overlapping polls. A slow backend must never queue
+    // work behind itself; the caller gets the previous (stale) payload instead.
+    if (this._inFlight) return;
+    this._inFlight = true;
     try {
       const json = await callApi("/status");
       if (json && json.success) {
-        this.data = json;
-        this._fetchFailed = false;
-        this.initDraftEdits();
-        this.applyPollFromConfig();
+        // v1.21.0 (A2): the backend now degrades instead of 500ing, and says so
+        // in the payload. Surface it once through the existing latch so a
+        // broken snapshot is visible rather than silently blank.
+        if (json.degraded) {
+          if (!this._fetchFailed) {
+            toastFrontendError(
+              "Status degraded: " + (json.error || "snapshot incomplete"),
+              "Chat Shepherd",
+            );
+          }
+          this._fetchFailed = true;
+        } else {
+          this.data = json;
+          this._fetchFailed = false;
+          this.initDraftEdits();
+          this.applyPollFromConfig();
+        }
       } else {
         // v1.20.2: the "toast once, not every 5s" guard was dead code -
         // _fetchFailed was only ever assigned false, so a wedged backend
@@ -103,6 +148,8 @@ export const store = createStore("chatShepherdStore", {
     } catch (e) {
       if (!this._fetchFailed) toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
       this._fetchFailed = true;
+    } finally {
+      this._inFlight = false;
     }
   },
 
@@ -252,6 +299,17 @@ export const store = createStore("chatShepherdStore", {
       if (json && json.success) {
         this.timelines[chatId] = json;
         this.timelineOpen = chatId;
+        // v1.21.0 (A10): prune cached timelines for chats that are no longer
+        // tracked. `timelines` held a full /history payload per chat id and
+        // only ever grew - the same leak class v1.20.2 fixed for draftEdits,
+        // missed here. Bound it by the tracked chat set rather than a cap, so
+        // it can never evict a chat the user is looking at.
+        const live = new Set(
+          ((this.data && this.data.chats) || []).map((c) => c.chat_id)
+        );
+        for (const id of Object.keys(this.timelines)) {
+          if (!live.has(id) && id !== chatId) delete this.timelines[id];
+        }
       } else {
         toastFrontendError((json && json.error) || 'History failed', "Chat Shepherd");
       }

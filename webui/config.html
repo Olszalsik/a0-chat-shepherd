@@ -303,7 +303,30 @@ Chat Shepherd
 </div>
 </div>
 
-<div class="cs-card" x-data="{ counts: null }" x-init="(async () => { try { const m = await import('/js/api.js'); const s = await m.callJsonApi('/api/plugins/chat_shepherd/status', {}); if (s && s.success && s.counts) counts = s.counts; } catch (e) {} })()">
+<!--
+  v1.21.0 (A12): the "Status (at open)" card no longer fires its own
+  /api/plugins/chat_shepherd/status call. /status is the plugin's heaviest
+  endpoint (state.json + journal + aggregates + one log scan per tracked
+  chat), and opening the settings card duplicated the whole snapshot on top
+  of the dashboard's own poll. The page-scoped chatShepherdStore already
+  holds that payload, so the card reads from it when present and only falls
+  back to a single fetch when the store is not loaded at all.
+-->
+<div class="cs-card" x-data="{
+  counts: null,
+  async load() {
+    try {
+      var store = window.Alpine && Alpine.store ? Alpine.store('chatShepherdStore') : null;
+      if (store && store.data && store.data.counts) {
+        counts = store.data.counts;
+        return;
+      }
+      const m = await import('/js/api.js');
+      const s = await m.callJsonApi('/api/plugins/chat_shepherd/status', {});
+      if (s && s.success && s.counts) counts = s.counts;
+    } catch (e) {}
+  }
+}" x-init="load()">
 <h4>Status (at open)</h4>
 <div class="cs-row" style="font-size: 12px; opacity: 0.85;">
 <div>Chats tracked: <strong x-text="counts ? Object.values(counts).reduce(function (a, b) { return a + b; }, 0) : '…'"></strong></div>

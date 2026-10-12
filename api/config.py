@@ -109,12 +109,23 @@ class Config(ApiHandler):
         to_save = prune_to_explicit(current)
 
         try:
-            plugins_helper.save_plugin_config(PLUGIN_NAME, "", "", to_save)
+            # v1.21.0 (A5): the WRITE now runs off the event loop too, not just
+            # the read. v1.20.5 offloaded both read seams after CSRF-token
+            # timeouts proved that one slow 9p op in a plugin request stalls
+            # the whole server - but `save_plugin_config` still ran inline, and
+            # it does a find_plugin_assets + JSON read + a write through the
+            # save hook. A save is rarer than a poll, so the stall was rarer,
+            # not absent; TEST41 only pinned the read branches, which is why
+            # this survived that review. Same shape as api/draft.py's send.
+            await asyncio.to_thread(
+                plugins_helper.save_plugin_config,
+                PLUGIN_NAME, "", "", to_save,
+            )
         except Exception as e:
             return {"ok": False, "success": False, "error": f"save failed: {e}"}
 
         try:
-            plugins_helper.clear_plugin_cache([PLUGIN_NAME])
+            await asyncio.to_thread(plugins_helper.clear_plugin_cache, [PLUGIN_NAME])
         except Exception:
             pass
 

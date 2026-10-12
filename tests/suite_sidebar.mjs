@@ -435,4 +435,111 @@ function ok(condition, message) { assert.ok(condition, message); checks += 1; }
   checks += 1;
 }
 
+// 10. The row-id walk is BOUNDED (v1.21.0 A13). It used to climb to <html>, so
+//     a row buried inside someone else's subtree reached an ancestor
+//     `data-folder-thread` and got painted with another chat's status. The hop
+//     ceiling is what stops it - asserted here with a wrapper chain deeper
+//     than the ceiling, which no real list view produces.
+{
+  const env = installEnv({ data: statusData([["chat0010", "stalled"], ["chat0011", "stalled"]]) });
+  const li = new Element("li");
+  li.setAttribute("data-folder-thread", "chat0010");
+  let parent = li;
+  // 10 nested divs: past ROW_WALK_MAX_HOPS (6) from the container.
+  for (let i = 0; i < 10; i += 1) {
+    const wrap = new Element("div");
+    wrap.setAttribute("class", "deep-wrapper");
+    parent.appendChild(wrap);
+    parent = wrap;
+  }
+  const container = new Element("div");
+  container.setAttribute("class", "chat-container");
+  const label = new Element("div");
+  label.setAttribute("class", "chat-list-button");
+  label.textContent = "third-party row";
+  container.appendChild(label);
+  parent.appendChild(container);
+  env.chatsSection.appendChild(li);
+  const api = load();
+  api._test.injectBadges();
+  ok(!badgeIn({ container }),
+    "a row past the hop ceiling must not inherit an ancestor id");
+  ok(li.querySelectorAll(".cs-badge").length === 0,
+    "and nothing is painted under the wrapper either");
+  ok(env.store.data.chats.length === 2, "precondition: two chats in the payload");
+}
+
+// 11. A paint failure is reported, not swallowed (v1.21.0 A14). The catch that
+//     keeps a transient DOM shape from killing the poll loop also hid a
+//     genuinely broken injector: icons simply stopped updating, silently.
+{
+  const env = installEnv({ data: statusData([["chat0012", "running"]]) });
+  const row = buildRow({
+    scopeOwner: { item: { id: "chat0012" } },
+    attrs: { "data-folder-thread": "chat0012" },
+  });
+  env.chatsSection.appendChild(row.li);
+  const api = load();
+  const seen = [];
+  const realConsole = globalThis.console;
+  const realNow = Date.now;
+  const realQsa = env.document.querySelectorAll;
+  globalThis.console = { error: (m) => seen.push(m) };
+  try {
+    api._test.injectBadges();
+    ok(seen.length === 0, "a healthy paint reports nothing");
+    ok(badgeIn(row), "precondition: the badge was painted");
+    // Now make the row scan itself explode, the way a renamed helper would.
+    env.document.querySelectorAll = () => { throw new Error("boom-paint"); };
+    Date.now = () => realNow.call(Date) + 600000;   // defeat the rate limit
+    api._test.injectBadges();
+    api._test.injectBadges();                       // rate-limited: still one line
+  } finally {
+    delete env.document.querySelectorAll;
+    globalThis.console = realConsole;
+    Date.now = realNow;
+  }
+  ok(seen.length === 1, "a failing paint must reach the console exactly once, got " + seen.length);
+  ok(/paintRows failed/.test(seen[0] || ""), String(seen[0]));
+  ok(/boom-paint/.test(seen[0] || ""), "the report must carry the error");
+}
+
+// 12. A re-keyed row must repaint (v1.21.0 O11 follow-up). The row memo
+//     originally cached the CHAT ID as well as the DOM handles, which is not
+//     safe: Alpine's keyed x-for REUSES elements across a key change and
+//     patches the bound data in place, so a cached id kept painting the old
+//     chat's status on a row that now shows a different one. The memo now holds
+//     only element handles and the id is re-resolved every pass.
+{
+  const env = installEnv({
+    data: statusData(
+      [["chat0020", "stalled"], ["chat0021", "running"]],
+      // distinct colors so the assertion can prove the paint really changed
+      { colors: { stalled: "#aa0000", running: "#00aa00" } },
+    ),
+  });
+  const row = buildRow({
+    scopeOwner: { item: { id: "chat0020" } },
+    attrs: { "data-folder-thread": "chat0020" },
+  });
+  env.chatsSection.appendChild(row.li);
+  const api = load();
+  api._test.injectBadges();
+  const before = badgeIn(row);
+  // capture the color NOW: the repaint is expected to REUSE this element, so
+  // comparing before.style.color afterwards would compare the new color with
+  // itself (badge reuse working is exactly what makes them the same object).
+  const beforeColor = before.style.color;
+  ok(before.getAttribute("aria-label").indexOf("Stalled") >= 0,
+    "precondition: painted as stalled");
+  // same element, new key - exactly what Alpine does on a re-key
+  row.container.setAttribute("data-folder-thread", "chat0021");
+  api._test.injectBadges();
+  const after = badgeIn(row);
+  ok(after === before, "precondition: the badge element is reused, not duplicated");
+  ok(after.getAttribute("aria-label").indexOf("Running") >= 0,
+    "a re-keyed row must repaint, got: " + after.getAttribute("aria-label"));
+  ok(after.style.color !== beforeColor, "and pick up the new state's color");
+}
+
 console.log(`Sidebar badge injector checks passed (${checks} assertions).`);

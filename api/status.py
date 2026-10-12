@@ -1,18 +1,44 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 from typing import Any
 
 from helpers.api import ApiHandler, Request, Response
 
 from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN, JOURNAL_KEEP
-from usr.plugins.chat_shepherd.helpers.state import load_state
+# v1.21.0 (A8): state is reached through the MODULE, never through a pinned
+# `from ...state import load_state, read_journal`. Those bindings survive a
+# `helpers/state.py` hot-reload, so /status kept running the OLD load_state
+# while the tick (module-attr) ran the new one - two generations of state code
+# inside a single request, and the reload was silently a no-op for this
+# endpoint. Same fix in api/export.py and api/history.py.
 from usr.plugins.chat_shepherd.helpers import state as state_mod
 from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers import hotreload
 from usr.plugins.chat_shepherd.helpers import adaptive
 from usr.plugins.chat_shepherd.helpers import aggregates
+
+# v1.21.0 (O2): aggregates are a pure function of the journal, so they only
+# need recomputing when the journal actually changed. Keyed on the same stat
+# tuple `read_journal` uses internally plus the requested limit.
+_AGG_CACHE: dict[str, Any] = {'key': None, 'value': None}
+
+
+def _aggregates_block() -> dict[str, Any]:
+    entries = state_mod.read_journal(JOURNAL_KEEP)
+    try:
+        st = os.stat(state_mod.files.get_abs_path(state_mod.JOURNAL_FILE))
+        key = (st.st_mtime_ns, st.st_size, JOURNAL_KEEP)
+    except OSError:
+        key = ('nostat', len(entries), JOURNAL_KEEP)
+    if _AGG_CACHE['key'] == key and isinstance(_AGG_CACHE['value'], dict):
+        return _AGG_CACHE['value']
+    block = aggregates.compute(entries)
+    _AGG_CACHE['key'] = key
+    _AGG_CACHE['value'] = block
+    return block
 
 DEFAULT_ICONS: dict[str, str] = {
     'running': '🏃',
@@ -27,11 +53,26 @@ DEFAULT_ICONS: dict[str, str] = {
 }
 
 
-def _to_int(value: Any) -> int:
- try:
-  return max(0, int(value))
- except (TypeError, ValueError):
-  return 0
+def _to_int(value: Any, fallback: int = 0) -> int:
+    """Coerce a persisted field for the payload without ever raising.
+
+    v1.21.0 (cycle 3): OverflowError joins the pair, for the same reason it
+    did in `state._as_int` and `monitor._as_int` - `int(float('inf'))` raises
+    it, and a JSON body or a hand-edited state file can carry a non-finite
+    float. It matters here because the two unguarded reads in `_build_snapshot`
+    (`int(_th.get('budget', ...))` and `int(poll_seconds)`) sit in the block
+    the v1.21.0 degrade guard covers, so the symptom was a `degraded: true`
+    payload instead of a working status - i.e. this seam's own guard firing on
+    its own unguarded neighbour.
+
+    `fallback` exists because a caller may need to tell "unusable" from a
+    legitimate 0 (a `budget` of 0 means auto-nudging off, and substituting the
+    default for it would paint a false "capped"/budget-full reading).
+    """
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return max(0, int(fallback))
 
 
 def _resolve_icons(cfg: dict[str, Any]) -> dict[str, str]:
@@ -88,10 +129,65 @@ class Status(ApiHandler):
         return await asyncio.to_thread(self._snapshot_sync)
 
     def _snapshot_sync(self) -> dict | Response:
+        """Guarded entry point (v1.21.0, A2).
+
+        Every open tab polls this endpoint every `poll_seconds`, and the
+        sidebar icons depend on it, so a 500 here is not one broken card: it
+        freezes every chat icon on stale data for the rest of the page
+        session, and the store only toasts once. Per-chat classification was
+        already guarded, but the effectiveness / adaptive / throttle / payload
+        blocks above it were not, so one malformed field anywhere in
+        state.json took the whole endpoint down.
+
+        A failure now degrades to a minimal, still-valid payload instead of a
+        500, and records the reason so the UI's own failure path can show it.
+        """
+        try:
+            return self._build_snapshot()
+        except Exception as exc:  # noqa: BLE001 - a poll must never 500
+            return {
+                'success': True,
+                'degraded': True,
+                'error': str(exc)[:200],
+                'config': {
+                    'enabled': True,
+                    'icons': dict(DEFAULT_ICONS),
+                    'poll_seconds': 5,
+                },
+                'last_tick': '',
+                'hot_reload': {},
+                'chats': [],
+                'counts': {},
+                'effectiveness': {
+                    'sent': 0,
+                    'effective': 0,
+                    'hit_rate': None,
+                    'wedge_sent': 0,
+                    'wedge_effective': 0,
+                },
+                'throttle': {
+                    'nudges_this_tick': 0,
+                    'budget': 1,
+                    'capped': False,
+                    'stalled_queued': 0,
+                    'stalled_nudged': 0,
+                    'resume_nudged': 0,
+                    'wedge_this_tick': 0,
+                    'wedge_budget': 1,
+                    'pruned': 0,
+                    'cap_evicted': 0,
+                    'timestamp': '',
+                },
+                'aggregates': None,
+                'drafts': [],
+                'history': [],
+            }
+
+    def _build_snapshot(self) -> dict | Response:
         # v1.20.3: defaults are re-applied locally, so a get_plugin_config
         # hook regression cannot hand this endpoint a partial config.
         cfg = monitor._load_config()
-        state = load_state()
+        state = state_mod.load_state()
         icons = _resolve_icons(cfg)
 
         contexts: dict[str, dict[str, Any]] = {}
@@ -121,23 +217,27 @@ class Status(ApiHandler):
         for chat_id, info in contexts.items():
             prev = chats_state.get(chat_id, {})
             ctx_obj = info.pop('ctx')
+            # v1.21.0 (O5): one log snapshot per chat for this pass, shared by
+            # the frozen clock and the classifier - /status used to take the
+            # agent's log lock twice per chat per poll, per open tab.
+            view = monitor._log_snapshot(ctx_obj)
             try:
                 # Pass the frozen-log clock so a wedged context shows as
                 # intervention in the UI too, matching what tick() decided.
-                frozen_minutes = monitor._wedge_minutes(ctx_obj, prev)
+                frozen_minutes = monitor._wedge_minutes(ctx_obj, prev, view)
                 live_status, reason = monitor.classify_chat(
-                    ctx_obj, chat_id, cfg, prev, frozen_minutes
+                    ctx_obj, chat_id, cfg, prev, frozen_minutes, view=view
                 )
             except Exception:
                 live_status, reason = prev.get('status', 'idle'), ''
             chat_list.append({
                 'chat_id': chat_id,
                 'status': live_status,
-                'nudge_count': prev.get('nudge_count', 0),
-                'last_nudge_at': prev.get('last_nudge_at', ''),
-                'last_classification': reason or prev.get('last_classification', ''),
-                'last_log_type': prev.get('last_log_type', ''),
-                'error_detected': prev.get('error_detected', False),
+                'nudge_count': _to_int(prev.get('nudge_count', 0)),
+                'last_nudge_at': str(prev.get('last_nudge_at') or ''),
+                'last_classification': reason or str(prev.get('last_classification', '') or ''),
+                'last_log_type': str(prev.get('last_log_type', '') or ''),
+                'error_detected': bool(prev.get('error_detected', False)),
                 'running': info['running'],
                 'paused': info['paused'],
                 'name': info['name'] or chat_id,
@@ -160,14 +260,14 @@ class Status(ApiHandler):
             chat_list.append({
                 'chat_id': chat_id,
                 'status': fallback_status,
-                'nudge_count': entry.get('nudge_count', 0),
-                'last_nudge_at': entry.get('last_nudge_at', ''),
-                'last_classification': entry.get('last_classification', ''),
-                'last_log_type': entry.get('last_log_type', ''),
-                'error_detected': entry.get('error_detected', False),
+                'nudge_count': _to_int(entry.get('nudge_count', 0)),
+                'last_nudge_at': str(entry.get('last_nudge_at') or ''),
+                'last_classification': str(entry.get('last_classification', '') or ''),
+                'last_log_type': str(entry.get('last_log_type', '') or ''),
+                'error_detected': bool(entry.get('error_detected', False)),
                 'running': False,
                 'paused': False,
-                'name': entry.get('name', '') or chat_id,
+                'name': str(entry.get('name', '') or '') or chat_id,
             })
 
         status_order = {
@@ -187,15 +287,20 @@ class Status(ApiHandler):
         # carries the wedge remediation ladder counters).
         for c in chat_list:
             src = chats_state.get(c['chat_id'], {})
-            sent = src.get('nudges_sent', 0)
-            eff = src.get('nudges_effective', 0)
+            # v1.21.0 (A1): every counter read is coerced. state.json is
+            # hand-editable and survives upgrades, so these values can be a
+            # string or None - `100.0 * eff / sent` and the four sums below
+            # then raised TypeError and 500'd the whole poll, taking the
+            # sidebar icons down with it.
+            sent = _to_int(src.get('nudges_sent', 0))
+            eff = _to_int(src.get('nudges_effective', 0))
             c['nudges_sent'] = sent
             c['nudges_effective'] = eff
             c['hit_rate'] = round(100.0 * eff / sent) if sent else None
-            c['wedge_nudge_count'] = src.get('wedge_nudge_count', 0)
-            c['wedge_nudges_sent'] = src.get('wedge_nudges_sent', 0)
-            c['wedge_nudges_effective'] = src.get('wedge_nudges_effective', 0)
-            c['liveness'] = src.get('liveness', '')
+            c['wedge_nudge_count'] = _to_int(src.get('wedge_nudge_count', 0))
+            c['wedge_nudges_sent'] = _to_int(src.get('wedge_nudges_sent', 0))
+            c['wedge_nudges_effective'] = _to_int(src.get('wedge_nudges_effective', 0))
+            c['liveness'] = str(src.get('liveness', '') or '')
         _total_sent = sum(c['nudges_sent'] for c in chat_list)
         _total_eff = sum(c['nudges_effective'] for c in chat_list)
         effectiveness = {
@@ -230,9 +335,7 @@ class Status(ApiHandler):
         # cached, so this costs no extra parse; JOURNAL_KEEP is the full
         # journal (the same limit api/export.py uses).
         try:
-            aggregates_block = aggregates.compute(
-                state_mod.read_journal(JOURNAL_KEEP)
-            )
+            aggregates_block = _aggregates_block()
         except Exception:
             aggregates_block = None
         counts: dict[str, int] = {}
@@ -243,10 +346,14 @@ class Status(ApiHandler):
         # files fall back to zeroed defaults with a config-derived budget.
         _th_raw = state.get('throttle')
         _th = _th_raw if isinstance(_th_raw, dict) else {}
-        try:
-         _th_budget = max(0, min(10, int(_th.get('budget', cfg.get('max_nudges_per_tick', 1)))))
-        except (TypeError, ValueError):
-         _th_budget = 1
+        # v1.21.0 (cycle 3): the persisted budget no longer needs its own
+        # try/except - it had the same two-arm handler that missed
+        # OverflowError, so a non-finite budget degraded the whole snapshot.
+        # The fallback is the CONFIG-derived default, and `_to_int` takes an
+        # explicit fallback precisely so an unusable value can be told apart
+        # from a legitimate 0 (0 = auto-nudging off).
+        _budget_default = _to_int(cfg.get('max_nudges_per_tick', 1), 1) or 1
+        _th_budget = max(0, min(10, _to_int(_th.get('budget'), _budget_default)))
         throttle = {
          'nudges_this_tick': _to_int(_th.get('nudges_this_tick')),
          'budget': _th_budget,
@@ -262,12 +369,10 @@ class Status(ApiHandler):
          'cap_evicted': _to_int(_th.get('cap_evicted')),
          'timestamp': str(_th.get('timestamp', '') or ''),
         }
-        poll_seconds = cfg.get('poll_seconds', 5)
-        try:
-            poll_seconds = int(poll_seconds)
-        except (TypeError, ValueError):
-            poll_seconds = 5
-        poll_seconds = max(2, min(120, poll_seconds))
+        # Same story as the budget: `_to_int`'s explicit fallback separates
+        # "unusable" from a legitimate 0, and 0 must clamp UP to the 2 s floor
+        # rather than collapse to the default (an `or 5` would).
+        poll_seconds = max(2, min(120, _to_int(cfg.get('poll_seconds'), 5)))
         return {
             'success': True,
             'config': {

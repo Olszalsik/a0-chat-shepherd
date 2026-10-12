@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import glob
 import os
 import threading
 import time
 import json
 import re
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -80,12 +82,22 @@ def _as_float(val: Any, fallback: float) -> float:
     # _tick_impl — outside the per-chat guard — and took down the WHOLE tick
     # every iteration (the extension only logged tick_fail to the debug log).
     # A bad value degrades to the shipped default instead.
+    # v1.21.0 (cycle 3): OverflowError joins the pair, and non-finite results are
+    # rejected. `float(10**400)` raises OverflowError (JSON permits
+    # arbitrary-precision integer literals, so a hand-edited config can carry
+    # one), and `float('inf')` / `float('nan')` SUCCEED - which is worse than
+    # raising: an inf cooldown makes every chat instantly off-cooldown and an
+    # inf stall threshold makes every chat instantly stalled, i.e. a hand-edited
+    # value silently inverts the supervision policy instead of degrading.
     if isinstance(val, bool):
         val = int(val)
     try:
-        return float(val)
-    except (TypeError, ValueError):
+        out = float(val)
+    except (TypeError, ValueError, OverflowError):
         return fallback
+    if out != out or out in (float('inf'), float('-inf')):
+        return fallback
+    return out
 
 
 def _minutes_since(dt: datetime | None) -> float:
@@ -102,14 +114,26 @@ def _as_int(val: Any, fallback: int = 0) -> int:
     Comparing that against an int raised TypeError inside classify_chat and
     aborted the whole tick. Counters are best-effort bookkeeping, so a bad
     value degrades to the fallback instead of taking supervision down.
+    v1.21.0 (cycle 2): NaN/inf now covered. `int(float('inf'))` raises
+    OverflowError, which `except (TypeError, ValueError)` does not catch, so a
+    single non-finite counter escaped this seam. On the load-boundary path that
+    meant `load_state()` itself raised - with no guard around it - which is the
+    same whole-tick blindness the seam exists to prevent. Keep this in step
+    with `state._as_int`, which is the authority; this mirror exists for the
+    drain arithmetic.
     """
     if isinstance(val, bool):
         return int(val)
     if isinstance(val, int):
         return val
+    # Cycle 2: kept deliberately minimal. `int()` itself rejects every
+    # non-finite float (OverflowError for +-inf, ValueError for NaN), so the
+    # OverflowError arm is the whole fix - a post-hoc non-finite filter on the
+    # result is unreachable, and a cycle-2 mutation confirmed removing it
+    # changed nothing.
     try:
         return int(val)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return fallback
 
 
@@ -120,6 +144,24 @@ def _as_int(val: Any, fallback: int = 0) -> int:
 # poll. One scandir of usr/chats (parent mtime+size keyed, short TTL) and a
 # short-TTL error.txt cache cut that to a couple of syscalls per poll.
 _CHAT_DIR_BASE = 'usr/chats'
+
+
+def _chat_dir(chat_id: str) -> str:
+    """Absolute path of one persisted chat dir.
+
+    v1.21.1: every runtime consumer now goes through this instead of
+    interpolating `'usr/chats/' + chat_id` inline. `_CHAT_DIR_BASE` already
+    existed for the scandir, but four sites bypassed it - and one of them was
+    the FALLBACK inside `_has_chat_dir`, the exact probe the id-verdict of every
+    nudged chat depends on. A single seam means the base can never drift
+    between the listing and the per-path probe (they would then disagree, and
+    `_has_chat_dir` returns False on exception, i.e. a chat silently stops
+    being supervised). It also unblocks redirecting the base for tests without
+    touching five call sites.
+    """
+    return files.get_abs_path(_CHAT_DIR_BASE + '/' + chat_id)
+
+
 _chat_listing_cache: dict[str, tuple[tuple[int, int], float, frozenset]] = {}
 _CHAT_LISTING_TTL_S = 2.0
 _error_file_cache: dict[str, tuple[float, bool]] = {}
@@ -158,7 +200,7 @@ def _check_error_file(chat_id: str) -> bool:
         return cached[1]
     result = False
     try:
-        chat_dir = files.get_abs_path(f'usr/chats/{chat_id}')
+        chat_dir = _chat_dir(chat_id)
         if not chat_dir:
             result = False
         else:
@@ -179,15 +221,59 @@ def _check_error_file(chat_id: str) -> bool:
 _LOG_TAIL = 50
 
 
-def _last_log_type(context: AgentContext) -> str:
-    # `list(context.log.logs)` copies every entry while holding the agent's
-    # log lock, blocking the agent's own writer for the duration; only the
-    # last few entries are ever inspected. _log_len() proves a big log exists
-    # without touching it, so the tail scan stays correct.
+class _LogView:
+    """One bounded, point-in-time snapshot of a chat's log (v1.21.0, O5).
+
+    v1.20.2 bounded every scanner's copy but each scanner still took
+    `context.log._lock` and re-copied the same tail - up to eight lock
+    acquisitions and five copies per chat per tick (and again for every
+    `/status` poll per open tab). Blocking the agent's own log writer is the
+    real cost, so the tick and the status endpoint now take ONE snapshot per
+    chat per pass and every scanner reads it.
+
+    Fields: `length` (entry count, -1 unknown), `updates` (log mutation
+    counter, -1 unknown), `tail` (newest-last slice of at most `_LOG_TAIL`
+    entries), `last_type` (type of the very last entry, unfiltered).
+    """
+
+    __slots__ = ('length', 'updates', 'tail', 'last_type')
+
+    def __init__(self, length: int = -1, updates: int = -1,
+                 tail: list | None = None, last_type: str = '') -> None:
+        self.length = length
+        self.updates = updates
+        self.tail = tail if tail is not None else []
+        self.last_type = last_type
+
+
+def _log_snapshot(context: AgentContext) -> _LogView:
+    """Single lock acquisition + single bounded tail copy for one chat."""
     try:
         with context.log._lock:
-            tail = list(context.log.logs[-_LOG_TAIL:])
-        for item in reversed(tail):
+            logs = context.log.logs
+            tail = list(logs[-_LOG_TAIL:])
+            last_type = (
+                str(getattr(logs[-1], 'type', '') or '') if logs else ''
+            )
+            length = len(logs)
+            # `updates` is the liveness-probe counter and is absent on some
+            # log implementations. Reading it must NOT sink the whole snapshot:
+            # -1 is the documented "unknown" value and simply disables the
+            # probe for that chat, which is the correct degradation.
+            updates = getattr(context.log, 'updates', None)
+            updates_len = len(updates) if updates is not None else -1
+            return _LogView(length, updates_len, tail, last_type)
+    except Exception:
+        return _LogView()
+
+
+def _last_log_type(context: AgentContext, view: _LogView | None = None) -> str:
+    # Reads a shared snapshot instead of `list(context.log.logs)` under the
+    # lock: the tail is already sliced there, and taking the agent's log lock
+    # eight times per chat per pass blocked its own writer for no reason.
+    view = view if view is not None else _log_snapshot(context)
+    try:
+        for item in reversed(view.tail):
             if item.type in ('response', 'tool', 'user', 'error'):
                 return item.type
     except Exception:
@@ -195,26 +281,25 @@ def _last_log_type(context: AgentContext) -> str:
     return ''
 
 
-def _last_log_fatal(context: AgentContext) -> bool:
+def _last_log_fatal(context: AgentContext, view: _LogView | None = None) -> bool:
     # v1.18.1: True when the chat's recent log tail shows it stopped for a
-    # reason a blind auto-nudge must not paper over — an error entry, or a
+    # reason a blind auto-nudge must not paper over - an error entry, or a
     # security-termination warning (e.g. the infection check logs
     # "Infection check: TERMINATED" before raising HandledException, which
-    # the framework logs NOTHING for). Auto-nudging such a chat restarts
-    # the very behavior that got it killed and churns safety checks.
+    # the framework logs NOTHING for). Auto-nudging such a chat restarts the
+    # very behavior that got it killed and churns safety checks.
     # Scans backwards until the first user/response item (a fresh human
     # turn or a completed response resets the verdict).
     # v1.18.2 fix (terminate-loop, part 2): this log-window scan alone is
-    # NOT durable — a chat_shepherd nudge injects a `user` log item and
+    # NOT durable - a chat_shepherd nudge injects a `user` log item and
     # pushes the TERMINATED warning out of the window, re-arming the very
     # nudges the guard exists to prevent. Callers now ALSO persist a
     # `terminated_at` stamp in the state entry (see tick()) and suppress
     # stall nudges for TERMINATION_NUDGE_COOLDOWN_MIN after it; a fresh
     # human turn clears the stamp.
+    view = view if view is not None else _log_snapshot(context)
     try:
-        with context.log._lock:
-            tail = list(context.log.logs[-_LOG_TAIL:])
-        for item in reversed(tail):
+        for item in reversed(view.tail):
             ltype = str(getattr(item, 'type', '') or '')
             if ltype == 'user' and '[chat_shepherd]' not in str(
                 getattr(item, 'content', '') or ''
@@ -241,7 +326,9 @@ def _last_log_fatal(context: AgentContext) -> bool:
 TERMINATION_NUDGE_COOLDOWN_MIN = 30.0
 
 
-def _scan_log_for_termination(context: AgentContext) -> tuple[bool, bool]:
+def _scan_log_for_termination(
+    context: AgentContext, view: _LogView | None = None
+) -> tuple[bool, bool]:
     """Scan the log tail for a security termination / error stop.
 
     Returns (found, fresh_human_turn):
@@ -251,14 +338,14 @@ def _scan_log_for_termination(context: AgentContext) -> tuple[bool, bool]:
       item, meaning the chat already moved on (clears the suppression).
     Unlike _last_log_fatal this is a full-tail scan (not just 5 items) so
     the stamp is stamped once, durably, even if later log items hide it.
-    The scan is bounded to the last _LOG_TAIL entries and sliced under the
-    lock, so a long-running chat no longer copies its whole log here.
+    The scan is bounded to the last _LOG_TAIL entries (v1.20.2) and, since
+    v1.21.0, reads the caller's shared snapshot, so a long-running chat
+    neither copies its whole log nor takes the agent's log lock twice.
     """
+    view = view if view is not None else _log_snapshot(context)
     try:
-        with context.log._lock:
-            tail = list(context.log.logs[-_LOG_TAIL:])
         found = False
-        for item in reversed(tail):
+        for item in reversed(view.tail):
             ltype = str(getattr(item, 'type', '') or '')
             if ltype == 'user' and '[chat_shepherd]' not in str(
                 getattr(item, 'content', '') or ''
@@ -288,36 +375,32 @@ def _termination_cooldown_active(prev_entry: dict[str, Any]) -> bool:
     return _minutes_since(terminated_at) < TERMINATION_NUDGE_COOLDOWN_MIN
 
 
-def _last_entry_type(context: AgentContext) -> str:
+def _last_entry_type(context: AgentContext, view: _LogView | None = None) -> str:
     """Type of the very last log entry (unfiltered)."""
     # v1.20.2: read the last entry in place; the full copy was pure waste.
-    try:
-        with context.log._lock:
-            logs = context.log.logs
-            if logs:
-                return str(getattr(logs[-1], 'type', '') or '')
-    except Exception:
-        pass
-    return ''
+    # v1.21.0: served from the shared snapshot, so it costs no lock at all.
+    view = view if view is not None else _log_snapshot(context)
+    return view.last_type
 
 
-def _log_len(context: AgentContext) -> int:
+def _log_len(context: AgentContext, view: _LogView | None = None) -> int:
     """Number of log entries right now (-1 = unknown, disables wedge detection)."""
-    try:
-        with context.log._lock:
-            return len(context.log.logs)
-    except Exception:
-        return -1
+    view = view if view is not None else _log_snapshot(context)
+    return view.length
 
-def _log_updates(context: AgentContext) -> int:
+def _log_updates(context: AgentContext, view: _LogView | None = None) -> int:
     # v1.10.0 liveness probe: mutation counter of the log next to the
     # entry count. Entries frozen + mutations advancing = spinning
     # dead loop; both frozen = hung call. -1 = unknown (legacy path).
-    try:
-        with context.log._lock:
-            return len(context.log.updates)
-    except Exception:
-        return -1
+    # v1.21.0: served from the shared snapshot, so it costs no lock at all.
+    # NOTE: since the snapshot refactor the tick and `/status` read
+    # `view.updates` DIRECTLY (they already hold the snapshot); this wrapper is
+    # the standalone equivalent and is kept because it is the documented way to
+    # read the counter for a chat whose snapshot you do not otherwise have.
+    # Do not "optimize" the two call sites back to calling this - that would
+    # re-introduce a second log lock per chat per pass (TEST45I).
+    view = view if view is not None else _log_snapshot(context)
+    return view.updates
 
 
 def _has_chat_dir(chat_id: str) -> bool:
@@ -339,18 +422,23 @@ def _has_chat_dir(chat_id: str) -> bool:
         ids = _chat_dir_ids()
         if ids is not None:
             return chat_id in ids
-        return bool(files.exists(files.get_abs_path(f'usr/chats/{chat_id}')))
+        return bool(files.exists(_chat_dir(chat_id)))
     except Exception:
         return False
 
 
-def _wedge_minutes(context: AgentContext, prev_entry: dict[str, Any]) -> float:
+def _wedge_minutes(
+    context: AgentContext,
+    prev_entry: dict[str, Any],
+    view: _LogView | None = None,
+) -> float:
     """P3: frozen-log minutes for a context (mirror of tick()'s clock).
 
     Read-only companion for the live status endpoint; tick() owns the
-    log_len_since mutation.
+    log_len_since mutation. v1.21.0: takes the caller's shared snapshot so
+    one /status poll takes ONE log lock per chat, not two.
     """
-    cur = _log_len(context)
+    cur = _log_len(context, view)
     prev_len = prev_entry.get('last_log_len', -1)
     if not (
         context.is_running() and cur >= 0 and prev_len >= 0 and cur == prev_len
@@ -391,41 +479,54 @@ def _load_config() -> dict[str, Any]:
         return dict(raw) if isinstance(raw, dict) else {}
 
 
+# v1.21.0 (O9): the day whose retention pass already ran. Rotation is a
+# directory glob + up to 7 unlinks; doing it on every log line (hot-reload
+# events, per-chat tick failures, nudge delivery failures) meant a directory
+# listing per line. One pass per UTC day is all retention ever needed - a new
+# file can only appear with a new day stamp.
+_DEBUG_LOG_ROTATED_DAY = ''
+
+
 def _debug_log(kind: str, message: str) -> None:
     # R2: no more silently swallowed exceptions - kind-tagged,
     # daily-rotated debug log under the plugin data dir.
+    global _DEBUG_LOG_ROTATED_DAY
     try:
-        day = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        now = datetime.now(timezone.utc)
+        day = now.strftime('%Y-%m-%d')
         rel = 'usr/plugins/chat_shepherd/data/debug-' + day + '.log'
-        line = (
-            datetime.now(timezone.utc).isoformat() + ' ' + kind + ' ' + str(message) + '\n'
-        )
+        line = now.isoformat() + ' ' + kind + ' ' + str(message) + '\n'
         with open(files.get_abs_path(rel), 'a', encoding='utf-8') as f:
             f.write(line)
-        # v1.17.1: keep only the newest 7 daily debug files
-        try:
-            import glob
-            import os
-            old = sorted(glob.glob(files.get_abs_path('usr/plugins/chat_shepherd/data/debug-*.log')))[:-7]
-            for pth in old:
-                try:
-                    os.remove(pth)
-                except OSError:
-                    pass
-        except Exception:
-            pass
+        # v1.17.1: keep only the newest 7 daily debug files.
+        # v1.21.0 (O9): once per day, not once per line.
+        if _DEBUG_LOG_ROTATED_DAY != day:
+            try:
+                old = sorted(glob.glob(files.get_abs_path('usr/plugins/chat_shepherd/data/debug-*.log')))[:-7]
+                for pth in old:
+                    try:
+                        os.remove(pth)
+                    except OSError:
+                        pass
+                _DEBUG_LOG_ROTATED_DAY = day
+            except Exception:
+                pass
     except Exception:
         pass
 
 
-_NAME_CACHE: dict[str, tuple[Any, str]] = {}
+# v1.21.0 (O10): OrderedDict so it can be a real LRU (move_to_end on hit,
+# popitem(last=False) on overflow) instead of a full flush at the cap.
+_NAME_CACHE: 'OrderedDict[str, tuple[Any, str]]' = OrderedDict()
 _NAME_CACHE_MAX = 120
 
 def _read_chat_title(chat_id: str) -> str:
     # Human-readable chat title from usr/chats/<id>/chat.json.
     # The 'name' field sits in the first bytes, so a bounded head
     # read is enough - never parse the embedded context payload.
-    path = files.get_abs_path('usr/chats/' + chat_id + '/chat.json')
+    # v1.21.1: resolved through `_chat_dir` so the base cannot drift from the
+    # scandir in `_chat_dir_ids`.
+    path = _chat_dir(chat_id) + '/chat.json'
     try:
         with open(path, 'rb') as f:
             head = f.read(4096).decode('utf-8', errors='replace')
@@ -451,19 +552,31 @@ def _chat_display_name(chat_id: str, ctx: Any = None, prev: dict | None = None) 
         name = str(prev.get('name', '') or '')
     if not name:
         key = None
-        path = files.get_abs_path('usr/chats/' + chat_id + '/chat.json')
+        path = _chat_dir(chat_id) + '/chat.json'
         try:
             st = os.stat(path)
             key = (st.st_mtime, st.st_size)
         except OSError:
             key = None
         cached = _NAME_CACHE.get(chat_id)
+        # v1.21.0 (O10): touch on hit so the dict is a true recency order.
+        if cached is not None:
+            _NAME_CACHE.move_to_end(chat_id)
         if key is not None and cached and cached[0] == key:
             name = cached[1]
         elif key is not None:
             name = _read_chat_title(chat_id)
-            if len(_NAME_CACHE) >= _NAME_CACHE_MAX and chat_id not in _NAME_CACHE:
-                _NAME_CACHE.clear()
+            if chat_id in _NAME_CACHE:
+                _NAME_CACHE.pop(chat_id, None)
+            # v1.21.0 (O10): evict the LEAST recently used entry instead of
+            # clearing the whole dict. This instance has ~345 chats against a
+            # 120-entry cache, so the old full flush threw away every warm
+            # entry at once and re-read up to 120 chat.json files in a burst -
+            # a per-notification stat storm on the 9p mount. Name resolution
+            # also became an LRU here: `move_to_end` on a hit, `popitem` on
+            # overflow, so the working set survives.
+            while len(_NAME_CACHE) >= _NAME_CACHE_MAX:
+                _NAME_CACHE.popitem(last=False)
             _NAME_CACHE[chat_id] = (key, name)
     name = name.strip()[:80]
     return name if name else chat_id
@@ -613,10 +726,15 @@ def _notify(kind: str, message: str, priority: str = 'normal', cfg: dict | None 
     # v1.19.0: the framework leg moved verbatim to _notify_framework.
     fw_ok = _notify_framework(kind, message, priority)
     try:
-        if cfg is None:
-            from helpers import plugins as _plugins
-            from usr.plugins.chat_shepherd.helpers.constants import PLUGIN_NAME as _PN
-            cfg = _plugins.get_plugin_config(_PN) or {}
+        # v1.21.0 (A9): the fallback now goes through the v1.20.3 seam instead
+        # of `plugins.get_plugin_config` directly. Calling it directly
+        # violated the "no runtime path may call it directly" rule and, being
+        # unreachable until now (both call sites pass cfg=cfg), was never
+        # noticed: a raw partial read carries no `webhook_url` and no telegram
+        # token, so a caller passing cfg=None would silently lose every
+        # external alert while the in-app notification still succeeded.
+        if not isinstance(cfg, dict):
+            cfg = _load_config()
         _dispatch_external(cfg, kind, message, priority)
     except Exception as e:
         _debug_log('alert_dispatch_fail', repr(e))
@@ -628,7 +746,7 @@ def _record_nudge_outcome(state: dict, chat_id: str, now_iso: str) -> None:
     # awaiting_user within NUDGE_EFFECTIVE_WINDOW_MIN minutes of its
     # last nudge, credit that nudge as effective and log it.
     entry = state_mod.get_chat(state, chat_id)
-    if entry.get('nudge_count', 0) <= 0 or not entry.get('last_nudge_at', ''):
+    if _as_int(entry.get('nudge_count', 0)) <= 0 or not entry.get('last_nudge_at', ''):
         return
     nudged_at = _parse_dt(entry.get('last_nudge_at', ''))
     if nudged_at is None:
@@ -636,7 +754,7 @@ def _record_nudge_outcome(state: dict, chat_id: str, now_iso: str) -> None:
     minutes = _minutes_since(nudged_at)
     if minutes > NUDGE_EFFECTIVE_WINDOW_MIN:
         return
-    entry['nudges_effective'] = entry.get('nudges_effective', 0) + 1
+    entry['nudges_effective'] = _as_int(entry.get('nudges_effective', 0)) + 1
     entry['last_nudge_outcome_at'] = now_iso
     entry['nudge_count'] = 0
     entry['last_nudge_at'] = ''
@@ -653,7 +771,7 @@ def _record_wedge_outcome(state: dict, chat_id: str, now_iso: str) -> None:
     # turn ends) within NUDGE_EFFECTIVE_WINDOW_MIN minutes of the last wedge
     # remediation, credit it and clear the wedge budget for a fresh episode.
     entry = state_mod.get_chat(state, chat_id)
-    if entry.get('wedge_nudge_count', 0) <= 0 or not entry.get('last_wedge_nudge_at', ''):
+    if _as_int(entry.get('wedge_nudge_count', 0)) <= 0 or not entry.get('last_wedge_nudge_at', ''):
         return
     nudged_at = _parse_dt(entry.get('last_wedge_nudge_at', ''))
     if nudged_at is None:
@@ -663,7 +781,7 @@ def _record_wedge_outcome(state: dict, chat_id: str, now_iso: str) -> None:
     entry['last_wedge_nudge_at'] = ''
     if minutes > NUDGE_EFFECTIVE_WINDOW_MIN:
         return
-    entry['wedge_nudges_effective'] = entry.get('wedge_nudges_effective', 0) + 1
+    entry['wedge_nudges_effective'] = _as_int(entry.get('wedge_nudges_effective', 0)) + 1
     entry['last_wedge_outcome_at'] = now_iso
     state_mod.append_history(state, {
         'chat_id': chat_id,
@@ -713,6 +831,7 @@ def classify_chat(
     cfg: dict[str, Any],
     prev_entry: dict[str, Any],
     frozen_minutes: float = 0.0,
+    view: _LogView | None = None,
 ) -> tuple[str, str]:
     if context is None:
         if _check_error_file(chat_id):
@@ -796,7 +915,7 @@ def classify_chat(
             f'{int(TERMINATION_NUDGE_COOLDOWN_MIN)}m',
         )
 
-    last_log_type = _last_log_type(context)
+    last_log_type = _last_log_type(context, view)
     last_msg_dt = _parse_dt(getattr(context, 'last_message', ''))
     minutes_idle = _minutes_since(last_msg_dt)
 
@@ -844,14 +963,14 @@ def _active_goal(chat_id: str) -> dict[str, Any] | None:
     return goal
 
 
-def _last_response_text(context: AgentContext) -> str:
+def _last_response_text(context: AgentContext, view: _LogView | None = None) -> str:
     # v1.8.0: heading + content of the most recent response log item
-    # (completion-claim evidence). Same lock discipline as _last_log_type.
-    # v1.20.2: tail slice under the lock instead of copying the whole log.
+    # (completion-claim evidence). v1.20.2: bounded tail slice under the lock
+    # instead of copying the whole log; v1.21.0: reads the caller's shared
+    # snapshot, so the goal gate adds no lock of its own.
+    view = view if view is not None else _log_snapshot(context)
     try:
-        with context.log._lock:
-            tail = list(context.log.logs[-_LOG_TAIL:])
-        for item in reversed(tail):
+        for item in reversed(view.tail):
             if getattr(item, 'type', '') == 'response':
                 heading = str(getattr(item, 'heading', '') or '')
                 content = str(getattr(item, 'content', '') or '')
@@ -902,6 +1021,7 @@ def _goal_gate_check(
     cfg: dict[str, Any],
     now_iso: str,
     summary: dict[str, Any],
+    view: _LogView | None = None,
 ) -> bool:
     # v1.8.0 goal completion gate: silent nudge when a USER chat's latest
     # response claims completion while its native goal is still open.
@@ -921,13 +1041,16 @@ def _goal_gate_check(
     goal = _active_goal(chat_id)
     if not goal:
         return False
-    if not _looks_like_completion(_last_response_text(ctx)):
+    if not _looks_like_completion(_last_response_text(ctx, view)):
         return False
     goal_key = str(goal.get('updated_at') or goal.get('objective') or '')
     if str(entry.get('goal_gate_key', '')) != goal_key:
         entry['goal_gate_key'] = goal_key
         entry['goal_gate_count'] = 0
-    count = int(entry.get('goal_gate_count', 0) or 0)
+    # v1.21.0 (A1): counters from state.json are coerced here too - the
+    # load-boundary repair covers the file, and this covers an entry mutated
+    # in-process or written by an older version.
+    count = _as_int(entry.get('goal_gate_count', 0))
     if count >= max_nudges:
         return False
     if cooldown > 0 and _minutes_since(
@@ -942,7 +1065,7 @@ def _goal_gate_check(
     entry['goal_gate_count'] = count + 1
     entry['last_goal_gate_at'] = now_iso
     entry['goal_gate_nudges_sent'] = (
-        int(entry.get('goal_gate_nudges_sent', 0) or 0) + 1
+        _as_int(entry.get('goal_gate_nudges_sent', 0)) + 1
     )
     summary['goal_gate_nudged'] = summary.get('goal_gate_nudged', 0) + 1
     try:
@@ -1118,16 +1241,23 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
           prev = state_mod.get_chat(state, chat_id)
           old_status = prev.get('status', '')
 
+          # v1.21.0 (O5): ONE log lock acquisition for this chat, shared by
+          # the frozen clock, the liveness probe, the classifier, the
+          # termination scan and the persisted last_log_type. Reading it five
+          # times also let the classifier and the frozen clock disagree by one
+          # entry on a chat that was logging while the tick ran.
+          view = _log_snapshot(ctx)
+
           # P3 wedge detection: capture the log length and compare with the
           # previous tick. Unchanged length while running => start/continue the
           # frozen clock; any growth resets it.
-          cur_log_len = _log_len(ctx)
-          prev_log_len = prev.get('last_log_len', -1)
+          cur_log_len = view.length
+          prev_log_len = _as_int(prev.get('last_log_len', -1), -1)
           # v1.10.0 liveness probe: read the log mutation counter next
           # to the entry count. Entries frozen + mutations advancing =
           # spinning dead loop; both frozen = hung call. O(1) reads
           # under the same lock; unknown counter = legacy behavior.
-          cur_updates = _log_updates(ctx) if wedge_probe else -1
+          cur_updates = view.updates if wedge_probe else -1
           frozen_minutes = 0.0
           liveness = ''
           if (
@@ -1142,11 +1272,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   frozen_minutes = 0.0
               else:
                   frozen_minutes = _minutes_since(frozen_since)
-                  prev_updates = prev.get('last_updates_len', -1)
-                  try:
-                      prev_updates = int(prev_updates)
-                  except (TypeError, ValueError):
-                      prev_updates = -1
+                  prev_updates = _as_int(prev.get('last_updates_len', -1), -1)
                   if cur_updates >= 0 and prev_updates >= 0:
                       if cur_updates > prev_updates:
                           liveness = 'spinning'
@@ -1160,7 +1286,9 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               # wedge remediation either worked or is moot; credit it if recent.
               _record_wedge_outcome(state, chat_id, now_iso)
 
-          new_status, reason = classify_chat(ctx, chat_id, cfg, prev, frozen_minutes)
+          new_status, reason = classify_chat(
+              ctx, chat_id, cfg, prev, frozen_minutes, view=view
+          )
 
           # v1.18.2 fix (terminate-loop, part 2): persist the termination
           # stamp durably in state. A full-tail scan catches a TERMINATED
@@ -1168,7 +1296,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
           # progress entries) bury it; a fresh human turn (shepherd nudges
           # excluded) clears the suppression early. The stamp gates both
           # nudge queues below for TERMINATION_NUDGE_COOLDOWN_MIN minutes.
-          _term_found, _term_fresh_human = _scan_log_for_termination(ctx)
+          _term_found, _term_fresh_human = _scan_log_for_termination(ctx, view)
           if _term_found:
               prev['terminated_at'] = now_iso
           elif _term_fresh_human:
@@ -1187,7 +1315,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               and getattr(ctx, 'type', None) == AgentContextType.USER
               and not ctx.is_running()
               and not getattr(ctx, 'paused', False)
-              and _last_entry_type(ctx) != 'response'
+              and _last_entry_type(ctx, view) != 'response'
           ):
               new_status = STATUS_INTERRUPTED
               reason = (
@@ -1202,7 +1330,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               name=fname,
               status=new_status,
               last_classification=reason,
-              last_log_type=_last_log_type(ctx) if ctx else '',
+               last_log_type=_last_log_type(ctx, view) if ctx else '',
               last_log_len=cur_log_len,
               last_updates_len=cur_updates,
               last_ticked=now_iso,
@@ -1232,7 +1360,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   goal_gate_enabled
                   and getattr(ctx, 'type', None) == AgentContextType.USER
                   and _goal_gate_check(
-                      state, chat_id, ctx, entry, cfg, now_iso, summary
+                      state, chat_id, ctx, entry, cfg, now_iso, summary,
+                      view=view,
                   )
               ):
                   entry['status'] = STATUS_NUDGED
@@ -1244,7 +1373,11 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               last_nudge_dt = _parse_dt(prev.get('last_nudge_at', ''))
               cooldown_ok = _minutes_since(last_nudge_dt) >= nudge_cooldown
               minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
-              nudge_count = prev.get('nudge_count', 0)
+              # v1.21.0 (A1): coerce - classify_chat already coerced this same
+              # field, so an unusable value used to yield a status of "nudge
+              # 3/3 used" in the UI while this comparison raised and the chat
+              # was silently never queued again.
+              nudge_count = _as_int(prev.get('nudge_count', 0))
               if (
                   cooldown_ok
                   and not _term_cooldown_active
@@ -1264,7 +1397,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   # as the final attempt when wedge_soft_restart is enabled.
                   # Scheduler TASK contexts are excluded — the scheduler
                   # resumes its own task chats on its own cadence.
-                  wedge_count = int(prev.get('wedge_nudge_count', 0) or 0)
+                  wedge_count = _as_int(prev.get('wedge_nudge_count', 0))
                   last_wedge_dt = _parse_dt(prev.get('last_wedge_nudge_at', ''))
                   wedge_cooldown_ok = _minutes_since(last_wedge_dt) >= wedge_cooldown
                   if (
@@ -1316,7 +1449,9 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   ):
                       summary['drafted'] += 1
               else:
-                  nudge_count = entry.get('nudge_count', 0)
+                  # v1.21.0 (A1): coerce the persisted budget read (same field
+                  # as the stall branch above).
+                  nudge_count = _as_int(entry.get('nudge_count', 0))
                   if nudge_count < max_nudges:
                       minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
                       resume_queue.append(
@@ -1349,9 +1484,14 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
             if summary['nudges_this_tick'] >= resume_budget:
                 break
             if _nudge_context(ctx, text, chat_id=chat_id):
-                prev = state_mod.get_chat(state, chat_id)
-                entry['nudge_count'] = prev.get('nudge_count', 0) + 1
-                entry['nudges_sent'] = entry.get('nudges_sent', 0) + 1
+                # v1.21.0 (O12): `entry` IS the dict get_chat returns for this
+                # id, so the extra lookup only re-read the same object.
+                # v1.21.0 (A1): coerce - these three counters are read straight
+                # out of state.json and used in `+ 1` arithmetic, and this
+                # drain runs OUTSIDE the per-chat guard, so one unusable value
+                # used to abort the entire tick for every chat.
+                entry['nudge_count'] = _as_int(entry.get('nudge_count', 0)) + 1
+                entry['nudges_sent'] = _as_int(entry.get('nudges_sent', 0)) + 1
                 entry['last_nudge_at'] = now_iso
                 entry['status'] = STATUS_NUDGED
                 entry['last_classification'] = (
@@ -1368,8 +1508,6 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                     'timestamp': now_iso,
                 })
 
-    pre_drain_nudged = summary['nudged']
-    nudge_queue_len = len(nudge_queue)
     # v1.20.7: the stalled queue gets its OWN budget counter. It used to break
     # on summary['nudges_this_tick'], which the restart-resume drain above
     # also increments - a restart burst (resume budget >= 3) therefore
@@ -1377,6 +1515,11 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     # max_nudges_per_tick: 1, three resume nudges left every queued stalled
     # chat unnudged for that tick and the dashboard showed a false "capped").
     # The wedge drain was already independent (its own counters below).
+    # v1.21.0 (A7): a `pre_drain_nudged` snapshot used to sit here, but
+    # summary['nudged'] is only ever incremented inside THIS drain, so it was
+    # always 0 and the subtraction was dead weight. Removed with the vestige;
+    # `nudge_queue_len` still feeds the throttle snapshot's suppression test.
+    nudge_queue_len = len(nudge_queue)
     stall_drained = 0
     if nudge_queue and (supervised or max_nudges_per_tick > 0):
         nudge_queue.sort(key=lambda item: item[0], reverse=True)
@@ -1395,9 +1538,10 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                     summary['drafted'] += 1
                 continue
             if _nudge_context(ctx, chat_id=chat_id):
-                prev = state_mod.get_chat(state, chat_id)
-                entry['nudge_count'] = prev.get('nudge_count', 0) + 1
-                entry['nudges_sent'] = entry.get('nudges_sent', 0) + 1
+                # v1.21.0 (A1/O12): coerce the counters (this drain is outside
+                # the per-chat guard) and drop the redundant re-lookup.
+                entry['nudge_count'] = _as_int(entry.get('nudge_count', 0)) + 1
+                entry['nudges_sent'] = _as_int(entry.get('nudges_sent', 0)) + 1
                 entry['last_nudge_at'] = now_iso
                 entry['status'] = STATUS_NUDGED
                 entry['last_classification'] = (
@@ -1424,8 +1568,11 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
         for frozen_minutes, chat_id, ctx, entry, now_iso in wedge_queue:
             if summary['wedge_nudged'] + summary['wedge_restarts'] >= wedge_budget:
                 break
-            prev = state_mod.get_chat(state, chat_id)
-            attempt = prev.get('wedge_nudge_count', 0) + 1
+            # v1.21.0 (A1/O12): `entry` is the live dict for this chat; the
+            # wedge drain runs outside the per-chat guard, so its counters must
+            # be coerced rather than trusted.
+            prev = entry
+            attempt = _as_int(prev.get('wedge_nudge_count', 0)) + 1
             final_attempt = attempt >= wedge_max_remediations
             # v1.10.0 liveness probe: a spinning dead loop never reaches a
             # safe point, so a continue intervention can never drain it and
@@ -1567,12 +1714,23 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     # queue was truncated by the budget (storm visibility), plus resume
     # and wedge drain usage. Unknown top-level keys round-trip through
     # load/save, so no state.py schema change is needed.
-    _stalled_delivered = summary['nudged'] - pre_drain_nudged
+    # v1.21.0 (A7): `_stalled_delivered` was `summary['nudged'] - pre_drain_...`
+    # where the subtracted snapshot was always 0 - it is exactly the count this
+    # drain delivered.
+    _stalled_delivered = summary['nudged']
     state['throttle'] = {
      'nudges_this_tick': summary['nudges_this_tick'],
      'budget': max_nudges_per_tick,
+     # v1.21.0 (A6): "capped" must mean "the budget suppressed nudges".
+     # Under supervised mode nothing is auto-sent at all - the queue drains
+     # into editable drafts and every queued chat is delivered for review -
+     # so the `max_nudges_per_tick <= 0` branch used to raise a red "capped"
+     # badge on a run where no nudge was ever suppressed (v1.16.0 made
+     # supervised mode explicitly budget-free). Only a real budget or a real
+     # truncation counts as capped; drafts are reported separately below.
      'capped': bool(
       nudge_queue_len
+      and not supervised
       and (
        max_nudges_per_tick <= 0
        or (
@@ -1581,6 +1739,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
        )
       )
      ),
+     'supervised': bool(supervised),
      'stalled_queued': nudge_queue_len,
      'stalled_nudged': _stalled_delivered,
      'resume_nudged': summary['resumed'],

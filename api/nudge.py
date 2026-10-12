@@ -84,8 +84,13 @@ class Nudge(ApiHandler):
         # non-dict body (list / string / number) raised AttributeError → raw
         # 500. Same guard api/draft.py already applies.
         body = input if isinstance(input, dict) else {}
-        chat_id = (body.get('chat_id') or '').strip()
-        text = (body.get('text') or '').strip() or None
+        # v1.21.0 (A3): `helpers/api.py:79-83` normalizes a non-dict BODY to
+        # `{}` before the handler runs, but dict field VALUES still arrive raw,
+        # so `{"chat_id": 123}` raised AttributeError on `.strip()` -> a bare
+        # 500 for a merely mistyped request. Coerce every field; `str()` here
+        # matches draft.py / history.py / test_notify.py.
+        chat_id = str(body.get('chat_id') or '').strip()
+        text = str(body.get('text') or '').strip() or None
         # v1.20.4: an explicit operator override of the fatal-stop guard.
         force = _as_bool(body.get('force'))
 
@@ -136,7 +141,14 @@ class Nudge(ApiHandler):
         def _apply(st: dict) -> dict:
             now_iso = datetime.now(timezone.utc).isoformat()
             entry = get_chat(st, chat_id)
-            new_count = entry.get('nudge_count', 0) + 1
+            # v1.21.0 (A1): the entry's counters come from state.json, which is
+            # hand-editable and survives upgrades. `load_state` repairs unusable
+            # counters at the boundary, and this coerces again so a value written
+            # by an older version (or mutated in-process) cannot make the
+            # bookkeeping raise - it would do so AFTER the message was already
+            # delivered, turning a successful nudge into a 500 with no counter
+            # and no journal row.
+            new_count = monitor._as_int(entry.get('nudge_count', 0)) + 1
             # v1.20.4: an override must NOT erase the evidence. The old code
             # hardcoded status='nudged', so nudging an errored chat flipped the
             # row to a healthy-looking "nudged" and replaced the reason it died

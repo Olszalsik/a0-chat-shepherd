@@ -86,14 +86,44 @@ def _parse_iso(value: Any) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _num(cfg: dict, key: str, fallback: float) -> float:
+    """Coerce one configured knob without ever raising (v1.21.0, A4).
+
+    v1.20.7 added exactly this guard to `monitor` (`_as_float`) for exactly
+    this hazard - a hand-edited config.json carrying `null` or a string - but
+    never reached this module, so the fix was incomplete. A bad value raised
+    `ValueError` inside `evaluate()`, which the tick catches, so the WHOLE
+    adaptive overlay silently degraded to `adaptive_tag='error'`; in `/status`
+    the same raise was swallowed and the entire `effectiveness.adaptive`
+    reflection disappeared. Both callers already had a try/except, so the
+    failure was invisible by construction - the seam that must not raise is
+    this one.
+
+    This also drops the old `or <fallback>`, which turned a legitimate
+    configured `0` into the fallback, and rejects NaN/inf.
+    v1.21.0 (cycle 3): OverflowError joins the pair - `float(10**400)` raises
+    it, and JSON permits arbitrary-precision integer literals, so the same
+    hand-edit that produced a `ValueError` here could produce an
+    OverflowError instead.
+    """
+    val = cfg.get(key, fallback)
+    if isinstance(val, bool):
+        val = int(val)
+    try:
+        out = float(val)
+    except (TypeError, ValueError, OverflowError):
+        return float(fallback)
+    if out != out or out in (float('inf'), float('-inf')):  # NaN / inf
+        return float(fallback)
+    return out
+
+
 def configured_values(cfg: dict) -> dict[str, float]:
     return {
-        'nudge_cooldown_minutes': float(cfg.get('nudge_cooldown_minutes', 10) or 10),
-        'wedge_nudge_after_minutes': float(
-            cfg.get('wedge_nudge_after_minutes', 10) or 10
-        ),
-        'wedge_remediation_cooldown_minutes': float(
-            cfg.get('wedge_remediation_cooldown_minutes', 10) or 10
+        'nudge_cooldown_minutes': _num(cfg, 'nudge_cooldown_minutes', 10),
+        'wedge_nudge_after_minutes': _num(cfg, 'wedge_nudge_after_minutes', 10),
+        'wedge_remediation_cooldown_minutes': _num(
+            cfg, 'wedge_remediation_cooldown_minutes', 10
         ),
     }
 

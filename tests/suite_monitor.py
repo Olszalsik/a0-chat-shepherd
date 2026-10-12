@@ -26,6 +26,22 @@ FAKE_CHAT_C = 'csTstC03'
 
 TEST_JOURNAL = 'usr/plugins/chat_shepherd/data/test_history.jsonl'
 
+# v1.21.3 (P6.2 scratch-dir hygiene, closed): the fixture chats used to be
+# created as REAL `usr/chats/csTst*` directories. They match
+# CHAT_ID_PATTERN, so a live tick on a running server could track them - and a
+# run that died before `cleanup()` left them behind to be classified (and
+# potentially nudged) for real. Deferred since v1.13.0 because it needed a
+# monitor-side redirect; `monitor._CHAT_DIR_BASE` + `monitor._chat_dir()` (the
+# single seam added in v1.21.2) provide exactly that, so the whole redirect is
+# one assignment. Everything below that builds a chat path goes through
+# `_chat_dir`, and TEST45X pins the seam - if a future change bypasses it, this
+# suite starts writing to the real tree again and fails loudly.
+TEST_CHAT_BASE = 'tmp/chat_shepherd_suite_chats'
+
+def _chat_dir(cid):
+    """Fixture chat dir under the redirected base."""
+    return files.get_abs_path(TEST_CHAT_BASE + '/' + cid)
+
 def _truncate_journal():
     try:
         os.unlink(files.get_abs_path(TEST_JOURNAL))
@@ -84,24 +100,37 @@ def read_state():
 
 
 def make_chat_dirs():
+    # v1.21.3: these live under TEST_CHAT_BASE (redirected via
+    # monitor._CHAT_DIR_BASE in main()), never in the real usr/chats.
     for cid in (FAKE_CHAT_A, FAKE_CHAT_B, FAKE_CHAT_C):
-        d = files.get_abs_path('usr/chats/' + cid)
-        os.makedirs(d, exist_ok=True)
+        os.makedirs(_chat_dir(cid), exist_ok=True)
     # error path for the no-context classification test
-    with open(os.path.join(files.get_abs_path('usr/chats/' + FAKE_CHAT_C), 'error.txt'), 'w') as f:
+    with open(os.path.join(_chat_dir(FAKE_CHAT_C), 'error.txt'), 'w') as f:
         f.write('boom')
+    # v1.21.3: a chat.json so the title/name resolver has something real to
+    # read. Without it the suite passed only because the resolver returns ''
+    # for a missing file - it never exercised the cache path against a real
+    # file, which is where the v1.21.0 LRU eviction lives.
+    with open(os.path.join(_chat_dir(FAKE_CHAT_A), 'chat.json'), 'w',
+              encoding='utf-8') as f:
+        f.write(json.dumps({'name': 'Suite Chat A'}))
+    with open(os.path.join(_chat_dir(FAKE_CHAT_B), 'chat.json'), 'w',
+              encoding='utf-8') as f:
+        f.write(json.dumps({'name': 'Suite Chat B'}))
 
 
 def cleanup():
-
-
+    import shutil
     for cid in (FAKE_CHAT_A, FAKE_CHAT_B, FAKE_CHAT_C):
-        d = files.get_abs_path('usr/chats/' + cid)
         try:
-            import shutil
-            shutil.rmtree(d, ignore_errors=True)
+            shutil.rmtree(_chat_dir(cid), ignore_errors=True)
         except Exception:
             pass
+    try:
+        # drop the (now empty) scratch base itself
+        shutil.rmtree(files.get_abs_path(TEST_CHAT_BASE), ignore_errors=True)
+    except Exception:
+        pass
 
     try:
         os.unlink(files.get_abs_path(TEST_STATE))
@@ -115,11 +144,42 @@ def main():
 
     orig_journal_file = state_mod.JOURNAL_FILE
     orig_agent_ctx = monitor.AgentContext
+    # v1.21.0 (A15): state/journal are redirected to scratch files, but
+    # `_debug_log` was NOT, so every suite run wrote its own test events into
+    # the LIVE production debug log (usr/plugins/chat_shepherd/data/debug-*.log
+    # shipped with hot_reload/auto_nudge_fail/chat_tick_fail rows naming the
+    # test fixtures) and its newest-7 rotation could push a real day out of
+    # the window. Redirect it to a scratch file for the whole run; tests that
+    # want to assert on log content stub `_debug_log` themselves (TEST24A),
+    # which keeps working because the stub replaces the attribute outright.
+    orig_debug_log = monitor._debug_log
+    # v1.21.3 (P6.2): redirect the chat-dir base so fixture chats are created
+    # under tmp/ instead of the live usr/chats. Single assignment thanks to the
+    # `_chat_dir` seam; the listing cache is dropped so nothing resolved
+    # against the real base is reused.
+    orig_chat_base = monitor._CHAT_DIR_BASE
     state_mod.STATE_FILE = TEST_STATE
 
     state_mod.JOURNAL_FILE = TEST_JOURNAL
     monitor.AgentContext = FakeAgentContext
+    monitor._CHAT_DIR_BASE = TEST_CHAT_BASE
+    monitor._chat_listing_cache.clear()
+    monitor._error_file_cache.clear()
+    monitor._NAME_CACHE.clear()
     try:
+        # v1.21.0 (A15): the scratch debug sink must be an appender, because
+        # TEST5C/TEST24A-style stubs restore this original afterwards.
+        _scratch_debug_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'data', 'scratch_debug.log',
+        )
+        os.makedirs(os.path.dirname(_scratch_debug_path), exist_ok=True)
+
+        def _scratch_debug(kind, message):
+            with open(_scratch_debug_path, 'a', encoding='utf-8') as _f:
+                _f.write('%s %s %s\n' % (kind, message, ''))
+
+        monitor._debug_log = _scratch_debug
         make_chat_dirs()
         now_iso = datetime.now(timezone.utc).isoformat()
         cfg = {
@@ -385,7 +445,7 @@ def main():
         
         # --- 6: human-readable chat names in alerts (v1.4.0)
         import json as _json6
-        _dir_a = files.get_abs_path('usr/chats/' + FAKE_CHAT_A)
+        _dir_a = _chat_dir(FAKE_CHAT_A)
         with open(os.path.join(_dir_a, 'chat.json'), 'w') as _f:
             _json6.dump({'id': FAKE_CHAT_A, 'name': 'Alpha Rescue Chat'}, _f)
         assert monitor._chat_display_name(FAKE_CHAT_A) == 'Alpha Rescue Chat', monitor._chat_display_name(FAKE_CHAT_A)
@@ -1315,7 +1375,9 @@ def main():
         import time as _time19
         _orig_save19 = state_mod.save_state
         _saves19 = []
-        state_mod.save_state = lambda st: _saves19.append(st)
+        # v1.21.0 (O3): save_state takes the transaction's already-computed
+        # signature as an optional second argument, so the stub must accept it.
+        state_mod.save_state = lambda st, signature=None: _saves19.append(st)
         try:
             # 19a: transaction persists a durable change exactly once, returns its result
             write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
@@ -1589,9 +1651,11 @@ def main():
                 and 'cs_nudge_fail_probe' in h.get('error', '')
                 for h in _st24.get('history', [])
             ), _st24.get('history', [])[:5]
-            _dbg24 = os.path.join(_data24, 'debug-' + datetime.now(timezone.utc).strftime('%Y-%m-%d') + '.log')
-            assert os.path.exists(_dbg24), _dbg24
-            assert 'auto_nudge_fail' in open(_dbg24, encoding='utf-8').read(), 'shared debug log missing failure kind'
+            # v1.21.0 (A15): read the run's SCRATCH sink, not the production
+            # daily log. This assertion only ever passed because the suite
+            # wrote its failures into production state.
+            assert os.path.exists(_scratch_debug_path), _scratch_debug_path
+            assert 'auto_nudge_fail' in open(_scratch_debug_path, encoding='utf-8').read(), 'shared debug log missing failure kind'
             assert not os.path.exists(_legacy24), 'legacy nudge_debug.log was recreated'
             print('TEST24A_NUDGE_FAIL_JOURNALED_OK')
             _agent_mod24.UserMessage = _orig_um24
@@ -2045,16 +2109,35 @@ def main():
         # Each helper used to do list(context.log.logs) under the agent's log
         # lock (blocking the agent's own writer) and then inspect a handful of
         # tail items. Guard the bounded slice structurally.
+        # v1.21.0 (O5): the invariant moved. The tail slice now happens ONCE, in
+        # `_log_snapshot`, and the five scanners read that shared view - so
+        # asserting the slice appears in each scanner (which is what this test
+        # used to require) would now be asserting the duplication we just
+        # removed. The guards below are the new shape: the snapshot slices
+        # under the lock, and NO scanner touches context.log.logs itself.
         import inspect as _insp34
+        _snap34 = '\n'.join(
+            ln for ln in _insp34.getsource(monitor._log_snapshot).splitlines()
+            if not ln.strip().startswith('#') and 'log.logs)' not in ln
+        )
+        assert 'logs[-_LOG_TAIL:]' in _snap34, (
+            '_log_snapshot must take exactly one bounded tail slice'
+        )
+        assert '_lock' in _snap34, (
+            '_log_snapshot must hold the log lock while slicing'
+        )
         for _fn34 in ('_last_log_type', '_last_log_fatal', '_scan_log_for_termination',
-                      '_last_response_text', '_last_entry_type'):
+                      '_last_response_text', '_last_entry_type', '_log_len', '_log_updates'):
             _src34 = _insp34.getsource(getattr(monitor, _fn34))
             _code34 = '\n'.join(
                 ln for ln in _src34.splitlines()
-                if not ln.strip().startswith('#') and 'log.logs)' not in ln
+                if not ln.strip().startswith('#')
             )
-            assert 'logs[-_LOG_TAIL:]' in _code34 or 'logs = context.log.logs' in _code34, (
-                _fn34 + ' still copies the entire log under the lock'
+            assert 'context.log.logs' not in _code34, (
+                _fn34 + ' reads the log itself; it must use the shared _LogView'
+            )
+            assert 'view' in _code34, (
+                _fn34 + ' must accept the shared snapshot'
             )
         print('TEST34_LOG_TAIL_SLICE_OK')
 
@@ -2409,6 +2492,15 @@ def main():
         _orig41 = {}
         try:
             _main41 = _th41.current_thread()
+            # v1.21.0 (A8): capture the PRISTINE state seams before this test
+            # patches them. Two consecutive sections each capture the current
+            # `state_mod.read_journal` as their "original" - the second one
+            # captured the first section's stub and restored that instead, so
+            # after TEST41 every later read_state() in the suite saw an empty
+            # journal. Symptom: TEST44A found zero `draft_sent` rows for a send
+            # that had succeeded. Restoring the true original closes it.
+            _orig41['rj0'] = state_mod.read_journal
+            _orig41['ls0'] = state_mod.load_state
 
             # /config: the disk read must not run on the calling thread.
             # BOTH branches matter - a pure read and a save each call
@@ -2438,8 +2530,15 @@ def main():
 
             # /history: the journal read must not run on the calling thread
             _seen41.clear()
-            _orig41['rj'] = _his41.read_journal
-            _his41.read_journal = lambda limit=200, chat_id=None: (
+            # v1.21.0 (A8): these three seams are patched on the STATE MODULE,
+            # not on the endpoint modules. api/status.py, api/export.py and
+            # api/history.py used to `from ...state import load_state,
+            # read_journal`, and a from-import binding survives a
+            # helpers/state.py hot-reload - so those endpoints silently kept
+            # serving pre-patch state code until a plugin refresh. They now
+            # call `state_mod.*`, which also makes the module the test seam.
+            _orig41['rj'] = state_mod.read_journal
+            state_mod.read_journal = lambda limit=200, chat_id=None: (
                 _seen41.append(_th41.current_thread()), [])[1]
             _orig41['name'] = _his41.monitor._chat_display_name
             _his41.monitor._chat_display_name = lambda cid: 'probe'
@@ -2452,12 +2551,12 @@ def main():
 
             # /export: must offload AND must keep the FULL journal
             _seen41.clear()
-            _orig41['ls'] = _exp41.load_state
-            _exp41.load_state = lambda: (
+            _orig41['ls'] = state_mod.load_state
+            state_mod.load_state = lambda: (
                 _seen41.append(_th41.current_thread()),
                 {'chats': {}, 'last_tick': '', 'history': ['MIRROR-ONLY-200']})[1]
-            _orig41['rj2'] = _exp41.read_journal
-            _exp41.read_journal = lambda limit=200, chat_id=None: ['FULL-%s' % limit]
+            _orig41['rj2'] = state_mod.read_journal
+            state_mod.read_journal = lambda limit=200, chat_id=None: ['FULL-%s' % limit]
             _r41b = _aio40.run(_exp41.Export(None, None).process({}, None))
             assert _r41b.get('success') is True, _r41b
             assert _seen41 and _seen41[0] is not _main41, (
@@ -2481,10 +2580,9 @@ def main():
         finally:
             _cfg40._read_disk = _orig41['read_disk']
             _cfg40.plugins_helper = _orig41['helper']
-            _his41.read_journal = _orig41['rj']
+            state_mod.read_journal = _orig41['rj0']
             _his41.monitor._chat_display_name = _orig41['name']
-            _exp41.load_state = _orig41['ls']
-            _exp41.read_journal = _orig41['rj2']
+            state_mod.load_state = _orig41['ls0']
         print('TEST41_ENDPOINTS_OFF_EVENT_LOOP_OK')
         # ============ TEST 43: the settings-modal save hook prunes too (v1.20.6) ============
         # hooks.save_plugin_config is the path the FRAMEWORK settings modal
@@ -2711,11 +2809,13 @@ def main():
         _cfg44g = {'webhook_url': 'http://127.0.0.1/hook?token=CSREDACT44',
                    'webhook_allow_private': False}
         assert monitor._external_jobs(_cfg44g, 'info', 'probe') == []
-        _dbg44 = files.get_abs_path('usr/plugins/chat_shepherd/data/debug-' +
-                                    datetime.now(timezone.utc).strftime('%Y-%m-%d') + '.log')
+        # v1.21.0 (A15): assert against the run's SCRATCH sink. This test used
+        # to read the real production debug-YYYY-MM-DD.log - which is why it
+        # only passed because the suite was writing into production state in
+        # the first place.
         _tail44 = ''
         try:
-            with open(_dbg44, 'r', encoding='utf-8') as f:
+            with open(_scratch_debug_path, 'r', encoding='utf-8') as f:
                 _tail44 = f.read()
         except Exception:
             pass
@@ -2737,12 +2837,1266 @@ def main():
         print('TEST44H_LOCK_PRESERVATION_COVERS_PLAIN_LOCK_OK')
         print('TEST44_AUDIT_FIXES_OK')
 
+        # ============ TEST 45: v1.21.0 audit fixes (A1-A9, O1-O13) ============
+        from usr.plugins.chat_shepherd.api import nudge as _nudge45
+        from usr.plugins.chat_shepherd.api import resolve as _resolve45
+        from usr.plugins.chat_shepherd.api import draft as _draft45
+        from usr.plugins.chat_shepherd.api import status as _status45
+        from usr.plugins.chat_shepherd.api import config as _config45
+        from usr.plugins.chat_shepherd.helpers import adaptive as _adaptive45
+
+        # --- 45a: load_state repairs unusable counters (A1, load boundary) ---
+        # The load-boundary repair is the layer that closes the whole-tick
+        # blast radius: every counter site in the drains sits OUTSIDE the
+        # per-chat guard, so a string in state.json used to abort every tick.
+        _bad45 = {
+            'nudge_count': '3',
+            'nudges_sent': '2',
+            'nudges_effective': None,
+            'wedge_nudge_count': ['x'],
+            'wedge_nudges_sent': '1',
+            'wedge_nudges_effective': '0',
+            'goal_gate_count': '9',
+            'goal_gate_nudges_sent': None,
+            'last_log_len': '12',
+            'last_updates_len': 'nope',
+            'status': 'stalled',
+        }
+        files.write_file(state_mod.STATE_FILE, json.dumps({
+            'chats': {FAKE_CHAT_A: _bad45},
+            'last_tick': now_iso,
+            'history': [],
+        }))
+        _rep45 = state_mod.load_state()
+        _e45 = _rep45['chats'][FAKE_CHAT_A]
+        for _k45 in ('nudge_count', 'nudges_sent', 'nudges_effective',
+                     'wedge_nudge_count', 'wedge_nudges_sent',
+                     'wedge_nudges_effective', 'goal_gate_count',
+                     'goal_gate_nudges_sent'):
+            assert isinstance(_e45[_k45], int), (
+                'counter %s left as %r after load' % (_k45, _e45[_k45])
+            )
+        assert _e45['nudge_count'] == 3 and _e45['nudges_sent'] == 2, _e45
+        assert _e45['last_log_len'] == 12, _e45
+        assert _e45['last_updates_len'] == -1, _e45
+        assert _rep45.get('repaired_counters') == 1, _rep45.get('repaired_counters')
+        # ...and the arithmetic that used to raise now works.
+        assert _e45['nudges_sent'] + 1 == 3
+        assert not (_e45['nudge_count'] < 3)
+        # a repair must NOT be adopted as the saved baseline, or the quiet-tick
+        # gate would skip the one write that persists the repair
+        assert state_mod.last_saved_signature() != state_mod.state_signature(_rep45), (
+            'repaired payload adopted as baseline - the fix would never persist'
+        )
+        print('TEST45A_LOAD_REPAIRS_COUNTERS_OK')
+
+        # --- 45b: a string counter cannot kill a tick (A1, drain arithmetic) ---
+        # The drains run AFTER the per-chat loop with no guard, so
+        # `entry['nudges_sent'] = entry.get('nudges_sent', 0) + 1` used to raise
+        # on a string and take down the whole tick - no nudges, no prune, no cap
+        # for ANY chat, traceable only in the debug log.
+        # 45a already proves load_state() repairs the file, so this case feeds a
+        # state straight to the tick with UNREPAIRED counters - i.e. any
+        # in-process writer that bypassed the load boundary (an extension, a
+        # hot-reloaded state module, a handler mutating its own snapshot). The
+        # call sites must hold on their own.
+        _raw45b = {
+            'chats': {
+                FAKE_CHAT_A: {
+                    'status': 'stalled',
+                    'nudge_count': '0',
+                    'nudges_sent': '2',
+                    'last_nudge_at': '',
+                    'last_message': '',
+                    'last_ticked': fresh_tick,
+                },
+            },
+            'drafts': [], 'history': [], 'last_tick': fresh_tick,
+            'adaptive': {},
+        }
+        _orig_load45b = state_mod.load_state
+        _nudged45 = []
+        _orig_nc45 = monitor._nudge_context
+        _orig_all45b = FakeAgentContext._all
+        _ctx45b = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=30)
+        FakeAgentContext._all = [_ctx45b]
+        try:
+            state_mod.load_state = lambda: json.loads(json.dumps(_raw45b))
+            monitor._nudge_context = lambda ctx, text=None, chat_id=None: (
+                _nudged45.append(chat_id) or True
+            )
+            _s45b = monitor.tick(wedge_cfg)
+        finally:
+            state_mod.load_state = _orig_load45b
+            monitor._nudge_context = _orig_nc45
+            FakeAgentContext._all = _orig_all45b
+        assert _nudged45, 'a malformed counter silently stopped the nudge ladder'
+        assert _s45b.get('tick_fail') is None, _s45b
+        _st45b = read_state()['chats'][FAKE_CHAT_A]
+        assert _st45b['nudge_count'] == 1 and _st45b['nudges_sent'] == 3, _st45b
+
+        # ...and the SAME for the restart-resume drain, which is a separate
+        # block of arithmetic with its own counter reads. Mutation testing
+        # showed the stall-drain assertion alone does not cover it.
+        _stale45b2 = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        _raw45b2 = {
+            'chats': {
+                FAKE_CHAT_B: {
+                    'status': 'running',
+                    'nudge_count': '0',
+                    'nudges_sent': '4',
+                    'last_nudge_at': '',
+                    'last_message': '',
+                    'last_ticked': _stale45b2,
+                },
+            },
+            'drafts': [], 'history': [],
+            # a >RESTART_GAP_MINUTES gap is what puts a chat on the resume queue
+            'last_tick': _stale45b2,
+            'adaptive': {},
+        }
+        _resumed45 = []
+        _ctx45b2 = FakeCtx(FAKE_CHAT_B, ['user'], idle_minutes=30)
+        FakeAgentContext._all = [_ctx45b2]
+        try:
+            state_mod.load_state = lambda: json.loads(json.dumps(_raw45b2))
+            _orig_comm45b2 = monitor._nudge_context
+            monitor._nudge_context = lambda ctx, text=None, chat_id=None: (
+                _resumed45.append(chat_id) or True
+            )
+            _s45b2 = monitor.tick(wedge_cfg)
+        finally:
+            state_mod.load_state = _orig_load45b
+            monitor._nudge_context = _orig_comm45b2
+            FakeAgentContext._all = _orig_all45b
+        assert _resumed45 == [FAKE_CHAT_B], (
+            'the restart-resume drain must deliver despite string counters, '
+            'got %r' % (_resumed45,)
+        )
+        assert _s45b2.get('tick_fail') is None, _s45b2
+        print('TEST45B_BAD_COUNTER_CANNOT_KILL_TICK_OK')
+
+        # --- 45c: /status degrades instead of 500 (A2) ---
+        _orig_hcd45 = monitor._has_chat_dir
+        try:
+            monitor._has_chat_dir = lambda cid: True
+            _p45 = _aio35.run(_CSStatus35(None, None).process({}, None))
+            assert _p45.get('success') is True, _p45
+            assert not _p45.get('degraded'), _p45
+            # now make the whole snapshot explode
+            _orig_agg45 = _status45.aggregates.compute
+            _status45.aggregates.compute = lambda entries: 1 / 0
+            _status45._AGG_CACHE['key'] = None
+            try:
+                _p45b = _aio35.run(_CSStatus35(None, None).process({}, None))
+            finally:
+                _status45.aggregates.compute = _orig_agg45
+            # aggregates is individually guarded, so the snapshot still builds;
+            # assert the GUARD exists by breaking an unguarded layer instead.
+            assert _p45b.get('success') is True, _p45b
+            _orig_bld45 = _CSStatus35._build_snapshot
+            _CSStatus35._build_snapshot = lambda self: 1 / 0
+            try:
+                _p45c = _aio35.run(_CSStatus35(None, None).process({}, None))
+            finally:
+                _CSStatus35._build_snapshot = _orig_bld45
+            assert _p45c.get('success') is True and _p45c.get('degraded') is True, _p45c
+            assert _p45c.get('chats') == [] and _p45c.get('error'), _p45c
+        finally:
+            monitor._has_chat_dir = _orig_hcd45
+        print('TEST45C_STATUS_DEGRADES_NOT_500_OK')
+
+        # --- 45d: mistyped request fields are a 400-shaped answer, not a 500 ---
+        # A3: the framework normalizes a non-dict BODY, but dict VALUES are raw.
+        _orig_hcd45d = monitor._has_chat_dir
+        _orig_ctx45d = _nudge45._get_context
+        _sent45d = []
+        try:
+            monitor._has_chat_dir = lambda cid: True
+            _nudge45._get_context = lambda chat_id: type(
+                'C45', (), {'communicate': lambda self, m: _sent45d.append(chat_id)}
+            )()
+            _r45d = _aio35.run(_nudge45.Nudge(None, None).process(
+                {'chat_id': 12345}, None))
+            assert _r45d.get('success') is True, _r45d
+            assert _sent45d == ['12345'], _sent45d
+            _r45e = _aio35.run(_resolve45.Resolve(None, None).process(
+                {'chat_id': 12345, 'action': 'Dismiss'}, None))
+            assert _r45e.get('success') is True, _r45e
+            _r45f = _aio35.run(_resolve45.Resolve(None, None).process(
+                {'chat_id': FAKE_CHAT_A, 'action': 'dismissed'}, None))
+            assert _r45f.get('success') is False and 'unknown action' in (
+                _r45f.get('error') or ''
+            ), 'an unknown action must not fall through to resolve: %r' % (_r45f,)
+        finally:
+            monitor._has_chat_dir = _orig_hcd45d
+            _nudge45._get_context = _orig_ctx45d
+        print('TEST45D_FIELD_COERCION_AND_ACTION_VALIDATION_OK')
+
+        # --- 45e: adaptive config coercion (A4) ---
+        _cfg45e = {
+            'nudge_cooldown_minutes': 'abc',
+            'wedge_nudge_after_minutes': None,
+            'wedge_remediation_cooldown_minutes': 0,
+        }
+        _vals45e = _adaptive45.configured_values(_cfg45e)
+        assert _vals45e['nudge_cooldown_minutes'] == 10.0, _vals45e
+        assert _vals45e['wedge_nudge_after_minutes'] == 10.0, _vals45e
+        # a legitimate 0 must survive (the old `or 10` turned it into 10)
+        assert _vals45e['wedge_remediation_cooldown_minutes'] == 0.0, _vals45e
+        print('TEST45E_ADAPTIVE_COERCION_OK')
+
+        # --- 45f: /config save runs off the event loop (A5) ---
+        _orig_helper45f = _config45.plugins_helper
+        _seen45f = []
+
+        class _H45:
+            @staticmethod
+            def get_plugin_config(name):
+                return {'stall_minutes': 6}
+
+            @staticmethod
+            def save_plugin_config(name, p, a, s):
+                _seen45f.append(('save', threading.current_thread().name))
+                return s
+
+            @staticmethod
+            def clear_plugin_cache(names):
+                _seen45f.append(('cache', threading.current_thread().name))
+        try:
+            _config45.plugins_helper = _H45()
+            _caller45f = threading.current_thread().name
+            _r45f = _aio35.run(_config45.Config(None, None).process(
+                {'stall_minutes': 9}, None))
+            assert _r45f.get('success') is True, _r45f
+            kinds45f = [k for k, _ in _seen45f]
+            assert 'save' in kinds45f and 'cache' in kinds45f, _seen45f
+            for _k45f, _thr45f in _seen45f:
+                assert _thr45f != _caller45f, (
+                    '%s ran on the event loop (the v1.20.5 read-only offload '
+                    'never covered the write)' % _k45f
+                )
+        finally:
+            _config45.plugins_helper = _orig_helper45f
+        print('TEST45F_CONFIG_WRITE_OFF_EVENT_LOOP_OK')
+
+        # --- 45g: journal reads are incremental + parse outside the lock (O1/O8) ---
+        _j45 = state_mod.JOURNAL_FILE
+        _abs45 = files.get_abs_path(_j45)
+        state_mod.JOURNAL_FILE = TEST_JOURNAL
+        try:
+            with open(files.get_abs_path(TEST_JOURNAL), 'w', encoding='utf-8') as _f45g:
+                _f45g.write(''.join(
+                    json.dumps({'action': 'nudge', 'i': _i}) + '\n' for _i in range(5)
+                ))
+            state_mod._journal_read_cache.pop(
+                files.get_abs_path(TEST_JOURNAL), None)
+            _all45 = state_mod.read_journal(100)
+            assert [_x['i'] for _x in _all45] == [4, 3, 2, 1, 0], _all45
+            _off45 = state_mod._journal_read_cache[
+                files.get_abs_path(TEST_JOURNAL)][1]
+            assert _off45 == os.path.getsize(files.get_abs_path(TEST_JOURNAL)), _off45
+            # appending 3 more and reading again must see them
+            for _i45 in (5, 6, 7):
+                state_mod.append_journal({'action': 'nudge', 'i': _i45})
+            _all45b = state_mod.read_journal(100)
+            assert [_x['i'] for _x in _all45b] == [7, 6, 5, 4, 3, 2, 1, 0], _all45b
+            # a torn final line must not corrupt the cache for the NEXT read
+            with open(files.get_abs_path(TEST_JOURNAL), 'a', encoding='utf-8') as _f45g:
+                _f45g.write(json.dumps({'action': 'nudge', 'i': 8})[:5])
+            _all45c = state_mod.read_journal(100)
+            assert [_x['i'] for _x in _all45c] == [7, 6, 5, 4, 3, 2, 1, 0], _all45c
+            with open(files.get_abs_path(TEST_JOURNAL), 'a', encoding='utf-8') as _f45g:
+                _f45g.write(json.dumps({'action': 'nudge', 'i': 8})[5:] + '\n')
+            _all45d = state_mod.read_journal(100)
+            assert [_x['i'] for _x in _all45d] == [8, 7, 6, 5, 4, 3, 2, 1, 0], _all45d
+        finally:
+            state_mod.JOURNAL_FILE = _j45
+
+        # The RESULT alone cannot prove the tail path: a full re-parse returns
+        # the same entries, so a mutation that disables the tail branch passes
+        # every assertion above. Prove it by BYTES READ - after an append the
+        # scan must read only the new tail, not the whole file.
+        import builtins as _bi45g
+        _real_open45g = _bi45g.open
+        _read_bytes45g = [0]
+
+        class _CountingFile:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __enter__(self):
+                self._inner.__enter__()
+                return self
+
+            def __exit__(self, *a):
+                return self._inner.__exit__(*a)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def read(self, *a):
+                data = self._inner.read(*a)
+                _read_bytes45g[0] += len(data)
+                return data
+
+        def _counting_open45g(path, *a, **k):
+            handle = _real_open45g(path, *a, **k)
+            if str(path).endswith(os.path.basename(TEST_JOURNAL)):
+                return _CountingFile(handle)
+            return handle
+
+        state_mod.JOURNAL_FILE = TEST_JOURNAL
+        try:
+            with open(files.get_abs_path(TEST_JOURNAL), 'w', encoding='utf-8') as _f45g:
+                _f45g.write(''.join(
+                    json.dumps({'action': 'nudge', 'i': _i, 'pad': 'p' * 120})
+                    + '\n' for _i in range(200)
+                ))
+            state_mod._journal_read_cache.pop(
+                files.get_abs_path(TEST_JOURNAL), None)
+            _bi45g.open = _counting_open45g
+            state_mod.read_journal(500)
+            _cold_bytes = _read_bytes45g[0]
+            assert _cold_bytes > 20000, (
+                'precondition: a cold read must pull the whole file, got %d bytes'
+                % _cold_bytes
+            )
+            # steady state: nothing appended -> no journal I/O at all
+            _read_bytes45g[0] = 0
+            state_mod.read_journal(500)
+            assert _read_bytes45g[0] == 0, (
+                'an unchanged journal must not be re-read, read %d bytes'
+                % _read_bytes45g[0]
+            )
+            # one appended row -> only that row is parsed
+            state_mod.append_journal({'action': 'nudge', 'i': 999, 'pad': 'p' * 120})
+            _read_bytes45g[0] = 0
+            _after = state_mod.read_journal(500)
+            assert _after[0].get('i') == 999, _after[:1]
+            assert 0 < _read_bytes45g[0] < _cold_bytes // 4, (
+                'an appended row must be read as a tail, not a full re-parse '
+                '(read %d of %d bytes)' % (_read_bytes45g[0], _cold_bytes)
+            )
+        finally:
+            _bi45g.open = _real_open45g
+            state_mod.JOURNAL_FILE = _j45
+            state_mod._journal_read_cache.pop(
+                files.get_abs_path(TEST_JOURNAL), None)
+        print('TEST45G_JOURNAL_INCREMENTAL_PARSE_OK')
+
+        # --- 45h: one signature per save (O3) + compact payload (O4) ---
+        _calls45h = []
+        _orig_sig45h = state_mod.state_signature
+        _orig_save45h = state_mod.save_state
+
+        def _counting_save(st, signature=None):
+            _calls45h.append(signature)
+            return _orig_save45h(st, signature)
+        try:
+            state_mod.save_state = _counting_save
+            def _bump(st):
+                state_mod.get_chat(st, FAKE_CHAT_A)['status'] = 'stalled'
+                return {'ok': True}
+            state_mod.state_transaction_apply(_bump)
+            assert len(_calls45h) == 1, _calls45h
+            assert isinstance(_calls45h[0], str) and _calls45h[0], (
+                'save_state recomputed the signature instead of using the '
+                'one the transaction already computed'
+            )
+        finally:
+            state_mod.save_state = _orig_save45h
+            state_mod.state_signature = _orig_sig45h
+        _raw45 = files.read_file(files.get_abs_path(state_mod.STATE_FILE))
+        assert '\n  "' not in _raw45[:400], (
+            'state.json is back to indent=2; that was ~40% extra bytes per '
+            'durable write'
+        )
+        assert '"chats"' in _raw45 and state_mod.load_state()['chats'], _raw45[:200]
+        print('TEST45H_SIGNATURE_REUSE_AND_COMPACT_OK')
+
+        # --- 45i: one log lock per chat per pass (O5) ---
+        _locks45i = []
+        _ctx45i = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=1)
+        _real_lock45i = _ctx45i.log._lock
+
+        class _CountingLock:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __enter__(self):
+                _locks45i.append(1)
+                return self._inner.__enter__()
+
+            def __exit__(self, *a):
+                return self._inner.__exit__(*a)
+        try:
+            _ctx45i.log._lock = _CountingLock(_real_lock45i)
+            monitor._log_snapshot(_ctx45i)
+            _view45i = monitor._log_snapshot(_ctx45i)
+            assert len(_locks45i) == 2, len(_locks45i)
+            for _fn45i in (
+                monitor._log_len, monitor._log_updates, monitor._last_log_type,
+                monitor._last_entry_type, monitor._last_response_text,
+                monitor._last_log_fatal,
+            ):
+                _fn45i(_ctx45i, _view45i)
+            assert len(_locks45i) == 2, (
+                'six scanners over a shared snapshot took %d extra log locks; '
+                'every one of them blocks the agent\'s own log writer'
+                % (len(_locks45i) - 2)
+            )
+            # ...and with no snapshot the helper still works standalone
+            assert monitor._log_len(_ctx45i) == 2, 'standalone _log_len broken'
+            assert len(_locks45i) == 3, len(_locks45i)
+        finally:
+            _ctx45i.log._lock = _real_lock45i
+        print('TEST45I_ONE_LOG_LOCK_PER_PASS_OK')
+
+        # --- 45j: state module is reached through module-attr (A8) ---
+        # The real invariant: no endpoint may PIN `load_state` / `read_journal`
+        # with a from-import (such a binding survives a helpers/state.py
+        # hot-reload, so the endpoint silently keeps serving pre-patch state
+        # code), and no call site may invoke the bare name. Checked with `ast`
+        # so docstrings and comments can never mask (or trip) it.
+        import ast as _ast45j
+        import inspect as _insp45j
+        _export45j = __import__(
+            'usr.plugins.chat_shepherd.api.export', fromlist=['x'])
+        _history45j = __import__(
+            'usr.plugins.chat_shepherd.api.history', fromlist=['x'])
+        for _mod45j, _names45j in (
+            (_status45, ('load_state', 'read_journal')),
+            (_export45j, ('load_state', 'read_journal')),
+            (_history45j, ('read_journal',)),
+        ):
+            _src45j = _insp45j.getsource(_mod45j)
+            for _ln45j in _src45j.splitlines():
+                _st45j = _ln45j.strip()
+                if _st45j.startswith('from usr.plugins.chat_shepherd.helpers.state import'):
+                    _imported45j = _st45j.split('import', 1)[1]
+                    for _n45j in _names45j:
+                        assert _n45j not in _imported45j, (
+                            '%s pins %s via a from-import; a state.py '
+                            'hot-reload would be a silent no-op there'
+                            % (_mod45j.__name__, _n45j)
+                        )
+            for _node45j in _ast45j.walk(_ast45j.parse(_src45j)):
+                if (
+                    isinstance(_node45j, _ast45j.Call)
+                    and isinstance(_node45j.func, _ast45j.Name)
+                    and _node45j.func.id in _names45j
+                ):
+                    raise AssertionError(
+                        '%s calls %s() as a bare name; use state_mod.%s() so a '
+                        'state.py hot-reload reaches this endpoint'
+                        % (_mod45j.__name__, _node45j.func.id, _node45j.func.id)
+                    )
+        print('TEST45J_STATE_ACCESS_IS_HOT_RELOAD_SAFE_OK')
+
+        # --- 45k: every config read goes through the _load_config seam (A9) ---
+        # v1.20.3 rule: only `_load_config` may call plugins.get_plugin_config.
+        # Checked by source, because a runtime call site is the whole point -
+        # and matched with the trailing '(' so a comment mentioning the API
+        # name cannot mask (or trip) it.
+        import glob as _glob45k
+        _plugin_root45k = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        import ast as _ast45k
+        _seam45k = _insp45j.getsource(monitor._load_config)
+        assert '_plugins.get_plugin_config(' in _seam45k, (
+            'the seam itself must be the one that reads the framework config'
+        )
+        for _rel45k in ('helpers/monitor.py', 'helpers/adaptive.py',
+                        'helpers/aggregates.py', 'helpers/resume_draft.py',
+                        'api/status.py', 'api/nudge.py', 'api/resolve.py',
+                        'api/draft.py', 'api/history.py', 'api/export.py',
+                        'api/test_notify.py'):
+            _p45k = os.path.join(_plugin_root45k, _rel45k.replace('/', os.sep))
+            with open(_p45k, 'r', encoding='utf-8') as _f45k:
+                _tree45k = _ast45k.parse(_f45k.read(), filename=_p45k)
+            for _node45k in _ast45k.walk(_tree45k):
+                _fn45k = _node45k.func if isinstance(_node45k, _ast45k.Call) else None
+                if (
+                    isinstance(_fn45k, _ast45k.Attribute)
+                    and _fn45k.attr == 'get_plugin_config'
+                    and isinstance(_fn45k.value, _ast45j.Name)
+                    and _fn45k.value.id == '_plugins'
+                ):
+                    _owner45k = [
+                        _n45k.name for _n45k in _ast45k.walk(_tree45k)
+                        if isinstance(_n45k, (_ast45j.FunctionDef, _ast45j.AsyncFunctionDef))
+                        and _n45k is not _node45k
+                        and any(_sub is _node45k for _sub in _ast45k.walk(_n45k))
+                    ]
+                    assert _owner45k == ['_load_config'], (
+                        '%s calls plugins.get_plugin_config inside %s; only '
+                        'monitor._load_config may (v1.20.3 seam)'
+                        % (_rel45k, _owner45k)
+                    )
+        _notify45k = _insp45j.getsource(monitor._notify)
+        assert '_plugins.get_plugin_config(' not in _notify45k, _notify45k
+        assert '_load_config()' in _notify45k, _notify45k
+        print('TEST45K_NOTIFY_USES_CONFIG_SEAM_OK')
+
+        # --- 45l: hot-reload keys on nanosecond mtime (O13) ---
+        _src45l = _insp45j.getsource(_hr44._check)
+        assert 'st_mtime_ns' in _src45l and '.st_mtime\n' not in _src45l, _src45l
+        print('TEST45L_HOTRELOAD_NANOSECOND_MTIME_OK')
+
+        # --- 45m: "capped" must mean suppressed (A6) ---
+        # Supervised mode with a zero per-tick budget queues editable drafts and
+        # suppresses NOTHING, yet the throttle snapshot ORed
+        # `max_nudges_per_tick <= 0` into `capped` unconditionally - the
+        # dashboard showed a red "capped" badge on a run where no nudge was
+        # ever withheld.
+        _ctx45m = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=30)
+        FakeAgentContext._all = [_ctx45m]
+        _cfg45m = dict(wedge_cfg, supervised_mode=True, max_nudges_per_tick=0)
+        monitor.tick(_cfg45m)
+        _thr45m = read_state().get('throttle', {})
+        assert _thr45m.get('stalled_queued', 0) >= 1, _thr45m
+        assert _thr45m.get('capped') is False, (
+            'supervised drafts are not a cap, yet capped=%r' % _thr45m.get('capped')
+        )
+        # control: a real truncation still reports capped
+        _ctx45m2 = [FakeCtx(FAKE_CHAT_A + '1', ['user'], idle_minutes=30),
+                    FakeCtx(FAKE_CHAT_A + '2', ['user'], idle_minutes=30)]
+        for _c45m in _ctx45m2:
+            _c45m.name = 'Chat ' + _c45m.id
+        FakeAgentContext._all = list(_ctx45m2)
+        monitor.tick(dict(wedge_cfg, supervised_mode=False, max_nudges_per_tick=1))
+        _thr45mb = read_state().get('throttle', {})
+        if _thr45mb.get('stalled_queued', 0) > 1:
+            assert _thr45mb.get('capped') is True, (
+                'a truncated queue must still report capped: %r' % _thr45mb
+            )
+        print('TEST45M_SUPERVISED_NOT_CAPPED_OK')
+
+        # --- 45n: aggregates are cached per journal stat key (O2) ---
+        _calls45n = []
+        _orig_compute45n = _status45.aggregates.compute
+        try:
+            _status45.aggregates.compute = lambda entries: (
+                _calls45n.append(len(entries)), _orig_compute45n(entries))[1]
+            _status45._AGG_CACHE['key'] = None
+            _orig_hcd45n = monitor._has_chat_dir
+            monitor._has_chat_dir = lambda cid: True
+            _aio35.run(_CSStatus35(None, None).process({}, None))
+            _first45n = len(_calls45n)
+            _aio35.run(_CSStatus35(None, None).process({}, None))
+            assert len(_calls45n) == _first45n, (
+                'aggregates recomputed for an unchanged journal (%d -> %d)'
+                % (_first45n, len(_calls45n))
+            )
+            state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'agg_probe'})
+            _aio35.run(_CSStatus35(None, None).process({}, None))
+            assert len(_calls45n) == _first45n + 1, (
+                'an appended journal row must invalidate the aggregates cache'
+            )
+        finally:
+            _status45.aggregates.compute = _orig_compute45n
+            monitor._has_chat_dir = _orig_hcd45n
+        print('TEST45N_AGGREGATES_CACHE_OK')
+
+        # --- 45o: /draft reads state twice, not three times (O7) ---
+        _loads45o = []
+        _orig_load45o = state_mod.load_state
+        try:
+            state_mod.load_state = lambda: (
+                _loads45o.append(1), _orig_load45o())[1]
+            _st45o = state_mod.load_state()
+            # earlier blocks (45M) may have left a draft for this chat; the
+            # one-per-chat dedupe would reject ours
+            _st45o['drafts'] = [
+                d for d in _st45o.get('drafts', [])
+                if not (isinstance(d, dict) and d.get('chat_id') == FAKE_CHAT_A)
+            ]
+            assert state_mod.add_draft(
+                _st45o, FAKE_CHAT_A, 'stall_nudge', reason='peek probe 45o')
+            _did45o = _st45o['drafts'][0]['id']
+            state_mod.save_state(_st45o)
+            _dctx45o = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=30)
+            _orig_gc45o = _draft45._get_context
+            _draft45._get_context = lambda cid: _dctx45o
+            _loads45o.clear()
+            try:
+                _r45o = _aio35.run(
+                    _CSDraft17(None, None).process(
+                        {'draft_id': _did45o, 'action': 'send'}, None))
+            finally:
+                _draft45._get_context = _orig_gc45o
+            assert _r45o.get('success') is True, _r45o
+            assert len(_loads45o) == 2, (
+                'a send must read state twice (claim + bookkeeping); the '
+                'removed peek made it three, got %d' % len(_loads45o)
+            )
+        finally:
+            state_mod.load_state = _orig_load45o
+        print('TEST45O_DRAFT_PEEK_REMOVED_OK')
+
+        # --- 45p: debug-log rotation runs once per day, not per line (O9) ---
+        _globs45p = []
+        _orig_glob45p = monitor.glob.glob
+        try:
+            monitor.glob.glob = lambda pat: (
+                _globs45p.append(pat), _orig_glob45p(pat))[1]
+            _real_debug45p = orig_debug_log
+            monitor._debug_log = _real_debug45p
+            _DEBUG_DAY = monitor._DEBUG_LOG_ROTATED_DAY
+            monitor._DEBUG_LOG_ROTATED_DAY = _DEBUG_DAY
+            _real_debug45p('probe45p_a', 'x')
+            _real_debug45p('probe45p_b', 'x')
+            _real_debug45p('probe45p_c', 'x')
+            assert len(_globs45p) == 1, (
+                'three log lines must glob the data dir once, saw %d'
+                % len(_globs45p)
+            )
+            # a new UTC day rotates again
+            monitor._DEBUG_LOG_ROTATED_DAY = '1999-01-01'
+            _real_debug45p('probe45p_d', 'x')
+            assert len(_globs45p) == 2, len(_globs45p)
+        finally:
+            monitor.glob.glob = _orig_glob45p
+            monitor._debug_log = _scratch_debug
+        print('TEST45P_DEBUG_ROTATION_ONCE_PER_DAY_OK')
+
+        # --- 45q: the name cache evicts LRU instead of flushing (O10) ---
+        # The old code called _NAME_CACHE.clear() at the cap, throwing away
+        # every warm entry at once - with ~345 chats against a 120-entry cap
+        # that is a burst of chat.json re-reads on a 9p mount. Exercised
+        # through the real resolver, not the dict, because the eviction lives
+        # inside the function.
+        _probe45q = ['nme45q01', 'nme45q02', 'nme45q03', 'nme45q04']
+        _orig_max45q = monitor._NAME_CACHE_MAX
+        import shutil as _shutil45q
+        try:
+            for _n45q, _id45q in enumerate(_probe45q):
+                # v1.21.3: under the redirected base, not the live usr/chats
+                _dir45q = files.get_abs_path(TEST_CHAT_BASE + '/' + _id45q)
+                os.makedirs(_dir45q, exist_ok=True)
+                # the cache is keyed on chat.json's (mtime, size), so the file
+                # has to exist for a miss to become a cached entry
+                with open(os.path.join(_dir45q, 'chat.json'), 'w', encoding='utf-8') as _f45q:
+                    _f45q.write(json.dumps({'name': 'Probe %d' % _n45q}))
+            monitor._NAME_CACHE.clear()
+            monitor._NAME_CACHE_MAX = 3
+            for _id45q in _probe45q:
+                monitor._chat_display_name(_id45q, None, {})
+            assert len(monitor._NAME_CACHE) <= 3, sorted(monitor._NAME_CACHE)
+            assert 'nme45q01' not in monitor._NAME_CACHE, (
+                'the LEAST recently used entry must be evicted, kept: %s'
+                % sorted(monitor._NAME_CACHE)
+            )
+            assert 'nme45q04' in monitor._NAME_CACHE, sorted(monitor._NAME_CACHE)
+            # a hit must refresh recency rather than age out
+            monitor._chat_display_name('nme45q02', None, {})
+            os.makedirs(
+                files.get_abs_path(TEST_CHAT_BASE + '/nme45q05'), exist_ok=True)
+            with open(
+                files.get_abs_path(TEST_CHAT_BASE + '/nme45q05/chat.json'), 'w',
+                encoding='utf-8',
+            ) as _f45q:
+                _f45q.write(json.dumps({'name': 'Probe 5'}))
+            monitor._chat_display_name('nme45q05', None, {})
+            assert 'nme45q02' in monitor._NAME_CACHE, sorted(monitor._NAME_CACHE)
+            for _id45q in _probe45q + ['nme45q05']:
+                _shutil45q.rmtree(
+                    files.get_abs_path(TEST_CHAT_BASE + '/' + _id45q),
+                    ignore_errors=True,
+                )
+        finally:
+            monitor._NAME_CACHE_MAX = _orig_max45q
+            monitor._NAME_CACHE.clear()
+        print('TEST45Q_NAME_CACHE_LRU_OK')
+
+        # --- 45r: the suite itself must not write to the live debug log (A15) ---
+        assert monitor._debug_log is not orig_debug_log, (
+            'the suite must keep a scratch _debug_log for the whole run; '
+            'otherwise every run appends its events to the production log'
+        )
+        assert monitor._debug_log.__name__ == '_scratch_debug', (
+            monitor._debug_log.__name__
+        )
+        print('TEST45R_SUITE_DEBUG_LOG_IS_SCRATCH_OK')
+
+        # --- 45s: coercion covers what TypeError/ValueError do not (cycle 2) ---
+        # int(float('inf')) raises OverflowError, which the original
+        # `except (TypeError, ValueError)` did not catch. On the LOAD path that
+        # meant load_state() itself raised - with no guard around it - turning a
+        # single hand-edited non-finite counter into exactly the whole-tick
+        # blindness the repair exists to prevent.
+        for _fn45s, _label45s in ((state_mod._as_int, 'state'),
+                                  (monitor._as_int, 'monitor')):
+            for _bad45s in (None, 'x', [], {}, float('nan'), float('inf'),
+                            float('-inf'), object()):
+                assert _fn45s(_bad45s, -1) == -1, (
+                    '%s._as_int raised or leaked a value for %r' % (_label45s, _bad45s)
+                )
+            assert _fn45s('7', -1) == 7 and _fn45s(3.9, -1) == 3, _label45s
+            assert _fn45s(True, -1) == 1, _label45s
+        # Structural, TEST34-style: the guard must include OverflowError. A
+        # mutation that dropped that arm (and kept only the two original
+        # exceptions) let `load_state` itself raise on a non-finite counter -
+        # i.e. it reintroduced the exact whole-tick failure class this repair
+        # exists to prevent. Deliberately a source check rather than a value
+        # check: once `int()` rejects every non-finite input on its own, a
+        # behavioural test for that arm cannot exist.
+        for _fn45s, _label45s in ((state_mod._as_int, 'state'),
+                                  (monitor._as_int, 'monitor')):
+            _src45s = _insp45j.getsource(_fn45s)
+            _body45s = '\n'.join(
+                _ln45s for _ln45s in _src45s.splitlines()
+                if not _ln45s.strip().startswith('#')
+            )
+            assert 'OverflowError' in _body45s, (
+                '%s._as_int must catch OverflowError: int(float("inf")) raises '
+                'it, and TypeError/ValueError do not cover it' % _label45s
+            )
+            assert 'except (TypeError, ValueError):' not in _body45s, (
+                '%s._as_int still has the pre-cycle-2 handler' % _label45s
+            )
+        # ...and end to end: an inf counter on disk must load, not explode
+        files.write_file(state_mod.STATE_FILE, json.dumps({
+            'chats': {FAKE_CHAT_A: {'nudge_count': float('inf'),
+                                    'nudges_sent': float('nan')}},
+            'last_tick': now_iso, 'history': [],
+        }))
+        _inf45 = state_mod.load_state()
+        assert _inf45['chats'][FAKE_CHAT_A]['nudge_count'] == 0, _inf45['chats'][FAKE_CHAT_A]
+        print('TEST45S_NONFINITE_COUNTERS_COERCED_OK')
+
+        # --- 45t: read_journal limit semantics (cycle 2) ---
+        # limit=0 / negative / None / non-numeric must not silently drop
+        # entries. `selected[-limit]` with a negative limit returned NOTHING for
+        # a short journal (data loss on a read path).
+        # Its OWN journal file: earlier tests appended rows to TEST_JOURNAL, so
+        # counting against that would assert on their leftovers, not on this.
+        _jl45t = 'tmp/chat_shepherd_journal_limit.jsonl'
+        _abs45t = files.get_abs_path(_jl45t)
+        files.write_file(_jl45t, '')
+        _jt45 = state_mod.JOURNAL_FILE
+        try:
+            state_mod.JOURNAL_FILE = _jl45t
+            state_mod._journal_read_cache.pop(_abs45t, None)
+            for _i45t in range(6):
+                state_mod.append_journal({'action': 'nudge', 'i': _i45t})
+            for _lim45t in (0, -3, None, 'x'):
+                assert len(state_mod.read_journal(_lim45t)) == 6, (
+                    'limit=%r silently dropped journal entries' % (_lim45t,)
+                )
+            assert len(state_mod.read_journal(3)) == 3
+            assert [e['i'] for e in state_mod.read_journal(3)] == [5, 4, 3]
+        finally:
+            state_mod.JOURNAL_FILE = _jt45
+            state_mod._journal_read_cache.pop(_abs45t, None)
+            try:
+                os.unlink(_abs45t)
+            except OSError:
+                pass
+        print('TEST45T_JOURNAL_LIMIT_SEMANTICS_OK')
+
+        # --- 45u: hostile state shapes degrade, never raise (cycle 2) ---
+        _shapes45u = (
+            {'chats': 'not-a-dict'},
+            {'chats': {FAKE_CHAT_A: 'junk-entry'}},
+            {'chats': {FAKE_CHAT_A: {'nudge_count': None, 'last_log_len': 'x'}}},
+        )
+        for _shape45u in _shapes45u:
+            files.write_file(state_mod.STATE_FILE, json.dumps(_shape45u))
+            _ok45u = state_mod.load_state()
+            assert isinstance(_ok45u.get('chats'), dict), _shape45u
+            assert all(
+                isinstance(_e, dict)
+                for _e in _ok45u['chats'].values()
+            ), _ok45u['chats']
+        # cap_chats must survive a non-dict entry mid-dict
+        _cap45u = {'chats': {FAKE_CHAT_A: {'last_ticked': '2026-01-01'},
+                             FAKE_CHAT_B: 'junk',
+                             FAKE_CHAT_C: {'last_ticked': '2026-01-03'}}}
+        state_mod.cap_chats(_cap45u, keep=1, protected=set())
+        assert FAKE_CHAT_C in _cap45u['chats'], _cap45u
+        print('TEST45U_HOSTILE_STATE_SHAPES_DEGRADE_OK')
+
+        # --- 45v: hostile INPUT bodies on every endpoint (cycle 3) ---
+        # Driven through the real handlers with values a JSON body can carry
+        # (Python's json.loads accepts Infinity/NaN, so these are not
+        # theoretical). v1.20.7 added `isinstance(input, dict)` to four
+        # handlers and missed /history; the numeric holes below are the same
+        # class in the fields those guards do not cover.
+        from usr.plugins.chat_shepherd.api import history as _his45v
+        from usr.plugins.chat_shepherd.api import test_notify as _tn45v
+        _jl45v = 'tmp/chat_shepherd_cycle3.jsonl'
+        files.write_file(_jl45v, '')
+        _abs45v = files.get_abs_path(_jl45v)
+        _jj45v = state_mod.JOURNAL_FILE
+        try:
+            state_mod.JOURNAL_FILE = _jl45v
+            state_mod._journal_read_cache.pop(_abs45v, None)
+            for _i45v in range(6):
+                state_mod.append_journal({'chat_id': FAKE_CHAT_A, 'action': 'x'})
+            # /history must answer, never raise, for every body shape
+            for _bad45v in (['a'], 'str', 5, None, {'chat_id': FAKE_CHAT_A,
+                                                    'limit': float('inf')},
+                            {'chat_id': FAKE_CHAT_A, 'limit': float('nan')},
+                            {'chat_id': FAKE_CHAT_A, 'limit': {}},
+                            {'chat_id': FAKE_CHAT_A, 'limit': [3]}):
+                _r45v = _aio35.run(
+                    _his45v.History(None, None).process(_bad45v, None))
+                assert isinstance(_r45v, dict) and 'success' in _r45v, (
+                    '/history raised or answered wrongly for %r' % (_bad45v,)
+                )
+            # a legit limit still trims; a junk one falls back to the default
+            assert len(_aio35.run(_his45v.History(None, None).process(
+                {'chat_id': FAKE_CHAT_A, 'limit': 3}, None))['history']) == 3
+        finally:
+            state_mod.JOURNAL_FILE = _jj45v
+            state_mod._journal_read_cache.pop(_abs45v, None)
+            try:
+                os.unlink(_abs45v)
+            except OSError:
+                pass
+        # /status must not degrade on a non-int persisted throttle field
+        _orig_hcd45v = monitor._has_chat_dir
+        _orig_cfg45v = monitor._load_config
+        try:
+            monitor._has_chat_dir = lambda cid: True
+            monitor._load_config = lambda: {
+                'enabled': True, 'icons': {}, 'max_nudges_per_tick': 3,
+            }
+            for _th45v in ({'budget': float('inf')}, {'budget': 'abc'},
+                           {'budget': None}, 'junk', {}):
+                files.write_file(state_mod.STATE_FILE, json.dumps({
+                    'chats': {}, 'drafts': [], 'history': [], 'last_tick': '',
+                    'throttle': _th45v,
+                }))
+                _p45v = _aio35.run(_CSStatus35(None, None).process({}, None))
+                assert _p45v.get('degraded') is None, (
+                    'a junk throttle budget degraded the whole snapshot: %r'
+                    % (_th45v,)
+                )
+                assert (_p45v.get('throttle') or {}).get('budget') == 3, (
+                    'an unusable budget must fall back to the config value, '
+                    'not 0 (which would read as "budget fully used"): %r'
+                    % (_p45v.get('throttle'),)
+                )
+            # ...but a legitimate 0 budget must survive as 0
+            files.write_file(state_mod.STATE_FILE, json.dumps({
+                'chats': {}, 'drafts': [], 'history': [], 'last_tick': '',
+                'throttle': {'budget': 0},
+            }))
+            _p45w = _aio35.run(_CSStatus35(None, None).process({}, None))
+            assert (_p45w.get('throttle') or {}).get('budget') == 0, (
+                'budget 0 means auto-nudging off and must not be replaced by '
+                'the default: %r' % (_p45w.get('throttle'),)
+            )
+            # the CONFIG side of the same seam: a non-int poll_seconds must be
+            # clamped, not raise into the degrade guard. This is what a
+            # hand-edited config.json looks like, and the dashboard poll
+            # interval comes from exactly this key.
+            for _cfg45v, _want in (
+                ({'poll_seconds': float('inf')}, 5),
+                ({'poll_seconds': 'abc'}, 5),
+                ({'poll_seconds': None}, 5),
+                ({'poll_seconds': 0}, 2),          # clamped up to the floor
+                ({'poll_seconds': 10 ** 9}, 120),   # clamped down to the ceiling
+                ({'poll_seconds': 7}, 7),
+            ):
+                monitor._load_config = lambda c=dict(_cfg45v): dict(
+                    c, enabled=True, icons={}, max_nudges_per_tick=3)
+                files.write_file(state_mod.STATE_FILE, json.dumps({
+                    'chats': {}, 'drafts': [], 'history': [], 'last_tick': '',
+                }))
+                _pc45v = _aio35.run(_CSStatus35(None, None).process({}, None))
+                assert _pc45v.get('degraded') is None, (
+                    'config %r degraded the snapshot: %s'
+                    % (_cfg45v, _pc45v.get('error'))
+                )
+                assert (_pc45v.get('config') or {}).get('poll_seconds') == _want, (
+                    'poll_seconds %r -> %r, expected %r'
+                    % (_cfg45v, (pc45v_cfg := _pc45v.get('config') or {}).get('poll_seconds'), _want)
+                )
+        finally:
+            monitor._has_chat_dir = _orig_hcd45v
+            monitor._load_config = _orig_cfg45v
+        print('TEST45V_HOSTILE_BODIES_NEVER_RAISE_OK')
+
+        # --- 45w: the float seams (cycle 3) ---
+        # `_as_float` guards the tick HEADER - outside the per-chat guard - so
+        # the v1.20.7 reasoning applies: raising there kills the whole tick.
+        # Two holes survived that fix. (1) `float(10**400)` raises
+        # OverflowError, which the two-arm handler did not catch, and JSON
+        # permits arbitrary-precision integer literals. (2) `float('inf')` and
+        # `float('nan')` SUCCEED - worse than raising: an inf cooldown makes
+        # every chat instantly off-cooldown and an inf stall threshold makes
+        # every chat instantly stalled, so a hand-edited value silently INVERTS
+        # the supervision policy instead of degrading to the default.
+        _INF_NAN = (float('inf'), float('-inf'), float('nan'))
+        for _fn45w, _label45w in ((monitor._as_float, 'monitor._as_float'),
+                                  (lambda v, f: _adaptive45._num(
+                                      {'k': v}, 'k', f), 'adaptive._num')):
+            _out45w = _fn45w(10 ** 400, 7.0)
+            assert _out45w == 7.0, (_label45w, '10**400 ->', _out45w)
+            for _nf45w in _INF_NAN:
+                _out45w = _fn45w(_nf45w, 7.0)
+                assert _out45w == 7.0, (
+                    '%s passed through %r instead of the fallback: %r'
+                    % (_label45w, _nf45w, _out45w)
+                )
+                assert _out45w == _out45w and _out45w not in _INF_NAN, (
+                    '%s returned a non-finite value' % _label45w
+                )
+            assert _fn45w('5.5', 7.0) == 5.5, _label45w
+            assert _fn45w('abc', 7.0) == 7.0, _label45w
+            assert _fn45w(None, 7.0) == 7.0, _label45w
+            # a legitimate 0 must survive (it is a real threshold, not a
+            # "missing" marker)
+            assert _fn45w(0, 7.0) == 0.0, _label45w
+        # ...and end to end through the public entry point
+        _vals45w = _adaptive45.configured_values({
+            'nudge_cooldown_minutes': 10 ** 400,
+            'wedge_nudge_after_minutes': float('inf'),
+            'wedge_remediation_cooldown_minutes': 'z',
+        })
+        assert _vals45w == {
+            'nudge_cooldown_minutes': 10.0,
+            'wedge_nudge_after_minutes': 10.0,
+            'wedge_remediation_cooldown_minutes': 10.0,
+        }, _vals45w
+        print('TEST45W_FLOAT_SEAMS_NEVER_RAISE_OR_GO_NONFINITE_OK')
+
+        # --- 45x: one seam for the chat-dir base (v1.21.1) ---
+        # `_CHAT_DIR_BASE` existed only for the scandir; four sites interpolated
+        # 'usr/chats/' inline, including the FALLBACK inside `_has_chat_dir` -
+        # the probe that decides whether a chat is supervised at all. If the
+        # base and the listing disagreed, `_has_chat_dir` returns False on
+        # exception and a real chat stops being nudged with no visible error.
+        import inspect as _insp45x
+        import ast as _ast45x
+        # Checked with `ast`, not by grepping text: docstrings legitimately
+        # mention the literal, and a text check would either miss a real inline
+        # concatenation or have to exempt prose by hand.
+        _tree45x = _ast45x.parse(
+            _insp45x.getsource(monitor), filename='monitor.py')
+        # No chat path may be built with an f-string over chat_id...
+        # (the one legitimate f-string over `chat_id` is an intervention
+        # MESSAGE, not a path - so the check requires a path-shaped literal.)
+        _fstrings45x = [
+            _n45x for _n45x in _ast45x.walk(_tree45x)
+            if isinstance(_n45x, _ast45x.JoinedStr)
+            and any(
+                isinstance(_p45x, _ast45x.FormattedValue)
+                and isinstance(getattr(_p45x, 'value', None), _ast45x.Name)
+                and getattr(_p45x.value, 'id', '') == 'chat_id'
+                for _p45x in _n45x.values
+            )
+            and any(
+                isinstance(_p45x, _ast45x.Constant)
+                and isinstance(_p45x.value, str)
+                and ('usr/chats' in _p45x.value or _p45x.value.endswith('/'))
+                for _p45x in _n45x.values
+            )
+        ]
+        assert not _fstrings45x, (
+            'monitor builds a chat path with an f-string over chat_id; route '
+            'it through _chat_dir() so the base cannot drift'
+        )
+        # ...nor by carrying the literal base anywhere else. Docstring nodes are
+        # skipped by identity rather than by text: `get_docstring` cleandocs
+        # (re-indents) the value, so comparing the two never matches.
+        _litfuncs45x = []
+        for _fn45x in _tree45x.body:
+            if not isinstance(_fn45x, (_ast45x.FunctionDef,
+                                       _ast45x.AsyncFunctionDef)):
+                continue
+            if _fn45x.name == '_chat_dir':
+                continue
+            _docnode45x = _fn45x.body[0] if _fn45x.body else None
+            _docnode45x = (
+                _docnode45x.value
+                if isinstance(_docnode45x, _ast45x.Expr)
+                and isinstance(_docnode45x.value, _ast45x.Constant)
+                else None
+            )
+            for _node45x in _ast45x.walk(_fn45x):
+                if _node45x is _docnode45x:
+                    continue
+                if (
+                    isinstance(_node45x, _ast45x.Constant)
+                    and isinstance(_node45x.value, str)
+                    and 'usr/chats' in _node45x.value
+                ):
+                    _litfuncs45x.append((_fn45x.name, _node45x.value.strip()[:40]))
+        assert not _litfuncs45x, (
+            'functions besides _chat_dir still carry the usr/chats literal: %s'
+            % _litfuncs45x
+        )
+        # ...and the seam actually resolves under the configured base
+        _orig_base45x = monitor._CHAT_DIR_BASE
+        _probe45x = files.get_abs_path('tmp/chat_shepherd_base_probe/' + FAKE_CHAT_A)
+        try:
+            monitor._CHAT_DIR_BASE = 'tmp/chat_shepherd_base_probe'
+            monitor._chat_listing_cache.clear()
+            os.makedirs(_probe45x, exist_ok=True)
+            assert monitor._has_chat_dir(FAKE_CHAT_A) is True, (
+                'the seam must resolve the chat under the configured base'
+            )
+            monitor._chat_dir_ids = lambda: None      # force the fallback path
+            assert monitor._has_chat_dir(FAKE_CHAT_A) is True, (
+                'the scandir-less fallback must use the same seam'
+            )
+            assert monitor._chat_dir(FAKE_CHAT_A) == _probe45x, monitor._chat_dir(
+                FAKE_CHAT_A)
+        finally:
+            monitor._CHAT_DIR_BASE = _orig_base45x
+            monitor._chat_listing_cache.clear()
+            import shutil as _shutil45x
+            _shutil45x.rmtree(
+                files.get_abs_path('tmp/chat_shepherd_base_probe'),
+                ignore_errors=True,
+            )
+        print('TEST45X_CHAT_DIR_BASE_HAS_ONE_SEAM_OK')
+
+        # --- 45y: this suite must never touch the live chat tree (P6.2) ---
+        # The behavioural half of the seam guarantee. TEST45X pins the code
+        # shape; this pins the effect: no fixture chat may exist under the
+        # REAL usr/chats at any point. Those ids match CHAT_ID_PATTERN, so a
+        # leftover from a crashed run would be picked up by a live tick and
+        # classified - and potentially nudged - as a real chat.
+        _leaked45y = [
+            _n45y for _n45y in os.listdir(files.get_abs_path('usr/chats'))
+            if _n45y.startswith(('csTst', 'nme45q'))
+        ] if os.path.isdir(files.get_abs_path('usr/chats')) else []
+        assert not _leaked45y, (
+            'test fixtures leaked into the live chat tree: %s' % _leaked45y
+        )
+        # and the fixtures really are under the scratch base, not absent
+        assert monitor._CHAT_DIR_BASE == TEST_CHAT_BASE, (
+            'the chat base must stay redirected for the whole run, got %r'
+            % (monitor._CHAT_DIR_BASE,)
+        )
+        assert monitor._has_chat_dir(FAKE_CHAT_A) is True, (
+            'the fixture chat must resolve under the redirected base'
+        )
+        assert os.path.isdir(_chat_dir(FAKE_CHAT_A)), (
+            'fixture chat missing from the scratch base'
+        )
+        print('TEST45Y_SUITE_NEVER_TOUCHES_LIVE_CHAT_TREE_OK')
+
+        # --- 45z: the signature cache (v1.21.3) ---
+        # `load_state` needs the fingerprint only to adopt the saved baseline,
+        # and the basis comes entirely from the file, so unchanged bytes can
+        # only produce an unchanged fingerprint. It was 50% of load_state on
+        # the audit host - and load_state runs on every /status poll per tab.
+        # What matters is not "it is faster" but that it never returns a stale
+        # fingerprint, which would silently disarm the quiet-tick gate.
+        _abs45z = files.get_abs_path(state_mod.STATE_FILE)
+        # self-contained: do not depend on what the previous block left behind
+        _seed45z = {
+            'chats': {
+                FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 1},
+                FAKE_CHAT_B: {'status': 'idle', 'nudge_count': 0},
+            },
+            'drafts': [], 'history': [], 'last_tick': now_iso,
+        }
+        with open(_abs45z, 'w', encoding='utf-8') as _f45z:
+            json.dump(_seed45z, _f45z)
+        state_mod._state_sig_cache = None
+        _st45z = state_mod.load_state()
+        assert _st45z.get('chats'), 'expected chats in the scratch state'
+        _fresh45z = state_mod.state_signature(_st45z)
+        assert state_mod._state_signature_cached(_st45z, _abs45z) == _fresh45z, (
+            'a cached signature disagreed with a fresh compute'
+        )
+        # ...and the cache must be invalidated by a write. The seam takes the
+        # RAW TEXT (the cache is keyed on a digest of it), so this must go
+        # through the same call shape load_state uses - passing the mutated
+        # state with the OLD bytes would ask the cache about bytes that no
+        # longer exist.
+        _mut45z = json.loads(json.dumps(_st45z))
+        _first45z = sorted(_mut45z['chats'])[0]
+        _mut45z['chats'][_first45z]['status'] = 'MUTATED45Z'
+        _raw45z = state_mod._state_sig_cache
+        _mut_raw45z = json.dumps(_mut45z)
+        with open(_abs45z, 'w', encoding='utf-8') as _f45z:
+            _f45z.write(_mut_raw45z)
+        try:
+            assert state_mod._state_signature_cached(_mut45z, _mut_raw45z) != _fresh45z, (
+                'the cache returned a STALE signature after the content '
+                'changed - the quiet-tick gate would skip a real save'
+            )
+            # ...and an UNCHANGED reload must still hit the cache
+            _calls45z = []
+            _state_mod_save45z = state_mod.state_signature
+            try:
+                state_mod.state_signature = (
+                    lambda st_, _o=_state_mod_save45z: (
+                        _calls45z.append(1), _o(st_))[1]
+                )
+                _again45z = state_mod._state_signature_cached(_mut45z, _mut_raw45z)
+            finally:
+                state_mod.state_signature = _state_mod_save45z
+            assert _again45z == state_mod.state_signature(_mut45z), (
+                'an identical reload must agree with a fresh compute'
+            )
+            assert not _calls45z, (
+                'a repeated load re-serialized the file (%d times) - the cache '
+                'is not doing its job' % len(_calls45z)
+            )
+        finally:
+            with open(_abs45z, 'w', encoding='utf-8') as _f45z:
+                json.dump(_st45z, _f45z)
+            state_mod._state_sig_cache = _raw45z
+            state_mod._last_saved_sig = ''
+            state_mod._last_loaded_sig = ''
+        # a transaction must still save exactly once on a real change, and not
+        # at all on a no-op (the gate the cache feeds)
+        _saves45z = []
+        _orig_save45z = state_mod.save_state
+        state_mod.save_state = lambda st_, sig=None: _saves45z.append(sig)
+        try:
+            state_mod.state_transaction_apply(lambda st_: {'noop': True})
+            assert not _saves45z, 'a no-op transaction saved %d times' % len(_saves45z)
+            def _bump45z(st_):
+                st_['chats'][_first45z]['status'] = 'NUDGED45Z'
+                return {'ok': True}
+            state_mod.state_transaction_apply(_bump45z)
+            assert len(_saves45z) == 1, 'a real change saved %d times' % len(_saves45z)
+            assert isinstance(_saves45z[0], str) and _saves45z[0], (
+                'save_state must receive the signature the transaction computed'
+            )
+        finally:
+            state_mod.save_state = _orig_save45z
+            state_mod._state_sig_cache = None
+            write_state(now_iso, chats={FAKE_CHAT_A: {'status': 'idle'}})
+        print('TEST45Z_SIGNATURE_CACHE_NEVER_STALE_OK')
+
+        # --- 45aa: the two identity/key contracts, pinned directly ---
+        # (a) CONTENT identity, not the file stat. state.json is rewritten in
+        # whole on every save, and two payloads of identical length written
+        # inside the filesystem's timestamp granularity share (mtime_ns, size) -
+        # that is the bug this cache was born with, and it silently disarmed the
+        # quiet-tick gate. Same-length content is constructed here on purpose.
+        import hashlib as _hl45aa
+        _raw_a45aa = json.dumps({'chats': {'aaaaaaaa': {'status': 'idle'}}})
+        _raw_b45aa = json.dumps({'chats': {'bbbbbbbb': {'status': 'idle'}}})
+        assert len(_raw_a45aa) == len(_raw_b45aa), 'fixture lengths must match'
+        assert _raw_a45aa != _raw_b45aa
+        state_mod._state_sig_cache = None
+        _pa45aa = json.loads(_raw_a45aa)
+        _sig_a45aa = state_mod._state_signature_cached(_pa45aa, _raw_a45aa)
+        _pb45aa = json.loads(_raw_b45aa)
+        _sig_b45aa = state_mod._state_signature_cached(_pb45aa, _raw_b45aa)
+        assert _sig_a45aa != _sig_b45aa, (
+            'same-length different content reused a fingerprint - the cache is '
+            'keyed on something that is not the content'
+        )
+        # and identical content must be stable regardless of spacing/ordering
+        _raw_a2_45aa = json.dumps({'chats': {'aaaaaaaa': {'status': 'idle'}}},
+                                  separators=(', ', ': '))
+        _pa2_45aa = json.loads(_raw_a2_45aa)
+        assert state_mod._state_signature_cached(_pa2_45aa, _raw_a2_45aa) == _sig_a45aa, (
+            'a byte-identical payload must not change the fingerprint'
+        )
+        # (b) the transaction must baseline on what the LOAD read. Structural,
+        # and deliberately so: `state_transaction_apply` holds `_state_lock`
+        # and calls `load_state()` itself, which re-establishes BOTH values, so
+        # a behavioural test cannot distinguish them - mutation testing
+        # confirmed both alternatives escape. Two attempts to pin this
+        # behaviourally failed for exactly that reason. `_last_loaded_sig` is
+        # still the right value to read (it is unconditional, while the save
+        # baseline is adopted only when no save raced and nothing was
+        # repaired), and the assertion below keeps the choice explicit.
+        _txn_src45aa = _insp45j.getsource(state_mod.state_transaction_apply)
+        assert '_last_loaded_sig' in _txn_src45aa, (
+            'the transaction must baseline on the loaded fingerprint'
+        )
+        assert 'last_saved_signature()' not in _txn_src45aa, (
+            'the transaction must not baseline on the conditionally-adopted '
+            'save baseline - that value can describe different bytes'
+        )
+        # ...and it must not RESERIALIZE the file just to find that out: the
+        # whole point of _last_loaded_sig is that the pre-apply baseline is
+        # already known. This is the assertion that catches the pure-perf
+        # mutation (recomputing it is correct, just slow), which a
+        # correctness-only test cannot see.
+        _sigcalls45aa = []
+        _seed45aa = {'chats': {'aaaaaaaa': {'status': 'stalled', 'nudge_count': 0}},
+                     'drafts': [], 'history': [], 'last_tick': now_iso}
+        _abs45aa = files.get_abs_path(state_mod.STATE_FILE)
+        with open(_abs45aa, 'w', encoding='utf-8') as _f45aa:
+            json.dump(_seed45aa, _f45aa)
+        state_mod._state_sig_cache = None
+        state_mod.load_state()
+        _orig_sig45aa = state_mod.state_signature
+        _orig_save45aa = state_mod.save_state
+        try:
+            def _counting_sig45aa(st_, _o=_orig_sig45aa):
+                _sigcalls45aa.append(1)
+                return _o(st_)
+            state_mod.state_signature = _counting_sig45aa
+            state_mod.save_state = lambda st_, sig=None: None
+            # a no-op transaction: the pre-apply baseline must come from
+            # _last_loaded_sig, so the only signature call is the POST-apply one
+            state_mod.state_transaction_apply(lambda st_: {'noop': True})
+            assert len(_sigcalls45aa) <= 1, (
+                'the transaction re-serialized the state to learn a baseline '
+                'it already had (%d signature calls for a no-op; expected 1 '
+                'post-apply)' % len(_sigcalls45aa)
+            )
+        finally:
+            state_mod.state_signature = _orig_sig45aa
+            state_mod.save_state = _orig_save45aa
+        _st45aa = state_mod.load_state()
+        _loaded45aa = state_mod.state_signature(_st45aa)
+        assert state_mod._last_loaded_sig == _loaded45aa, (
+            'load_state must record the fingerprint of the bytes it read'
+        )
+        # and the end-to-end contract that actually matters: a real change is
+        # saved exactly once, a no-op not at all.
+        _calls45aa = []
+        _orig_save45aa = state_mod.save_state
+        try:
+            state_mod.save_state = lambda st_, sig=None: _calls45aa.append(sig)
+            state_mod.state_transaction_apply(lambda st_: {'noop': True})
+            assert not _calls45aa, (
+                'a no-op transaction saved %d times' % len(_calls45aa)
+            )
+            def _bump45aa(st_):
+                st_['chats']['aaaaaaaa']['nudge_count'] = 1
+                return {'ok': True}
+            state_mod.state_transaction_apply(_bump45aa)
+        finally:
+            state_mod.save_state = _orig_save45aa
+        assert len(_calls45aa) == 1, (
+            'a real change must save exactly once, got %d' % len(_calls45aa)
+        )
+        state_mod._last_saved_sig = ''
+        state_mod._last_loaded_sig = ''
+        state_mod._state_sig_cache = None
+        print('TEST45AA_IDENTITY_IS_CONTENT_NOT_STAT_OK')
+
+        print('TEST45_V121_AUDIT_FIXES_OK')
+
         print('ALL_TESTS_PASSED')
     finally:
         state_mod.STATE_FILE = orig_state_file
 
         state_mod.JOURNAL_FILE = orig_journal_file
         monitor.AgentContext = orig_agent_ctx
+        # v1.21.3: restore the real chat base before cleanup() runs, so the
+        # teardown removes only the scratch tree this run created.
+        monitor._CHAT_DIR_BASE = orig_chat_base
+        monitor._chat_listing_cache.clear()
+        monitor._error_file_cache.clear()
+        monitor._NAME_CACHE.clear()
+        # v1.21.0 (A15): restore the real sink, and drop the scratch file so a
+        # run leaves nothing behind in the plugin tree.
+        monitor._debug_log = orig_debug_log
+        try:
+            if os.path.exists(_scratch_debug_path):
+                os.unlink(_scratch_debug_path)
+        except OSError:
+            pass
         FakeAgentContext._all = []
         cleanup()
 
