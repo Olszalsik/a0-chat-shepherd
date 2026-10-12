@@ -21,6 +21,12 @@ DEFAULTS: dict[str, Any] = {
     "save_state_interval_seconds": 120,
     "hot_reload_enabled": True,
     "allowed_chat_ids": [],
+    "auto_remediate_categories": [
+        "tool_error",
+        "framework_crash",
+        "network",
+        "json_malformed",
+    ],
     "intervention_after_failed_nudges": True,
     "notify_on_intervention": True,
     "notify_after_minutes": 30,
@@ -48,6 +54,7 @@ DEFAULTS: dict[str, Any] = {
         "stalled": "⚠️",
         "nudged": "🔄",
         "intervention": "🚨",
+        "blocked": "⛔",
         "interrupted": "🔌",
         "awaiting_user": "💬",
         "error": "❌",
@@ -270,6 +277,22 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
                 if s and len(s) <= 64 and s not in cleaned:
                     cleaned.append(s)
         current["allowed_chat_ids"] = cleaned[:200]
+    if "auto_remediate_categories" in readable:
+        # v1.22.0 (stage 2): the cause allowlist. Unknown names are REPORTED
+        # back as `rejected` by the save paths, never silently dropped here
+        # (same contract as unknown top-level keys). NEVER_REMEDIATE members
+        # remain accepted config values but are inert: planner.may_remediate
+        # applies the floor after this allowlist.
+        raw_cats = readable["auto_remediate_categories"]
+        if isinstance(raw_cats, str):
+            raw_cats = raw_cats.split(",")
+        if isinstance(raw_cats, list):
+            cats: list[str] = []
+            for item in raw_cats:
+                s = str(item).strip()
+                if s and s not in cats:
+                    cats.append(s)
+            current["auto_remediate_categories"] = cats[:20]
     if "webhook_url" in readable:
         current["webhook_url"] = str(readable["webhook_url"]).strip()[:500]
     if "webhook_allow_private" in readable:

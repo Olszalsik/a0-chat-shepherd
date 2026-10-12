@@ -12,6 +12,7 @@ export const DEFAULT_ICONS = {
   stalled: "⚠️",
   nudged: "🔄",
   intervention: "🚨",
+  blocked: "⛔",
   interrupted: "🔌",
   awaiting_user: "💬",
   error: "❌",
@@ -24,6 +25,7 @@ const COLORS = {
   stalled: "#ff9800",
   nudged: "#2196f3",
   intervention: "#f44336",
+  blocked: "#d32f2f",
   interrupted: "#ff5722",
   awaiting_user: "#9c27b0",
   error: "#f44336",
@@ -201,6 +203,19 @@ export const store = createStore("chatShepherdStore", {
     try {
       const json = await callApi("/resolve", { chat_id: chatId, action: "resolve" });
       if (!json || !json.success) toastFrontendError((json && json.error) || "Resolve failed", "Chat Shepherd");
+      this.fetchStatus();
+    } catch (e) {
+      toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
+    }
+  },
+
+  async release(chatId) {
+    // v1.22.0 (stage 2): release a blocked chat (the deliberate escape
+    // hatch; the ladder never releases). The server journals the reason
+    // it was previously blocked.
+    try {
+      const json = await callApi("/release", { chat_id: chatId });
+      if (!json || !json.success) toastFrontendError((json && json.error) || "Release failed", "Chat Shepherd");
       this.fetchStatus();
     } catch (e) {
       toastFrontendError(String((e && e.message) || e), "Chat Shepherd");

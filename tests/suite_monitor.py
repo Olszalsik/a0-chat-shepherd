@@ -1528,7 +1528,9 @@ def main():
         print('TEST21A_INFECTION_CHECK_RUNNING_OK')
 
         # 21b: TERMINATED warning stamps terminated_at durably; nudges stay
-        # suppressed even when the warning is buried under shepherd-nudge items
+        # suppressed even when the warning is buried under shepherd-nudge
+        # items. v1.22.0 (stage 2): the diagnosis floor now BLOCKS a safety
+        # termination for a human instead of leaving it as plain error.
         write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 0, 'last_nudge_at': ''}})
         ctx_b1 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
         ctx_b1.log.logs.append(types.SimpleNamespace(type='warning', heading='Infection check: TERMINATED'))
@@ -1538,8 +1540,13 @@ def main():
         st21b = read_state()
         assert st21b['chats'][FAKE_CHAT_A].get('terminated_at'), st21b['chats'][FAKE_CHAT_A]
         assert len(ctx_b1.communicated) == 0, ctx_b1.communicated
+        e21b = st21b['chats'][FAKE_CHAT_A]
+        assert e21b['status'] == 'blocked' and 'safety' in e21b['blocked_reason'], e21b
+        assert e21b['category'] == 'safety_termination', e21b
         # second tick: warning buried beyond the 5-item fatal window; the
-        # persisted stamp keeps the verdict an error with no auto-nudge
+        # persisted stamp keeps the verdict terminal with no auto-nudge, and
+        # the plugin's own nudges cannot release the block (automation, not
+        # a human turn)
         ctx_b2 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
         ctx_b2.log.logs.append(types.SimpleNamespace(type='warning', heading='Infection check: TERMINATED'))
         for _i in range(5):
@@ -1548,7 +1555,7 @@ def main():
         monitor.tick(dict(cfg, notify_on_intervention=False))
         assert len(ctx_b2.communicated) == 0, ctx_b2.communicated
         st21b2 = read_state()
-        assert st21b2['chats'][FAKE_CHAT_A]['status'] == 'error', st21b2['chats'][FAKE_CHAT_A]
+        assert st21b2['chats'][FAKE_CHAT_A]['status'] == 'blocked', st21b2['chats'][FAKE_CHAT_A]
         print('TEST21B_DURABLE_TERMINATION_STAMP_OK')
 
         # 21c: the nudge budget is NOT reset while a termination stamp is active;
@@ -4219,6 +4226,233 @@ def main():
             'stale subclass mark must expire on recovery'
         )
         print('TEST46H_SUBCLASS_MARK_EXPIRES_OK')
+
+        # ============ TEST 47: cause-gated remediation + blocked ============
+        # Ported from chat_shepherd2: the diagnosis floor, the blocked status,
+        # human-release ordering and the /release endpoint.
+
+        from usr.plugins.chat_shepherd.helpers import planner as planner_mod
+        from usr.plugins.chat_shepherd.api.release import (
+            _release_one, _valid_ids, MAX_BULK_RELEASE,
+        )
+
+        # TEST47A: the NEVER_REMEDIATE floor sits AFTER the allowlist — even
+        # allowlisting auth/safety never re-enables auto-fixing them.
+        assert not planner_mod.may_remediate('safety_termination', [
+            'safety_termination', 'auth', 'tool_error'])
+        assert not planner_mod.may_remediate('auth', [
+            'safety_termination', 'auth', 'tool_error'])
+        assert planner_mod.may_remediate('tool_error', [
+            'tool_error', 'network'])
+        assert not planner_mod.may_remediate('rate_limit', [
+            'tool_error', 'network'])
+        assert not planner_mod.may_remediate('tool_error', [])  # empty = off
+        print('TEST47A_MAY_REMEDIATE_FLOOR_OK')
+
+        # TEST47B: plan_seam verdicts — act / hold / block, and the
+        # released-signature hold that keeps a human release from being
+        # undone by the same verdict on the next tick.
+        v, r = planner_mod.plan_seam('none', ['tool_error'])
+        assert v == planner_mod.ACT, (v, r)
+        v, r = planner_mod.plan_seam('rate_limit', ['tool_error'])
+        assert v == planner_mod.HOLD and 'rate_limit' in r, (v, r)
+        v, r = planner_mod.plan_seam('safety_termination', ['tool_error'])
+        assert v == planner_mod.BLOCK and 'no auto-remediation' in r, (v, r)
+        v, r = planner_mod.plan_seam(
+            'safety_termination', ['tool_error'],
+            released_signature='abc', category_signature='abc')
+        assert v == planner_mod.HOLD and 'released by a human' in r, (v, r)
+        v, r = planner_mod.plan_seam(
+            'safety_termination', ['tool_error'],
+            released_signature='abc', category_signature='def')
+        assert v == planner_mod.BLOCK, (v, r)
+        print('TEST47B_PLAN_SEAM_VERDICTS_OK')
+
+        # TEST47C: release ordering — a genuine human turn newer than
+        # blocked_at; the plugin's own nudge entries do not qualify (the
+        # automation filter lives in diagnose.last_relevant_type); unreadable
+        # blocked_at never releases.
+        _mk_user = lambda content, ts: types.SimpleNamespace(
+            type='user', content=content, timestamp=ts)
+        import datetime as _dt
+        blocked_at_iso = (_dt.datetime.now(_dt.timezone.utc)
+                          - _dt.timedelta(minutes=5)).isoformat()
+        # human turn NOW vs blocked 5m ago -> release
+        assert planner_mod.human_arrived_after_block('user', time.time(), blocked_at_iso)
+        # human turn BEFORE the block -> no release
+        assert not planner_mod.human_arrived_after_block(
+            'user', time.time() - 600, blocked_at_iso)
+        # newest relevant entry is a response/tool, not a human turn
+        assert not planner_mod.human_arrived_after_block('response', time.time(), blocked_at_iso)
+        # absent/older-block stamp -> never release
+        assert not planner_mod.human_arrived_after_block('user', time.time(), '')
+        assert not planner_mod.human_arrived_after_block('user', time.time(), 'nonsense')
+        # diagnose filters the plugin's own nudges from the newest relevant type
+        view_auto = monitor._LogView(tail=[
+            types.SimpleNamespace(type='user', content='[chat_shepherd] nudge',
+                                  timestamp=time.time()),
+        ], last_type='user')
+        assert monitor.diag_mod.last_relevant_type(view_auto) == ''
+        assert monitor.diag_mod.last_human_user_at(view_auto) == 0.0
+        print('TEST47C_RELEASE_ORDERING_OK')
+
+        # TEST47D: the block budget stays bounded 1-5 and scales down.
+        assert planner_mod.block_budget(0) == 5
+        assert planner_mod.block_budget(5) == 5
+        assert planner_mod.block_budget(9) == 1
+        assert planner_mod.block_budget(100) == 1
+        assert planner_mod.block_budget(-7) == 5
+        print('TEST47D_BLOCK_BUDGET_OK')
+
+        # TEST47E: end-to-end — an auth failure (plain error entry with the
+        # text) BLOCKS the chat for a human and sends no nudge.
+        _e48 = time.time()
+        cfg47 = dict(cfg)
+        cfg47['notify_on_intervention'] = False
+        cfg47['wedge_max_remediations'] = 0  # keep the wedge ladder out of this
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'running', 'nudge_count': 0},
+        })
+        ctx47a = FakeCtx(FAKE_CHAT_A, ['user', 'response', 'tool'], idle_minutes=30)
+        ctx47a.log.logs.append(types.SimpleNamespace(
+            type='error', heading='', content='Error: 401 Unauthorized - invalid API key'))
+        FakeAgentContext._all = [ctx47a]
+        s47a = monitor.tick(cfg47)
+        assert len(ctx47a.communicated) == 0, 'auth failure must never be nudged'
+        ea47 = read_state()['chats'][FAKE_CHAT_A]
+        assert ea47['status'] == 'blocked', ea47
+        assert 'auth' in ea47['blocked_reason'], ea47
+        assert ea47['category'] == 'auth' and ea47['category_signature'], ea47
+        assert ea47['released_signature'] == '', ea47
+        actions47a = [h.get('action') for h in read_state()['history']]
+        assert 'blocked' in actions47a and 'classify' in actions47a, actions47a
+        print('TEST47E_AUTH_FAILURE_BLOCKS_OK')
+
+        # TEST47F: a genuine human turn NEWER than blocked_at releases on the
+        # next tick and stops re-blocking from the unchanged verdict...
+        ctx47b = FakeCtx(FAKE_CHAT_A, ['user', 'response', 'tool'], idle_minutes=0)
+        ctx47b.log.logs.append(types.SimpleNamespace(
+            type='user', content='I fixed the API key, continue', timestamp=time.time()))
+        FakeAgentContext._all = [ctx47b]
+        s47b = monitor.tick(cfg47)
+        assert len(ctx47b.communicated) == 0, 'released chat is not auto-nudged'
+        eb47 = read_state()['chats'][FAKE_CHAT_A]
+        assert eb47['status'] != 'blocked', eb47
+        assert eb47['released_signature'] == ea47['category_signature'], eb47
+        assert eb47['blocked_reason'] == '' and eb47['blocked_at'] == '', eb47
+        assert any(h.get('action') == 'blocked_released'
+                   for h in read_state()['history'])
+        print('TEST47F_HUMAN_TURN_RELEASES_OK')
+
+        # TEST47G: ...but only a CHANGED verdict re-blocks (hold while the
+        # signature is the one the human already saw).
+        _auth_text = 'Error: 401 Unauthorized - invalid API key'
+        _auth_sig = monitor.diag_mod.signature(
+            constants.CATEGORY_AUTH, _auth_text)
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {
+                'status': 'error', 'nudge_count': 0, 'category': 'auth',
+                'category_signature': _auth_sig,
+                'category_excerpt': _auth_text,
+                'released_signature': _auth_sig,
+                'blocked_reason': '', 'blocked_at': '',
+            },
+        })
+        ctx47c = FakeCtx(FAKE_CHAT_A, ['user', 'response', 'tool'], idle_minutes=30)
+        ctx47c.log.logs.append(types.SimpleNamespace(
+            type='error', heading='', content=_auth_text))
+        FakeAgentContext._all = [ctx47c]
+        monitor.tick(cfg47)
+        ec47 = read_state()['chats'][FAKE_CHAT_A]
+        assert ec47['status'] == 'error', ec47  # held, NOT re-blocked
+        assert 'released by a human' not in ec47['last_classification'], ec47
+        # a human turn again, verdict UNCHANGED (same text -> same signature):
+        # the tick-release stores the same sig; the gate keeps holding.
+        ctx47d = FakeCtx(FAKE_CHAT_A, ['user', 'response', 'tool'], idle_minutes=0)
+        ctx47d.log.logs.append(types.SimpleNamespace(
+            type='user', content='still here', timestamp=time.time()))
+        FakeAgentContext._all = [ctx47d]
+        monitor.tick(cfg47)
+        ed47 = read_state()['chats'][FAKE_CHAT_A]
+        assert ed47['status'] == 'error', ed47
+        print('TEST47G_RELEASED_HOLD_UNTIL_VERDICT_CHANGES_OK')
+
+        # TEST47H: the /release endpoint's state transition + validation.
+        st47h = {'chats': {
+            FAKE_CHAT_A: {'status': 'blocked', 'blocked_reason': 'auth (no auto-remediation by design)',
+                          'blocked_at': now_iso, 'category_signature': 'sig123',
+                          'released_signature': ''},
+            FAKE_CHAT_B: {'status': 'stalled'},
+        }}
+        out_ok = _release_one(st47h, FAKE_CHAT_A)
+        assert out_ok['released'] is True and out_ok['previous_reason'], out_ok
+        e47h = st47h['chats'][FAKE_CHAT_A]
+        assert e47h['status'] == 'nudged' and e47h['blocked_reason'] == '', e47h
+        assert e47h['released_signature'] == 'sig123', e47h
+        assert any(h.get('action') == 'blocked_released' for h in st47h.get('history', []))
+        assert _release_one(st47h, FAKE_CHAT_A)['released'] is False  # already released
+        assert _release_one(st47h, FAKE_CHAT_C)['reason'] == 'not a tracked chat'
+        assert _release_one(st47h, FAKE_CHAT_B)['reason'] == 'not blocked'
+        good, bad = _valid_ids(['zzz!bad', FAKE_CHAT_A, FAKE_CHAT_A, ''], FAKE_CHAT_B)
+        assert set(good) == {FAKE_CHAT_A, FAKE_CHAT_B}, (good, bad)
+        assert bad and 'invalid chat_id' in bad[0], bad
+        good2, bad2 = _valid_ids(['%08d' % i for i in range(MAX_BULK_RELEASE + 5)], '')
+        assert len(good2) == MAX_BULK_RELEASE and 'capped' in bad2[0]
+        print('TEST47H_RELEASE_ENDPOINT_UNIT_OK')
+
+        # TEST47I: rule-1 — classify_chat returns blocked for a stored
+        # blocked entry regardless of how healthy the current log looks
+        # (the release runs in tick, not here), and diagnose-off keeps the
+        # status terminal too.
+        ctx47e = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        prev47e = {'status': 'blocked', 'blocked_reason': 'auth (no auto-remediation by design)'}
+        s47i, r47i = monitor.classify_chat(ctx47e, FAKE_CHAT_A, cfg47, prev47e, 0.0)
+        assert s47i == constants.STATUS_BLOCKED and 'no auto-remediation' in r47i, (s47i, r47i)
+        print('TEST47I_BLOCKED_RULE1_OK')
+
+        # TEST47J: a non-allowlisted cause is HELD, not blocked — recorded on
+        # the row, never queued, never given an auto-nudge.
+        _hold_dir = _chat_dir(FAKE_CHAT_B)
+        with open(os.path.join(_hold_dir, 'error.txt'), 'w') as f:
+            f.write('Error: 429 rate limit exceeded, please retry later')
+        # files.exists() is a bounded stat cache: invalidate its entry for the
+        # freshly written marker or the suite reads a stale False (a real tick
+        # would never do this - the cache is invalidated on framework writes).
+        files._invalidate_exists_cache(files.get_abs_path(
+            os.path.join(_hold_dir, 'error.txt')))
+        monitor._error_file_cache.clear()
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_B: {'status': 'stalled', 'nudge_count': 0, 'last_nudge_at': ''},
+        })
+        ctx47f = FakeCtx(FAKE_CHAT_B, ['user', 'tool'], idle_minutes=60)
+        FakeAgentContext._all = [ctx47f]
+        s47j = monitor.tick(dict(cfg47, max_nudges_per_tick=5))
+        assert len(ctx47f.communicated) == 0, ctx47f.communicated
+        ej47 = read_state()['chats'][FAKE_CHAT_B]
+        assert ej47['status'] == 'error', ej47  # the stale error.txt verdict
+        assert ej47['category'] == 'rate_limit', ej47
+        assert ej47['status'] != 'blocked' and not ej47.get('blocked_reason'), ej47
+        # cleanup: restore the benign error.txt for the later no-context test
+        with open(os.path.join(_hold_dir, 'error.txt'), 'w') as f:
+            f.write('boom')
+        files._invalidate_exists_cache(files.get_abs_path(
+            os.path.join(_hold_dir, 'error.txt')))
+        monitor._error_file_cache.clear()
+        print('TEST47J_HELD_NOT_BLOCKED_OK')
+
+        # TEST47K: blocked chats still classify blocked on the tick and add
+        # to the blocked count; diagnose off does not un-block them either.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'blocked', 'blocked_reason': 'safety termination (no auto-remediation by design)',
+                          'blocked_at': now_iso, 'category_signature': 'sig', 'released_signature': ''},
+        })
+        ctx47g = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        FakeAgentContext._all = [ctx47g]
+        s47k = monitor.tick(cfg47)
+        assert s47k['blocked'] >= 1, s47k
+        assert len(ctx47g.communicated) == 0, ctx47g.communicated
+        assert read_state()['chats'][FAKE_CHAT_A]['status'] == 'blocked'
+        print('TEST47K_BLOCKED_STAYS_BLOCKED_OK')
 
         print('TEST45_V121_AUDIT_FIXES_OK')
 

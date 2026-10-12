@@ -439,6 +439,15 @@ def get_chat(state: dict, chat_id: str) -> dict[str, Any]:
             'wedge_nudges_effective': 0,
             'last_wedge_nudge_at': '',
             'last_wedge_outcome_at': '',
+            # v1.22.0 (stage 2): cause diagnosis + the blocked/hold bookkeeping.
+            'category': 'none',
+            'category_signature': '',
+            'category_excerpt': '',
+            'category_since': '',
+            'blocked_reason': '',
+            'blocked_at': '',
+            'supervisor_settled': False,
+            'released_signature': '',
         }
         chats[chat_id] = entry
     return entry

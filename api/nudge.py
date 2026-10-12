@@ -49,11 +49,25 @@ GUARDS = {
         'Automatic nudges are still suppressed for this chat after a recent '
         'security termination or error.'
     ),
+    'blocked': (
+        'This chat is BLOCKED pending human release. The deliberate escape '
+        'hatch is /release (single or bulk with confirm); a manual nudge is '
+        'an override that releases it implicitly.'
+    ),
 }
 
 
 def _evaluate_guards(ctx: Any, chat_id: str) -> tuple[str, str]:
     """Return (guard_key, operator message), or ('', '') when nudging is safe."""
+    try:
+        entry = state_mod.read_chat_entry(chat_id)
+        # v1.22.0 (stage 2): a blocked chat needs a deliberate human decision.
+        # A nudge still works as an override (and releases it implicitly via
+        # the standard override bookkeeping), but it must be a conscious one.
+        if str((entry or {}).get('status', '') or '') == 'blocked':
+            return ('blocked', GUARDS['blocked'])
+    except Exception:
+        pass
     try:
         if monitor._last_log_fatal(ctx):
             return ('fatal_stop', GUARDS['fatal_stop'])
@@ -156,6 +170,42 @@ class Nudge(ApiHandler):
             # Keep the prior status and annotate instead.
             if override:
                 prior_status = str(entry.get('status', '') or '')
+                # v1.22.0 (stage 2): an override nudge IS the release from
+                # `blocked` — the message was delivered, so keeping the
+                # terminal status and the reason would have the chat
+                # re-blocked on the unchanged error.txt the next tick anyway.
+                # Explicit release evidence: the current verdict's signature.
+                if guard == 'blocked' and prior_status == 'blocked':
+                    update_chat(st, chat_id,
+                        nudges_sent=entry.get('nudges_sent', 0) + 1,
+                        nudge_count=new_count,
+                        last_nudge_at=now_iso,
+                        manual_nudge_override_at=now_iso,
+                        manual_nudge_override_guard=guard,
+                        released_signature=str(entry.get('category_signature') or ''),
+                        blocked_reason='',
+                        blocked_at='',
+                        supervisor_settled=False,
+                        status='nudged',
+                        last_classification=(
+                            f'Manual nudge OVERRIDE released the block: {warning} '
+                            f'(attempt {new_count})'
+                        ),
+                    )
+                    append_history(st, {
+                        'chat_id': chat_id,
+                        'action': 'blocked_released',
+                        'detail': 'released by manual nudge override',
+                        'previous_reason': str(entry.get('blocked_reason') or '')[:200],
+                        'timestamp': now_iso,
+                    })
+                    return {
+                        'success': True,
+                        'chat_id': chat_id,
+                        'nudge_count': new_count,
+                        'overrode_guard': True,
+                        'message': 'Nudge sent; block released (override)',
+                    }
                 update_chat(st, chat_id,
                     nudges_sent=entry.get('nudges_sent', 0) + 1,
                     nudge_count=new_count,

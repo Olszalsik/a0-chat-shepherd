@@ -342,4 +342,12 @@ const OK_RESP = () => ({
   store.stopPolling();
 }
 
+
+import { readFileSync } from "node:fs";
+const storeSrc = readFileSync(new URL("../webui/shepherd-store.js", import.meta.url), "utf8");
+ok(storeSrc.includes("async release(chatId)") && storeSrc.includes('callApi("/release"'),
+  "the store must expose a release action that posts /release");
+ok(storeSrc.includes("blocked: \"⛔\"") && storeSrc.includes("blocked: \"#d32f2f\""),
+  "the store must carry default icon+color for the blocked status");
 console.log(`Shared store checks passed (${checks} assertions).`);
+

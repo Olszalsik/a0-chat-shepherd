@@ -542,4 +542,10 @@ function ok(condition, message) { assert.ok(condition, message); checks += 1; }
   ok(after.style.color !== beforeColor, "and pick up the new state's color");
 }
 
+
+import { readFileSync } from "node:fs";
+const injSrc = readFileSync(new URL("../webui/shepherd-sidebar.js", import.meta.url), "utf8");
+ok(injSrc.includes("blocked: \"⛔\"") && injSrc.includes('blocked: "Blocked"') && injSrc.includes("blocked: \"#d32f2f\""),
+  "the injector must know the blocked status icon, label and color");
 console.log(`Sidebar badge injector checks passed (${checks} assertions).`);
+

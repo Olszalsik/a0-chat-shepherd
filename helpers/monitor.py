@@ -23,6 +23,7 @@ from usr.plugins.chat_shepherd.helpers.constants import (
     STATUS_ERROR,
     STATUS_PAUSED,
     STATUS_IDLE,
+    STATUS_BLOCKED,
     NUDGE_TEXT,
     RESUME_TEXT,
     WEDGE_NUDGE_TEXT,
@@ -44,6 +45,7 @@ from usr.plugins.chat_shepherd.helpers.constants import (
 from usr.plugins.chat_shepherd.helpers import state as state_mod
 from usr.plugins.chat_shepherd.helpers import adaptive as adaptive_mod
 from usr.plugins.chat_shepherd.helpers import diagnose as diag_mod
+from usr.plugins.chat_shepherd.helpers import planner as planner_mod
 
 # v1.22.0 (stage 1, ported from chat_shepherd2's 2026-10-09 fix): the
 # wedged-completion reason classify_chat stamps, and the age parser for it.
@@ -839,6 +841,19 @@ def classify_chat(
     frozen_minutes: float = 0.0,
     view: _LogView | None = None,
 ) -> tuple[str, str]:
+    # v1.22.0 (stage 2): a blocked chat is terminal until a human acts — the
+    # release check runs in tick() before classify, so by the time we get
+    # here a still-blocked entry stays blocked regardless of how the log
+    # looks now (the verdict that blocked it usually lives in error.txt,
+    # which never expires).
+    if str(prev_entry.get('status', '')) == STATUS_BLOCKED:
+        return (
+            STATUS_BLOCKED,
+            str(
+                prev_entry.get('blocked_reason')
+                or 'blocked pending human release'
+            ),
+        )
     if context is None:
         if _check_error_file(chat_id):
             return STATUS_ERROR, 'Chat has error.txt but no active context'
@@ -1242,6 +1257,10 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
         'goal_gate_nudged': 0,
         'pruned': 0,
         'cap_evicted': 0,
+        # v1.22.0 (stage 2): blocked/hold bookkeeping.
+        'blocked': 0,
+        'blocked_released': 0,
+        'held': 0,
     }
     summary['adaptive'] = adaptive_tag
 
@@ -1251,6 +1270,14 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     resume_queue: list[tuple[float, str, Any, dict, str, Any]] = []
     resumed_names: list[str] = []
     wedge_queue: list[tuple[float, str, Any, dict, float]] = []
+    # v1.22.0 (stage 2): NEW blocked transitions, applied post-loop under a
+    # per-tick budget; the rest re-evaluate on the next tick.
+    block_queue: list[tuple[str, str, str, dict]] = []
+    # v1.22.0 (stage 2): the diagnosis gate's inputs, read once per tick.
+    diag_enabled = bool(cfg.get('diagnose_enabled', True))
+    allowed_cats = cfg.get('auto_remediate_categories') if isinstance(
+        cfg.get('auto_remediate_categories'), list
+    ) else []
 
     for chat_id, ctx in live_contexts.items():
         # v1.20.2: isolate per-chat failures. A single malformed state entry
@@ -1309,9 +1336,90 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               # wedge remediation either worked or is moot; credit it if recent.
               _record_wedge_outcome(state, chat_id, now_iso)
 
+          # v1.22.0 (stage 2): a blocked chat is released by a human, never
+          # by the ladder. Release = a genuine human turn newer than
+          # `blocked_at` (the plugin's own nudges are automation, not a human
+          # turn, so they cannot manufacture the release). The old verdict's
+          # signature is remembered so the same failure does not immediately
+          # re-block on the unchanged error.txt. Must run BEFORE classify:
+          # the blocked rule in classify_chat returns early on the stored
+          # status, and a release has to unblock the entry first.
+          _was_blocked = old_status == STATUS_BLOCKED
+          _released_now = False
+          if _was_blocked and diag_enabled:
+              _rel_type = diag_mod.last_relevant_type(view)
+              _human_ts = diag_mod.last_human_user_at(view)
+              if planner_mod.human_arrived_after_block(
+                  _rel_type, _human_ts, prev.get('blocked_at', '')
+              ):
+                  prev['released_signature'] = prev.get('category_signature', '')
+                  prev['status'] = STATUS_NUDGED
+                  prev['blocked_reason'] = ''
+                  prev['blocked_at'] = ''
+                  prev['supervisor_settled'] = False
+                  _was_blocked = False
+                  _released_now = True
+                  summary['blocked_released'] += 1
+                  state_mod.append_history(state, {
+                      'chat_id': chat_id,
+                      'action': 'blocked_released',
+                      'detail': 'released by a human turn (newer than blocked_at)',
+                      'timestamp': now_iso,
+                  })
+
           new_status, reason = classify_chat(
               ctx, chat_id, cfg, prev, frozen_minutes, view=view
           )
+
+          # v1.22.0 (stage 2): diagnose why the chat stopped, persist the
+          # category, and apply the gate verdict (act / hold / block) before
+          # the queues see the chat. The safety floor lives inside plan_seam,
+          # AFTER the allowlist, so config cannot re-enable auto-fixing a
+          # safety termination or an auth failure.
+          gate_verdict, gate_reason = planner_mod.ACT, ''
+          if diag_enabled:
+              _error_txt = ''
+              if _check_error_file(chat_id):
+                  _error_txt = diag_mod.read_error_head(
+                      os.path.join(_chat_dir(chat_id), 'error.txt')
+                  )
+              _fp = diag_mod.fingerprint(
+                  chat_id,
+                  error_text=_error_txt,
+                  fatal=diag_mod.fatal_text(view),
+              )
+              _cat = _fp['category']
+              _cat_sig = _fp['signature']
+              if diag_mod.category_changed(prev.get('category', 'none'), _cat):
+                  prev['category_since'] = now_iso
+                  state_mod.append_history(state, {
+                      'chat_id': chat_id,
+                      'action': 'classify',
+                      'category': _cat,
+                      'signature': _cat_sig,
+                      'source': _fp['source'],
+                      'timestamp': now_iso,
+                  })
+              prev['category'] = _cat
+              prev['category_signature'] = _cat_sig
+              prev['category_excerpt'] = _fp['excerpt']
+              gate_verdict, gate_reason = planner_mod.plan_seam(
+                  _cat, allowed_cats,
+                  released_signature=prev.get('released_signature', ''),
+                  category_signature=_cat_sig,
+              )
+              if gate_verdict == planner_mod.BLOCK and not _was_blocked:
+                  block_queue.append((now_iso, chat_id, gate_reason, prev))
+                  # The block supersedes the ladder for this chat this tick.
+                  gate_verdict = planner_mod.HOLD
+              elif gate_verdict == planner_mod.BLOCK and _was_blocked:
+                  # Still blocked and the floor says block again — the
+                  # classify rule already keeps it blocked; do not queue.
+                  gate_verdict = planner_mod.HOLD
+          elif _was_blocked:
+              # Diagnose off: a blocked chat keeps its terminal status; the
+              # only gate that still runs is the (config-dependent) ladder.
+              gate_verdict = planner_mod.HOLD
 
           # v1.18.2 fix (terminate-loop, part 2): persist the termination
           # stamp durably in state. A full-tail scan catches a TERMINATED
@@ -1345,6 +1453,15 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   f'Server restarted while chat was {old_status}; '
                   'mid-task work interrupted'
               )
+
+          # v1.22.0 (stage 2): one per-chat hold count for the actionable
+          # statuses; the dashboard shows the category next to the status,
+          # so a held chat stays readable instead of silently idle.
+          if (
+              gate_verdict == planner_mod.HOLD
+              and new_status in (STATUS_STALLED, STATUS_INTERRUPTED, STATUS_INTERVENTION)
+          ):
+              summary['held'] += 1
 
           fname = _chat_display_name(chat_id, ctx, prev)
           entry = state_mod.update_chat(
@@ -1405,7 +1522,11 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   cooldown_ok
                   and not _term_cooldown_active
                   and nudge_count < max_nudges
+                  and gate_verdict == planner_mod.ACT
               ):
+                  # v1.22.0 (stage 2): the diagnosis gate (hold/block)
+                  # precedes the ladder — a non-allowlisted cause is held,
+                  # a safety/auth verdict is queued for block, never nudged.
                   # Oldest stall first; final ordering happens post-loop.
                   nudge_queue.append((minutes_idle, chat_id, ctx, entry, now_iso))
           elif new_status == STATUS_INTERVENTION:
@@ -1430,6 +1551,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                       and not _term_cooldown_active
                       and frozen_minutes >= wedge_nudge_after
                       and getattr(ctx, 'type', None) == AgentContextType.USER
+                      and gate_verdict == planner_mod.ACT
                   ):
                       # Oldest freeze first; final ordering post-loop.
                       wedge_queue.append((frozen_minutes, chat_id, ctx, entry, now_iso))
@@ -1460,7 +1582,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                           _HK_AGE.search(reason).group(1) if _HK_AGE.search(reason) else 0.0,
                           0.0,
                       )
-                      wedge_queue.append((hk_age, chat_id, ctx, entry, now_iso))
+                      if gate_verdict == planner_mod.ACT:
+                          wedge_queue.append((hk_age, chat_id, ctx, entry, now_iso))
               # v1.7.0 quiet bell: persistence-gated paging. A fresh episode starts
               # the clock silently; the bell rings only once the chat has
               # persistently needed human help for >= notify_after minutes
@@ -1503,11 +1626,20 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   # v1.21.0 (A1): coerce the persisted budget read (same field
                   # as the stall branch above).
                   nudge_count = _as_int(entry.get('nudge_count', 0))
-                  if nudge_count < max_nudges:
+                  if (
+                      nudge_count < max_nudges
+                      and gate_verdict == planner_mod.ACT
+                  ):
                       minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
                       resume_queue.append(
                           (minutes_idle, chat_id, ctx, entry, now_iso, RESUME_TEXT)
                       )
+          elif new_status == STATUS_BLOCKED:
+              # v1.22.0 (stage 2): currently-blocked chat (transitioned on an
+              # earlier tick, or blocked-by-broken-prior-entry for diagnose-
+              # off runs). Terminal until release; it pages through the
+              # /release endpoint or a human turn, not through the ladder.
+              summary['blocked'] += 1
           elif new_status == STATUS_IDLE:
               summary['idle'] += 1
         except Exception as e:
@@ -1690,6 +1822,48 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 'frozen_minutes': round(frozen_minutes, 1),
                 'timestamp': now_iso,
             })
+
+    # v1.22.0 (stage 2): apply NEW blocked transitions, with a per-tick
+    # budget (1-5, scaled by how many chats are already blocked) so one
+    # chaotic tick cannot block half the fleet — the rest re-evaluate on
+    # the next tick. A block is terminal until a human releases it (a turn
+    # newer than blocked_at, or the /release endpoint).
+    if block_queue:
+        _already_blocked = sum(
+            1 for _e in state.get('chats', {}).values()
+            if isinstance(_e, dict) and _e.get('status') == STATUS_BLOCKED
+        )
+        _block_budget = planner_mod.block_budget(_already_blocked)
+        for _b_at, _b_id, _b_reason, _b_entry in block_queue:
+            if _block_budget <= 0:
+                break
+            if _b_entry.get('status') == STATUS_BLOCKED:
+                continue
+            _b_entry['status'] = STATUS_BLOCKED
+            _b_entry['blocked_reason'] = str(_b_reason)[:300]
+            _b_entry['blocked_at'] = _b_at
+            _b_entry['supervisor_settled'] = False
+            # A fresh block supersedes any earlier human release: the
+            # supervisor judged a human is needed again, so the old release
+            # no longer speaks for this verdict.
+            _b_entry['released_signature'] = ''
+            _block_budget -= 1
+            summary['blocked'] += 1
+            state_mod.append_history(state, {
+                'chat_id': _b_id,
+                'action': 'blocked',
+                'reason': str(_b_reason)[:200],
+                'timestamp': _b_at,
+            })
+            if notify_on_intervention:
+                _b_name = _chat_display_name(_b_id, None, _b_entry)
+                if not _notify(
+                    'warning',
+                    f'Chat {_b_name!r} ({_b_id}) blocked for a human: {_b_reason}',
+                    priority='high',
+                    cfg=cfg,
+                ):
+                    summary['notify_failures'] += 1
 
     if server_restarted:
         state_mod.append_history(state, {

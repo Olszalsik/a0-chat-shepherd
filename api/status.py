@@ -7,6 +7,7 @@ from typing import Any
 
 from helpers.api import ApiHandler, Request, Response
 
+from usr.plugins.chat_shepherd.helpers import constants
 from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN, JOURNAL_KEEP
 # v1.21.0 (A8): state is reached through the MODULE, never through a pinned
 # `from ...state import load_state, read_journal`. Those bindings survive a
@@ -238,6 +239,12 @@ class Status(ApiHandler):
                 'last_classification': reason or str(prev.get('last_classification', '') or ''),
                 'last_log_type': str(prev.get('last_log_type', '') or ''),
                 'error_detected': bool(prev.get('error_detected', False)),
+                # v1.22.0 (stage 2): cause + block evidence for the UI.
+                'category': str(prev.get('category', 'none') or 'none'),
+                'category_label': constants.CATEGORY_LABELS.get(
+                    str(prev.get('category', 'none') or 'none'), ''),
+                'blocked_reason': str(prev.get('blocked_reason', '') or ''),
+                'blocked_at': str(prev.get('blocked_at', '') or ''),
                 'running': info['running'],
                 'paused': info['paused'],
                 'name': info['name'] or chat_id,
@@ -257,6 +264,12 @@ class Status(ApiHandler):
                     fallback_status = 'idle'
             except Exception:
                 fallback_status = 'idle'
+            # v1.22.0 (stage 2): a blocked persisted entry stays blocked even
+            # without a live context — that is exactly the shape of a chat
+            # blocked for a human that no one has attended to yet.
+            if str(entry.get('status', '') or '') == 'blocked':
+                fallback_status = 'blocked'
+            _cat_entry = str(entry.get('category', 'none') or 'none')
             chat_list.append({
                 'chat_id': chat_id,
                 'status': fallback_status,
@@ -265,6 +278,10 @@ class Status(ApiHandler):
                 'last_classification': str(entry.get('last_classification', '') or ''),
                 'last_log_type': str(entry.get('last_log_type', '') or ''),
                 'error_detected': bool(entry.get('error_detected', False)),
+                'category': _cat_entry,
+                'category_label': constants.CATEGORY_LABELS.get(_cat_entry, ''),
+                'blocked_reason': str(entry.get('blocked_reason', '') or ''),
+                'blocked_at': str(entry.get('blocked_at', '') or ''),
                 'running': False,
                 'paused': False,
                 'name': str(entry.get('name', '') or '') or chat_id,
@@ -272,14 +289,15 @@ class Status(ApiHandler):
 
         status_order = {
             'intervention': 0,
-            'error': 1,
-            'interrupted': 2,
-            'stalled': 3,
-            'nudged': 4,
-            'running': 5,
-            'awaiting_user': 6,
-            'paused': 7,
-            'idle': 8,
+            'blocked': 1,
+            'error': 2,
+            'interrupted': 3,
+            'stalled': 4,
+            'nudged': 5,
+            'running': 6,
+            'awaiting_user': 7,
+            'paused': 8,
+            'idle': 9,
         }
         chat_list.sort(key=lambda c: status_order.get(c['status'], 99))
 

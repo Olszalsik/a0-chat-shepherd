@@ -129,6 +129,29 @@ Chat Shepherd
 <small class="hint">Global burst throttle: at most this many auto-nudges are sent per watch tick (0 disables auto-nudging). After max auto-nudges are exhausted, the chat escalates to intervention status.</small>
 </div>
 
+<div class="cs-card" x-data="{
+  cats: [
+  { key: 'tool_error', label: 'Tool errors' },
+  { key: 'framework_crash', label: 'Framework crashes' },
+  { key: 'network', label: 'Network failures' },
+  { key: 'json_malformed', label: 'Malformed model output' },
+  { key: 'context_length', label: 'Context length exhausted (recommended: off = held)' },
+  { key: 'rate_limit', label: 'Rate limits (recommended: off = held)' },
+  { key: 'model_refusal', label: 'Model refusals (recommended: off = held)' },
+  { key: 'safety_termination', label: 'Safety terminations (always blocked, not selectable)' },
+  { key: 'auth', label: 'Auth failures (always blocked, not selectable)' },
+  ],
+}">
+<h4>Cause-gated remediation</h4>
+<small class="hint">Tick the failure causes the auto-ladder is allowed to remediate (tool/framework/network/JSON are the safe defaults). Unticking holds those chats visible with no auto-action. A safety termination or an auth failure is ALWAYS blocked for a human — that floor is not configurable, and these two checkboxes are informational only.</small>
+<template x-for="c in cats" :key="c.key">
+<label style="display: block; margin: 4px 0;">
+  <input type="checkbox" :value="c.key" x-model="config.auto_remediate_categories" :disabled="c.key === 'safety_termination' || c.key === 'auth'" />
+  <strong x-text="c.label"></strong>
+</label>
+</template>
+</div>
+
 <div class="cs-card">
 <h4>Escalation</h4>
 <label style="display: block; margin: 4px 0;">
@@ -268,6 +291,7 @@ Chat Shepherd
   { key: 'stalled', label: 'Stalled' },
   { key: 'nudged', label: 'Nudged' },
   { key: 'intervention', label: 'Intervention' },
+  { key: 'blocked', label: 'Blocked' },
   { key: 'interrupted', label: 'Interrupted' },
   { key: 'awaiting_user', label: 'Awaiting you' },
   { key: 'error', label: 'Error' },

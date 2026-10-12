@@ -50,6 +50,60 @@ STATUS_AWAITING_USER = 'awaiting_user'
 STATUS_ERROR = 'error'
 STATUS_PAUSED = 'paused'
 STATUS_IDLE = 'idle'
+# v1.22.0 (stage 2, ported from chat_shepherd2): terminal until a HUMAN acts.
+# A chat the supervisor judged must not be auto-remediated (safety shutdown,
+# auth failure) and anything the ladder has no enabled remedy for. A block is
+# released by a genuine human turn newer than `blocked_at` (or the /release
+# endpoint) - never by the ladder itself, and never by the plugin's own
+# nudges (they are automation, not a human turn).
+STATUS_BLOCKED = 'blocked'
+
+# v1.22.0 (stage 2, ported from chat_shepherd2): the cause taxonomy. The
+# category is what decides whether remediation may act at all.
+CATEGORY_NONE = 'none'
+CATEGORY_TOOL_ERROR = 'tool_error'
+CATEGORY_CONTEXT_LENGTH = 'context_length'
+CATEGORY_RATE_LIMIT = 'rate_limit'
+CATEGORY_AUTH = 'auth'
+CATEGORY_MODEL_REFUSAL = 'model_refusal'
+CATEGORY_SAFETY_TERMINATION = 'safety_termination'
+CATEGORY_NETWORK = 'network'
+CATEGORY_JSON_MALFORMED = 'json_malformed'
+CATEGORY_FRAMEWORK_CRASH = 'framework_crash'
+CATEGORY_EXTERNAL_BLOCK = 'external_block'
+
+CATEGORIES = (
+    CATEGORY_NONE,
+    CATEGORY_TOOL_ERROR,
+    CATEGORY_CONTEXT_LENGTH,
+    CATEGORY_RATE_LIMIT,
+    CATEGORY_AUTH,
+    CATEGORY_MODEL_REFUSAL,
+    CATEGORY_SAFETY_TERMINATION,
+    CATEGORY_NETWORK,
+    CATEGORY_JSON_MALFORMED,
+    CATEGORY_FRAMEWORK_CRASH,
+    CATEGORY_EXTERNAL_BLOCK,
+)
+
+# The floor applied AFTER the config allowlist: adding a category to
+# auto_remediate_categories cannot re-enable auto-fixing a safety termination
+# or an auth failure - a safety case re-triggers itself, and a credential
+# failure is not fixed by retrying.
+NEVER_REMEDIATE = (CATEGORY_SAFETY_TERMINATION, CATEGORY_AUTH)
+
+CATEGORY_LABELS = {
+    CATEGORY_TOOL_ERROR: 'tool error',
+    CATEGORY_CONTEXT_LENGTH: 'context length exhausted',
+    CATEGORY_RATE_LIMIT: 'rate limit / quota',
+    CATEGORY_AUTH: 'provider auth rejected',
+    CATEGORY_MODEL_REFUSAL: 'model refusal',
+    CATEGORY_SAFETY_TERMINATION: 'safety termination',
+    CATEGORY_NETWORK: 'network failure',
+    CATEGORY_JSON_MALFORMED: 'malformed model output',
+    CATEGORY_FRAMEWORK_CRASH: 'framework crash',
+    CATEGORY_EXTERNAL_BLOCK: 'blocked by another plugin',
+}
 
 NUDGE_TEXT = (
     '[chat_shepherd] You stopped unexpectedly mid-task. '

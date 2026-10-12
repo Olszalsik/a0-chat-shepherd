@@ -4,6 +4,16 @@ watch_all: true
 # completion classifier (response logged but housekeeping never finished)
 # and the later cause-gated remediation — the 1.21.3 timing ladder runs on.
 diagnose_enabled: true
+# v1.22.0 (stage 2): the causes the remediation ladder may act on. A stall
+# whose newest failure classifies rate_limit / context_length / model_refusal
+# is HELD, not nudged (visible on the dashboard, no auto-action), and a
+# safety termination or auth failure is BLOCKED for a human no matter what
+# this list contains — that floor is not configurable by design.
+auto_remediate_categories:
+  - tool_error
+  - framework_crash
+  - network
+  - json_malformed
 stall_minutes: 5
 max_auto_nudges: 3
 max_nudges_per_tick: 1
@@ -73,6 +83,7 @@ icons:
   stalled: "⚠️"
   nudged: "🔄"
   intervention: "🚨"
+  blocked: "⛔"
   interrupted: "🔌"
   awaiting_user: "💬"
   error: "❌"
