@@ -15,6 +15,13 @@ stale_tick_minutes: 10
 notify_after_consecutive_failures: 3
 notify_on_selfcheck: true
 notify_degraded_after_failures: 3
+# v1.22.0 (stage 4): write-ahead intents for remediation deliveries. The
+# intent is recorded BEFORE the delivery and cleared after; a crash in
+# between leaves a durable intent the next tick reconciles and CHARGES to
+# the claimed action's budget (never replayed). inflight_timeout_minutes
+# is how long an undelivered intent can linger before it is reaped.
+inflight_enabled: true
+inflight_timeout_minutes: 5
 # v1.22.0 (stage 2): the causes the remediation ladder may act on. A stall
 # whose newest failure classifies rate_limit / context_length / model_refusal
 # is HELD, not nudged (visible on the dashboard, no auto-action), and a

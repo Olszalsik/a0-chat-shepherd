@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import time
+import uuid
 
 import threading
 from datetime import datetime, timezone
@@ -27,6 +28,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(str(value or ''))
+    except Exception:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
 def default_state() -> dict[str, Any]:
     # v1.22.0 (stage 3): `selfcheck` is the supervisor-health stamp
     # (findings, verdict, clocks); `channels`/`capabilities` arrive with the
@@ -37,7 +46,71 @@ def default_state() -> dict[str, Any]:
         'drafts': [],
         'last_tick': '',
         'selfcheck': {},
+        # v1.22.0 (stage 4): write-ahead intents for remediation deliveries.
+        'inflight': [],
     }
+
+
+# v1.22.0 (stage 4, ported from chat_shepherd2): the write-ahead in-flight
+# WAL for remediation deliveries. The order is load-bearing: record the
+# intent, deliver, then clear it. An exception between the first and second
+# step leaves a durable intent the NEXT tick reconciles — the only honest way
+# to represent "the supervisor tried to act and died mid-action" (a mutable
+# counter cannot be replayed and cannot be charged).
+
+
+def begin_inflight(
+    state: dict[str, Any], action: str, chat_id: str,
+    tier: int = 1, detail: str = '',
+) -> str:
+    entry = {'id': uuid.uuid4().hex[:12], 'action': str(action or ''),
+             'chat_id': str(chat_id or ''), 'tier': int(tier or 1),
+             'detail': str(detail or '')[:200],
+             'queued_at': _now_iso()}
+    inflight = state.get('inflight')
+    if not isinstance(inflight, list):
+        inflight = []
+        state['inflight'] = inflight
+    inflight.append(entry)
+    return entry['id']
+
+
+def end_inflight(state: dict[str, Any], intent_id: str) -> None:
+    inflight = state.get('inflight')
+    if isinstance(inflight, list):
+        state['inflight'] = [e for e in inflight
+                             if isinstance(e, dict) and e.get('id') != intent_id]
+
+
+def reconcile_inflight(
+    state: dict[str, Any], timeout_minutes: float = 5.0,
+) -> list[dict[str, Any]]:
+    """Reap timed-out intents; never replays them.
+
+    Returns the abandoned intents (the caller charges their budgets against
+    the action each intent CLAIMED). A fresh, un-timed-out intent is left
+    alone: a delivery running right now may still finish.
+    """
+    inflight = state.get('inflight')
+    if not isinstance(inflight, list):
+        state['inflight'] = []
+        return []
+    now = datetime.now(timezone.utc)
+    kept: list[dict[str, Any]] = []
+    abandoned: list[dict[str, Any]] = []
+    for entry in inflight:
+        if not isinstance(entry, dict):
+            continue
+        ts = _parse_iso(entry.get('queued_at', ''))
+        age_min = 99999.0 if ts is None else (
+            now - ts if ts.tzinfo else now - ts.replace(tzinfo=timezone.utc)
+        ).total_seconds() / 60.0
+        if age_min >= timeout_minutes:
+            abandoned.append(entry)
+        else:
+            kept.append(entry)
+    state['inflight'] = kept
+    return abandoned
 
 
 # v1.21.0 (A1): persisted per-chat counters are hand-editable state that
@@ -141,6 +214,8 @@ def load_state() -> dict[str, Any]:
         state.update(payload)
     if not isinstance(state.get('chats'), dict):
         state['chats'] = {}
+    if not isinstance(state.get('inflight'), list):
+        state['inflight'] = []
     # v1.20.2: repair non-dict chat entries at the load boundary. A hand-edited
     # or half-migrated state.json can hold `"chats": {"x": "oops"}`, and every
     # downstream consumer (classify_chat, the nudge-budget reset loop, /status)
@@ -342,6 +417,14 @@ def state_signature(state: dict[str, Any]) -> str:
             # every persist) churn every tick and would defeat the whole
             # point of the quiet-tick save gate (donor contract C9).
             'selfcheck': selfcheck_signature(state.get('selfcheck')),
+            # v1.22.0 (stage 4): only the COUNT matters — the ids churn and
+            # would defeat the whole point of the gate (donor contract).
+            'inflight': len(state.get('inflight') or [])
+            if isinstance(state.get('inflight'), list) else 0,
+            # v1.22.0 (stage 4): channel health is durable semantic state —
+            # the fold transaction must not be treated as a no-op.
+            'channels': state.get('channels') if isinstance(
+                state.get('channels'), dict) else {},
         }
         blob = json.dumps(basis, sort_keys=True, ensure_ascii=False, default=str)
         return hashlib.sha256(blob.encode('utf-8')).hexdigest()

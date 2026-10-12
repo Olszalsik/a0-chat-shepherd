@@ -17,6 +17,7 @@ from usr.plugins.chat_shepherd.helpers.constants import CHAT_ID_PATTERN, JOURNAL
 # endpoint. Same fix in api/export.py and api/history.py.
 from usr.plugins.chat_shepherd.helpers import state as state_mod
 from usr.plugins.chat_shepherd.helpers import selfcheck as selfcheck_mod
+from usr.plugins.chat_shepherd.helpers import notify as _notify_mod
 from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers import hotreload
 from usr.plugins.chat_shepherd.helpers import adaptive
@@ -419,6 +420,12 @@ class Status(ApiHandler):
             },
             'last_tick': state.get('last_tick', ''),
             # v1.22.0 (stage 3): the supervisor's own health stamp.
+            'channels': _notify_mod.channel_view(
+                state,
+                _to_int(cfg.get('notify_degraded_after_failures', 3)),
+            ),
+            'inflight': [dict(i) for i in (state.get('inflight') or [])
+                         if isinstance(i, dict)],
             'health': selfcheck_mod.health_summary(
                 state.get('selfcheck') or {},
                 (state.get('selfcheck') or {}).get('findings') or [],

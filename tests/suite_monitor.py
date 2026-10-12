@@ -470,7 +470,7 @@ def main():
         print('TEST6D_NOTIFY_SIG_OK')
         _orig_notify = monitor._notify
         _captured = []
-        monitor._notify = lambda kind, message, priority='normal', cfg=None: _captured.append(message) or True
+        monitor._notify = lambda kind, message, priority='normal', cfg=None, **_kw: _captured.append(message) or True
         try:
             write_state(fresh_tick, chats={FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 3, 'last_nudge_at': (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()}})
             _ctx_i = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=30)
@@ -485,7 +485,7 @@ def main():
         # --- 9: quiet bell (v1.7.0): persistence-gated intervention paging ---
         _orig_notify9 = monitor._notify
         _captured9 = []
-        monitor._notify = lambda kind, message, priority='normal', cfg=None: _captured9.append(message) or True
+        monitor._notify = lambda kind, message, priority='normal', cfg=None, **_kw: _captured9.append(message) or True
         try:
             qb_cfg = dict(cfg, notify_on_intervention=True, notify_after_minutes=30, notify_rearm_minutes=60)
             stale_nudge = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
@@ -4609,6 +4609,107 @@ def main():
             state_mod.save_state = _orig_save48
         monitor._save_failures = 0
         print('TEST48G_SAVE_FAILURE_FEEDS_HEALTH_OK')
+
+
+        # ============ TEST 49: notify channel health (stage 4) ============
+        from usr.plugins.chat_shepherd.helpers import notify as notify_mod
+
+        # TEST49A: record/threshold fold
+        st49 = {'channels': {}}
+        d49 = notify_mod.record_channels(st49, {'webhook': None}, threshold=3)
+        assert d49 == [] and st49['channels']['webhook']['consecutive_failures'] == 0
+        notify_mod.record_channels(st49, {'webhook': 'boom', 'telegram': None}, threshold=3)
+        notify_mod.record_channels(st49, {'webhook': 'boom'}, threshold=3)
+        assert notify_mod.degraded_channels(st49, 3) == [], 'only 2 failures'
+        notify_mod.record_channels(st49, {'webhook': 'boom'}, threshold=3)
+        assert notify_mod.degraded_channels(st49, 3) == ['webhook']
+        c49 = notify_mod.channel_view(st49, 3)
+        assert c49['degraded'] == ['webhook'] and c49['channels']['telegram']['status'] == 'ok'
+        print('TEST49A_RECORD_DEGRADE_OK')
+
+        # TEST49B: degraded routing skips the dead leg in job building
+        jobs49 = monitor._external_jobs(
+            {'webhook_url': 'https://example.com/hook', 'telegram_bot_token': 't', 'telegram_chat_id': 'c'},
+            'warning', 'x', skip=('webhook',))
+        assert [j[0] for j in jobs49] == ['telegram'], jobs49
+        jobs49b = monitor._external_jobs(
+            {'webhook_url': 'https://example.com/hook'}, 'warning', 'x', skip=('webhook',))
+        assert jobs49b == [], jobs49b
+        print('TEST49B_DEGRADED_ROUTING_OK')
+
+        # TEST49C: the fold reaches durable state through the transaction
+        # (what the daemon-thread path does after a real fan-out); a failing
+        # webhook shows one consecutive failure on the next read.
+        monitor._fold_channel_results({'channels': {}}, {'webhook': 'dead endpoint'})
+        ch49 = read_state().get('channels') or {}
+        assert ch49.get('webhook', {}).get('consecutive_failures') == 1, ch49
+        assert ch49.get('webhook', {}).get('last_error') == 'dead endpoint', ch49
+        print('TEST49C_DISPATCH_FOLD_PATH_OK')
+
+        # ============ TEST 50: in-flight WAL (stage 4) ============
+        # TEST50A: begin/end round-trip
+        st50a = {'chats': {}}
+        _id50 = state_mod.begin_inflight(st50a, 'stall_nudge', FAKE_CHAT_A, 1)
+        assert isinstance(_id50, str) and _id50, _id50
+        assert len(st50a.get('inflight') or []) == 1
+        st50b = {'inflight': [dict(st50a['inflight'][0]),
+                              {'id': 'x2', 'action': 'stall_nudge'}]}
+        state_mod.end_inflight(st50b, _id50)
+        assert len(st50b['inflight']) == 1 and st50b['inflight'][0]['id'] == 'x2'
+        print('TEST50A_BEGIN_END_OK')
+
+        # TEST50B: reconcile reaps only timed-out intents and never replays
+        st50c = {'chats': {}}
+        state_mod.begin_inflight(st50c, 'stall_nudge', FAKE_CHAT_A, 1)
+        fresh_id = st50c['inflight'][0]['id']
+        st50c['inflight'].append({
+            'id': 't50old', 'action': 'wedge_auto_continue', 'chat_id': FAKE_CHAT_B,
+            'tier': 1, 'detail': '', 'queued_at': (
+                datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),
+        })
+        abandoned = state_mod.reconcile_inflight(st50c, 5.0)
+        assert [a['id'] for a in abandoned] == ['t50old'], abandoned
+        assert [e['id'] for e in st50c['inflight']] == [fresh_id]
+        print('TEST50B_RECONCILE_OK')
+
+        # TEST50C: the tick charges a crashed delivery's budget once, to the
+        # action it CLAIMED (nudge_count for nudges, wedge_nudge_count for
+        # wedge actions), journals inflight_abandoned, and never replays.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'nudged', 'nudge_count': 1},
+            FAKE_CHAT_B: {'status': 'intervention', 'nudge_count': 0, 'wedge_nudge_count': 1},
+        })
+        _st50c = state_mod.load_state()
+        _st50c['inflight'] = [
+            {'id': 'wa', 'action': 'stall_nudge', 'chat_id': FAKE_CHAT_A, 'tier': 1,
+             'detail': '', 'queued_at': (datetime.now(timezone.utc)
+                                         - timedelta(minutes=30)).isoformat()},
+            {'id': 'wb', 'action': 'wedge_auto_continue', 'chat_id': FAKE_CHAT_B, 'tier': 1,
+             'detail': '', 'queued_at': (datetime.now(timezone.utc)
+                                         - timedelta(minutes=30)).isoformat()},
+        ]
+        state_mod.save_state(_st50c)
+        FakeAgentContext._all = []
+        s50c = monitor.tick(dict(cfg, notify_on_intervention=False))
+        st50d = read_state()['chats']
+        assert st50d[FAKE_CHAT_A]['nudge_count'] == 2, st50d[FAKE_CHAT_A]
+        assert st50d[FAKE_CHAT_B]['wedge_nudge_count'] == 2, st50d[FAKE_CHAT_B]
+        acts50 = [h.get('action') for h in read_state().get('history', [])]
+        assert acts50.count('inflight_abandoned') == 2, acts50
+        assert s50c.get('inflight_abandoned') == 2, s50c
+        print('TEST50C_BUDGET_CHARGE_OK')
+
+        # TEST50D: the count-only signature — ids churning must NOT flip the
+        # durable signature, only the number of intents does (the gate would
+        # otherwise save on every intent id change).
+        sig_a = state_mod.state_signature(
+            {'chats': {}, 'inflight': [{'id': 'a'}, {'id': 'b'}]})
+        sig_b = state_mod.state_signature(
+            {'chats': {}, 'inflight': [{'id': 'z'}, {'id': 'q'}]})
+        assert sig_a == sig_b
+        sig_c = state_mod.state_signature({'chats': {}, 'inflight': [{'id': 'a'}]})
+        assert sig_c != sig_a
+        print('TEST50D_COUNT_ONLY_SIGNATURE_OK')
 
         print('TEST45_V121_AUDIT_FIXES_OK')
 

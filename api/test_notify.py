@@ -7,6 +7,7 @@ from helpers.api import ApiHandler, Request, Response
 
 from usr.plugins.chat_shepherd.helpers import monitor
 from usr.plugins.chat_shepherd.helpers import state as state_mod
+from usr.plugins.chat_shepherd.helpers import notify as _notify_mod
 
 
 def _load_plugin_config() -> dict:
@@ -119,6 +120,15 @@ class TestNotify(ApiHandler):
                     'error': err or '',
                     'timestamp': datetime.now(timezone.utc).isoformat(),
                 })
+        except Exception:
+            pass
+        # v1.22.0 (stage 4): a deliberate test also maintains channel health —
+        # the operator just verified these legs, so the result is evidence.
+        try:
+            state_mod.state_transaction_apply(
+                lambda st: {'health': _notify_mod.record_channels(
+                    st, {k: v for k, v in results.items() if k != 'framework'})}
+            )
         except Exception:
             pass
 

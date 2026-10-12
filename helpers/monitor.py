@@ -47,11 +47,23 @@ from usr.plugins.chat_shepherd.helpers import adaptive as adaptive_mod
 from usr.plugins.chat_shepherd.helpers import diagnose as diag_mod
 from usr.plugins.chat_shepherd.helpers import planner as planner_mod
 from usr.plugins.chat_shepherd.helpers import selfcheck as selfcheck_mod
+from usr.plugins.chat_shepherd.helpers import notify as notify_mod
 
 # v1.22.0 (stage 1, ported from chat_shepherd2's 2026-10-09 fix): the
 # wedged-completion reason classify_chat stamps, and the age parser for it.
 HK_REASON_PREFIX = 'Response logged, but housekeeping never completed'
 _HK_AGE = re.compile(r'%s \((\d+)m' % re.escape(HK_REASON_PREFIX))
+
+# v1.22.0 (stage 4): which state counter a WAL intent's claimed action
+# charges when the delivery turn out to have crashed (reconcile). The wedge
+# ladder (wedge_*) charges wedge_nudge_count; everything else rides
+# nudge_count.
+_BUDGET_KEY_WAL = {
+    'restart_resume': 'nudge_count',
+    'stall_nudge': 'nudge_count',
+    'wedge_auto_continue': 'wedge_nudge_count',
+    'wedge_soft_restart': 'wedge_nudge_count',
+}
 
 # The job loop ticks roughly every 60s; a last_tick gap far beyond one
 # tick interval means the server process (or at least the job loop) was
@@ -623,7 +635,8 @@ def _post_json(url: str, payload: dict, timeout: float = 5.0) -> bool:
     return 200 <= resp.status_code < 300
 
 
-def _external_jobs(cfg: dict, kind: str, message: str, priority: str = 'normal') -> list[tuple[str, str, dict]]:
+def _external_jobs(cfg: dict, kind: str, message: str, priority: str = 'normal',
+                   skip: tuple = ()) -> list[tuple[str, str, dict]]:
     # v1.19.0: job-building seam extracted from _dispatch_external so the
     # /test_notify endpoint reuses the exact job list the real fan-out
     # sends (same SSRF validation + webhook_skip logging, same payloads).
@@ -631,6 +644,12 @@ def _external_jobs(cfg: dict, kind: str, message: str, priority: str = 'normal')
         return []
     jobs: list[tuple[str, str, dict]] = []
     webhook_url = str(cfg.get('webhook_url') or '').strip()
+    if 'webhook' in set(skip or ()):
+        # v1.22.0 (stage 4): a degraded channel is routed around — the alert
+        # goes through the still-alive legs instead of being pumped into the
+        # dead one every tick.
+        _debug_log('webhook_skip', 'channel degraded (health routing)')
+        webhook_url = ''
     if webhook_url and not bool(cfg.get('webhook_allow_private', False)):
         try:
             from helpers.network import validate_public_http_url
@@ -654,7 +673,7 @@ def _external_jobs(cfg: dict, kind: str, message: str, priority: str = 'normal')
         ))
     token = str(cfg.get('telegram_bot_token') or '').strip()
     tg_chat = str(cfg.get('telegram_chat_id') or '').strip()
-    if token and tg_chat:
+    if token and tg_chat and 'telegram' not in set(skip or ()):
         jobs.append((
             'telegram',
             'https://api.telegram.org/bot' + token + '/sendMessage',
@@ -685,7 +704,34 @@ def _post_jobs(jobs: list[tuple[str, str, dict]], message: str = '') -> dict[str
     return results
 
 
-def _dispatch_external(cfg: dict, kind: str, message: str, priority: str = 'normal', sync: bool = False) -> None:
+def _fold_channel_results(state: dict | None, results: dict[str, str | None]) -> None:
+    # v1.22.0 (stage 4): fold one delivery round into durable channel health,
+    # journaling channels that just went down. A stateless caller (tests via
+    # sync=True without state) only posts.
+    if not isinstance(state, dict):
+        return
+    try:
+        _threshold = _load_config().get('notify_degraded_after_failures', 3)
+    except Exception:
+        _threshold = 3
+
+    def _apply(st: dict) -> dict:
+        newly = notify_mod.record_channels(st, results, threshold=_threshold)
+        if newly:
+            state_mod.append_history(st, {
+                'chat_id': '',
+                'action': 'notify_degraded',
+                'channels': newly,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+            })
+        return {}
+    try:
+        state_mod.state_transaction_apply(_apply)
+    except Exception as e:
+        _debug_log('channel_fold_fail', repr(e))
+
+
+def _dispatch_external(cfg: dict, kind: str, message: str, priority: str = 'normal', sync: bool = False, state: dict | None = None, skip: tuple = ()) -> None:
     # R3: fan the alert out to optional external channels (generic
     # webhook + Telegram). URL validation happens on the calling
     # (tick) thread because it is cheap; the actual POST runs in a
@@ -693,12 +739,22 @@ def _dispatch_external(cfg: dict, kind: str, message: str, priority: str = 'norm
     # is for tests only.
     # v1.19.0: job building and posting live in _external_jobs /
     # _post_jobs so the /test_notify endpoint shares this code path.
-    jobs = _external_jobs(cfg, kind, message, priority)
+    jobs = _external_jobs(cfg, kind, message, priority, skip=skip)
     if not jobs:
         return
-
+    # v1.22.0 (stage 4): a configured channel that produced NO job was
+    # refused (SSRF guard) or routed around as degraded — record a real
+    # outcome instead of leaving it invisible forever (donor F7).
+    _attempted = {j[0] for j in jobs}
+    _refused = {
+        name: 'rejected by the SSRF guard / degraded routing'
+        for name in notify_mod.configured_channels(cfg, skip)
+        if name not in _attempted
+    }
     def _run() -> None:
-        _post_jobs(jobs, message)
+        results = _post_jobs(jobs, message)
+        results.update(_refused)
+        _fold_channel_results(state, results)
 
     if sync:
         _run()
@@ -734,7 +790,8 @@ def _notify_framework(kind: str, message: str, priority: str = 'normal') -> bool
         return False
 
 
-def _notify(kind: str, message: str, priority: str = 'normal', cfg: dict | None = None) -> bool:
+def _notify(kind: str, message: str, priority: str = 'normal', cfg: dict | None = None,
+            state: dict | None = None) -> bool:
     # R2/R3: central notification helper. Returns True when the
     # in-framework notification was accepted; failures are logged,
     # never silently swallowed. R3: also fans out to optional
@@ -751,7 +808,14 @@ def _notify(kind: str, message: str, priority: str = 'normal', cfg: dict | None 
         # external alert while the in-app notification still succeeded.
         if not isinstance(cfg, dict):
             cfg = _load_config()
-        _dispatch_external(cfg, kind, message, priority)
+        # v1.22.0 (stage 4): degraded channels are routed around (health
+        # state read when the caller passed it; the fold is what maintains it).
+        skip = () if state is None else tuple(
+            notify_mod.degraded_channels(
+                state, cfg.get('notify_degraded_after_failures', 3))
+        )
+        _dispatch_external(cfg, kind, message, priority,
+                           state=state, skip=skip)
     except Exception as e:
         _debug_log('alert_dispatch_fail', repr(e))
     return fw_ok
@@ -1399,6 +1463,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
         'blocked': 0,
         'blocked_released': 0,
         'held': 0,
+        'inflight_abandoned': 0,
     }
     summary['adaptive'] = adaptive_tag
 
@@ -1411,11 +1476,46 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     # v1.22.0 (stage 2): NEW blocked transitions, applied post-loop under a
     # per-tick budget; the rest re-evaluate on the next tick.
     block_queue: list[tuple[str, str, str, dict]] = []
+    inflight_on = bool(cfg.get('inflight_enabled', True))
+    inflight_timeout = _as_float(cfg.get('inflight_timeout_minutes', 5), 5.0)
+    inflight_timeout = max(0.5, min(120.0, inflight_timeout))
+    inflight_blocked = 0
+    # v1.22.0 (stage 4): reconcile the in-flight write-ahead intents. A
+    # delivery that crashed between "recorded" and "delivered" is reaped
+    # here and CHARGES the budget of the action it claimed (never replayed).
+    if inflight_on:
+        for _intent in state_mod.reconcile_inflight(state, inflight_timeout):
+            summary['inflight_abandoned'] += 1
+            try:
+                inflight_blocked += 1
+                _bchat = str(_intent.get('chat_id') or '')
+                _act = str(_intent.get('action') or '')
+                _bentry = state_mod.get_chat(state, _bchat)
+                if _act.startswith('wedge'):
+                    _bentry['wedge_nudge_count'] = _as_int(
+                        _bentry.get('wedge_nudge_count', 0)) + 1
+                else:
+                    _bentry[_BUDGET_KEY_WAL.get(_act, 'nudge_count')] = _as_int(
+                        _bentry.get(_BUDGET_KEY_WAL.get(_act, 'nudge_count'), 0)) + 1
+            except Exception as e:
+                _debug_log('inflight_reconcile_fail', repr(e))
+            try:
+                state_mod.append_history(state, {
+                    'chat_id': str(_intent.get('chat_id') or ''),
+                    'action': 'inflight_abandoned',
+                    'detail': str(_intent.get('action') or ''),
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
+
     # v1.22.0 (stage 2): the diagnosis gate's inputs, read once per tick.
     diag_enabled = bool(cfg.get('diagnose_enabled', True))
     allowed_cats = cfg.get('auto_remediate_categories') if isinstance(
         cfg.get('auto_remediate_categories'), list
     ) else []
+    # v1.22.0 (stage 4): write-ahead intents for remediation deliveries.
+
 
     for chat_id, ctx in live_contexts.items():
         # v1.20.2: isolate per-chat failures. A single malformed state entry
@@ -1747,6 +1847,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                               f'intervention after {waited:.0f}m: {reason}',
                               priority='high',
                               cfg=cfg,
+                              state=state,
                               ):
                               summary['notify_failures'] += 1
                           entry['intervention_notify_at'] = now_iso
@@ -1804,6 +1905,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
         for minutes_idle, chat_id, ctx, entry, now_iso, text in resume_queue:
             if summary['nudges_this_tick'] >= resume_budget:
                 break
+            if inflight_on:
+                _wal_id = state_mod.begin_inflight(state, 'restart_resume', chat_id, 1)
             if _nudge_context(ctx, text, chat_id=chat_id):
                 # v1.21.0 (O12): `entry` IS the dict get_chat returns for this
                 # id, so the extra lookup only re-read the same object.
@@ -1822,6 +1925,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 summary['resumed'] += 1
                 resumed_names.append(_chat_display_name(chat_id, ctx, entry))
                 summary['nudges_this_tick'] += 1
+                if inflight_on:
+                    state_mod.end_inflight(state, _wal_id)
                 state_mod.append_history(state, {
                     'chat_id': chat_id,
                     'action': 'restart_resume',
@@ -1858,6 +1963,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 ):
                     summary['drafted'] += 1
                 continue
+            if inflight_on:
+                _wal_id = state_mod.begin_inflight(state, 'stall_nudge', chat_id, 1)
             if _nudge_context(ctx, chat_id=chat_id):
                 # v1.21.0 (A1/O12): coerce the counters (this drain is outside
                 # the per-chat guard) and drop the redundant re-lookup.
@@ -1871,6 +1978,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 summary['nudged'] += 1
                 summary['nudges_this_tick'] += 1
                 stall_drained += 1
+                if inflight_on:
+                    state_mod.end_inflight(state, _wal_id)
                 state_mod.append_history(state, {
                     'chat_id': chat_id,
                     'action': 'auto_nudge',
@@ -1902,6 +2011,9 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
             # a human without spending the episode budget.
             if prev.get('liveness', '') == 'spinning':
                 if wedge_soft_restart and wedge_max_remediations > 0:
+                    if inflight_on:
+                        _wal_id = state_mod.begin_inflight(
+                            state, 'wedge_soft_restart', chat_id, 2)
                     try:
                         ctx.nudge()
                         summary['wedge_restarts'] += 1
@@ -1921,6 +2033,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                             'frozen_minutes': round(frozen_minutes, 1),
                             'timestamp': now_iso,
                         })
+                        if inflight_on:
+                            state_mod.end_inflight(state, _wal_id)
                     except Exception as e:
                         _debug_log('wedge_restart_fail', chat_id + ' ' + repr(e))
                 continue
@@ -1934,6 +2048,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 # (helpers/defer.py), safe to call from this thread; on a
                 # truly dead loop it is a harmless no-op and the chat stays
                 # intervention for a human.
+                if inflight_on:
+                    _wal_id = state_mod.begin_inflight(state, action, chat_id, 2)
                 try:
                     ctx.nudge()
                     action = 'wedge_soft_restart'
@@ -1942,6 +2058,9 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                     _debug_log('wedge_restart_fail', chat_id + ' ' + repr(e))
                     continue
             else:
+                if inflight_on:
+                    _wal_id = state_mod.begin_inflight(
+                        state, 'wedge_auto_continue', chat_id, 1)
                 if not _nudge_context(ctx, WEDGE_NUDGE_TEXT, chat_id=chat_id):
                     continue
                 summary['wedge_nudged'] += 1
@@ -1953,6 +2072,11 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 f'Wedged: auto-continue sent (attempt {attempt}'
                 f'/{wedge_max_remediations})'
             )
+            if inflight_on:
+                try:
+                    state_mod.end_inflight(state, _wal_id)
+                except Exception:
+                    pass
             state_mod.append_history(state, {
                 'chat_id': chat_id,
                 'action': action,
@@ -2000,6 +2124,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                     f'Chat {_b_name!r} ({_b_id}) blocked for a human: {_b_reason}',
                     priority='high',
                     cfg=cfg,
+                    state=state,
                 ):
                     summary['notify_failures'] += 1
 
@@ -2020,7 +2145,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 + ' of ' + str(summary['interrupted']) + ' interrupted chat(s)'
                 + (': ' + name_list if name_list else '')
             )
-            if not _notify('info', msg, cfg=cfg):
+            if not _notify('info', msg, cfg=cfg, state=state):
                 summary['notify_failures'] += 1
 
     for chat_id, entry in list(state.get('chats', {}).items()):
@@ -2177,6 +2302,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 'Chat Shepherd self-check: ' + page_reason,
                 priority='high',
                 cfg=cfg,
+                state=state,
             ):
                 summary['notify_failures'] += 1
             sc_stamp = state.get('selfcheck')

@@ -19,6 +19,8 @@ DEFAULTS: dict[str, Any] = {
     "notify_after_consecutive_failures": 3,
     "notify_on_selfcheck": True,
     "notify_degraded_after_failures": 3,
+    "inflight_enabled": True,
+    "inflight_timeout_minutes": 5,
     "stall_minutes": 5,
     "max_auto_nudges": 3,
     "max_nudges_per_tick": 1,
@@ -177,6 +179,13 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
         current["notify_after_consecutive_failures"] = coerce_int(
             readable["notify_after_consecutive_failures"],
             current["notify_after_consecutive_failures"], 1, 20,
+        )
+    if "inflight_enabled" in readable:
+        current["inflight_enabled"] = coerce_bool(readable["inflight_enabled"])
+    if "inflight_timeout_minutes" in readable:
+        current["inflight_timeout_minutes"] = coerce_int(
+            readable["inflight_timeout_minutes"],
+            current["inflight_timeout_minutes"], 1, 120,
         )
     if "notify_degraded_after_failures" in readable:
         current["notify_degraded_after_failures"] = coerce_int(
