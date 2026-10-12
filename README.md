@@ -5,6 +5,15 @@
 [![Plugin ID](https://img.shields.io/badge/plugin-chat__shepherd-8a5cf5)](https://github.com/agent0ai/agent-zero)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
+> **v1.22.0** merges the `chat_shepherd2` experiment back into this plugin: failure-cause
+> diagnosis with a blocked/hold state (a safety termination or an auth failure is blocked
+> for a human no matter what; rate limits and context exhaustion are held, not nudged),
+> a supervisor self-check (`health` on the dashboard), alert-channel health with degraded
+> routing, a write-ahead in-flight ledger so a crashed remediation is charged and visible,
+> an operating window (active hours + startup grace), and an opt-in **continuity wake** —
+> a periodic health check that can bring work into existence, not just react (off by
+> default; wake ceiling 0 = off).
+
 An Agent Zero agent is not always working, even when it looks busy. A chat can stall
 after a tool call, hang on a long streaming request, forget to close its goal, or
 silently die mid-task while the UI still shows a spinner. Chat Shepherd is a

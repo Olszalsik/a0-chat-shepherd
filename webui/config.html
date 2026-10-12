@@ -152,6 +152,67 @@ Chat Shepherd
 </template>
 </div>
 
+<div class="cs-card" x-data="{ show: false }">
+<h4>Operating window &amp; continuity wake</h4>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="config.active_hours_enabled" />
+<strong>Auto-actions only inside active hours (classification and blocking still run)</strong>
+</label>
+<div class="cs-row">
+  <div>
+    <label>Active from (HH:MM)</label>
+    <input type="text" x-model="config.active_hours_start" placeholder="09:00" />
+  </div>
+  <div>
+    <label>Active until (HH:MM)</label>
+    <input type="text" x-model="config.active_hours_end" placeholder="22:00" />
+  </div>
+  <div>
+    <label>Timezone (empty = system)</label>
+    <input type="text" x-model="config.active_hours_timezone" placeholder="Europe/Budapest" />
+  </div>
+  <div>
+    <label>Startup grace (ticks)</label>
+    <input type="number" min="0" max="20" x-model.number="config.startup_grace_ticks" />
+  </div>
+</div>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="config.continuity_enabled" />
+<strong>Continuity wake: periodic health check that can start new work (costs tokens per fire)</strong>
+</label>
+<div class="cs-row">
+  <div>
+    <label>Wake every (minutes)</label>
+    <input type="number" min="1" max="1440" x-model.number="config.continuity_every_minutes" />
+  </div>
+  <div>
+    <label>Max wakes per day (0 = off)</label>
+    <input type="number" min="0" max="200" x-model.number="config.continuity_max_wakes_per_day" />
+  </div>
+  <div>
+    <label>Page when unresolved for (minutes)</label>
+    <input type="number" min="1" max="720" x-model.number="config.continuity_intervention_minutes" />
+  </div>
+</div>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="config.continuity_on_goal" />
+<strong>Wake when a chat with an open goal waits for you</strong>
+</label>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="config.continuity_on_nudge_exhaustion" />
+<strong>Wake when a chat exhausts its nudge budget</strong>
+</label>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="config.continuity_on_intervention" />
+<strong>Wake when a chat stays unresolved too long</strong>
+</label>
+<label style="display: block; margin: 4px 0;">
+<input type="checkbox" x-model="config.continuity_isolated" />
+<strong>Isolated wake (background chat, not the last user chat)</strong>
+</label>
+<small class="hint">The wake asks an agent to inspect the dashboard and answer SHEPHERD_OK quietly when nothing needs a human. The isolated wake prefers the heartbeat plugin's runner when that plugin is installed. A manual wake is available from the API (/wake) and bypasses the schedule; it still refuses a busy target unless forced.</small>
+</div>
+
 <div class="cs-card">
 <h4>Escalation</h4>
 <label style="display: block; margin: 4px 0;">

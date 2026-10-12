@@ -2,7 +2,63 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.21.3 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
+**Version:** 1.22.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
+
+## v1.22.0 — the chat_shepherd2 merge (2026-10-12)
+
+`chat_shepherd2` (the clean-rewrite sibling created 2026-10-03, which ran live
+from then on) was folded back into THIS plugin in five committed stages; after
+its retirement shepherd2 stays on disk disabled as a reference. What was ported,
+stage by stage (all stage commits green on the full suite):
+
+- **Stage 1 — wedged-completion detection** (the donor's 2026-10-09 fix): a
+  turn whose completion path died after logging the response leaves an
+  in-flight housekeeping marker (`helpers/diagnose.pending_housekeeping`) as
+  the newest log entry; it classifies `intervention` and rides the wedge
+  ladder tier-1 with a no-kill guard (`housekeeping_wedge` mark, expires on
+  recovery). TEST46A–H.
+- **Stage 2 — cause-gated remediation + `blocked`**: `helpers/diagnose.py`
+  (11-cause taxonomy, first-match-wins RULES, bounded error.txt head,
+  fatal-text scans read the _LogView), `helpers/planner.py` (the two donor
+  gates: `may_remediate` with the NEVER_REMEDIATE floor AFTER the allowlist,
+  and `plan_seam` act/hold/block). New status `blocked` — terminal until a
+  human releases (a genuine turn NEWER than `blocked_at`, or `api/release.py`,
+  or a confirmed manual-nudge override; the released_signature remembers WHICH
+  verdict the human saw so the unchanged error.txt cannot re-block).
+  Non-allowlisted causes are HELD (visible, no auto-action). Blocks drain
+  post-loop under a bounded per-tick budget. Semantics change: a safety
+  termination or auth failure now blocks; rate_limit/context_length/
+  model_refusal are held, not nudged. TEST47A–K.
+- **Stage 3 — self-check** (`helpers/selfcheck.py`): pure evaluator over a
+  facts snapshot + the tick wrapper reporting its own death (durable
+  `consecutive_tick_failures` + inline `loop_suspended` evaluation — a
+  permanent failure must write its own findings). `/status` gains `health`.
+  The save signature includes the stamp's SEMANTIC view only (last_at/since/
+  paged_at/failure counter excluded) and a truly quiet tick with no prior
+  stamp creates none — the TEST18A quiet-tick contract held. TEST48A–G.
+- **Stage 4 — channel health + in-flight WAL** (`helpers/notify.py` +
+  `state.begin/end/reconcile_inflight`): real per-channel results fold into
+  state (refused/routed-around channels get an outcome, never invisible);
+  degraded legs are routed around in `_external_jobs`; the tick's deliveries
+  are recorded BEFORE delivery and cleared after, a crash in between is
+  reaped by the phase-0 reconcile and CHARGES the claimed action's budget
+  (never replayed); the signature counts inflight by length only and treats
+  `channels` as durable. TEST49A–C, TEST50A–D.
+- **Stage 5 — wake / operating window / capabilities** (`helpers/clock.py`,
+  `helpers/wake.py`, `helpers/capabilities.py`, `api/wake.py`, `planner.
+  plan_wake`): the continuity wake (heartbeat proxy when present, vendored
+  create-or-resolve otherwise; `SHEPHERD_OK` quiet token; wake contexts
+  STAMPED in context.data and excluded from live_contexts), active-hours +
+  `startup_grace_ticks` window gating EXECUTION only (withheld actions are
+  surfaced, not silent), paperclip_zero external blocks as the strongest
+  fingerprint signal, soft dependency probes with regression-only
+  degradation. Wake ceiling 0 = disabled. TEST51A–G.
+
+Not ported (deliberate): shepherd2's `plan_chat`/`plan_actions` ladder and
+`observe.py`/`monitor.py` — v1's own audited tick stayed; the donor's gates
+are injected at seam level instead. Shepherd2's `settled` blocks (budget
+exhaustion "no enabled remedy left") map to v1's existing
+intervention-after-exhaustion behaviour.
 
 ## Purpose
 
