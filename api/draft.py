@@ -74,6 +74,17 @@ async def _restore_claimed_draft(claim: dict) -> None:
         ):
             if len(drafts) < state_mod.DRAFT_MAX:
                 drafts.append(claimed)
+            else:
+                # v1.24.1 (audit fix P3-3, cycle 3): a restore that could
+                # not re-queue (DRAFT_MAX / raced draft) must leave a
+                # record — the claimed draft would otherwise vanish with
+                # no journal row.
+                append_history(st, {
+                    'chat_id': str(claimed.get('chat_id') or ''),
+                    'action': 'draft_restore_dropped',
+                    'detail': f"draft {claimed.get('id')} not restored (drafts full)",
+                    'timestamp': _now_iso(),
+                })
         return {'success': True}
 
     try:
@@ -222,6 +233,41 @@ class Draft(ApiHandler):
             # draft had been delivered, so the operator saw a 500 for a send
             # that worked, with the draft already gone.
             new_count = monitor._as_int(entry.get('nudge_count', 0)) + 1
+            # v1.24.1 (audit fix P2-2, cycle 3): a block_queue can apply
+            # BLOCKED between the claim-time snapshot and this
+            # bookkeeping-only transaction — the bare status overwrite left
+            # blocked_reason/blocked_at/released_signature dangling with NO
+            # release record (the exact shape fix 17 closed at claim time).
+            # A delivered message IS the release evidence; keep the same
+            # bookkeeping the /nudge override path applies.
+            if str(entry.get('status') or '') == 'blocked':
+                update_chat(st, chat_id,
+                    nudges_sent=monitor._as_int(entry.get('nudges_sent', 0)) + 1,
+                    nudge_count=new_count,
+                    last_nudge_at=now_iso,
+                    released_signature=str(entry.get('category_signature') or ''),
+                    blocked_reason='',
+                    blocked_at='',
+                    supervisor_settled=False,
+                    status='nudged',
+                    last_classification=(
+                        f'Supervised resume sent to a blocked chat (draft '
+                        f'{draft_id}) — message delivery is the release'
+                    ),
+                )
+                append_history(st, {
+                    'chat_id': chat_id,
+                    'action': 'blocked_released',
+                    'detail': 'released by draft send (block landed mid-send)',
+                    'previous_reason': 'block applied between claim and send',
+                    'timestamp': now_iso,
+                })
+                return {
+                    'success': True,
+                    'chat_id': chat_id,
+                    'nudge_count': new_count,
+                    'message': 'Draft sent (block released on delivery)',
+                }
             update_chat(st, chat_id,
                 nudges_sent=monitor._as_int(entry.get('nudges_sent', 0)) + 1,
                 nudge_count=new_count,

@@ -114,6 +114,10 @@ no_response_minutes: 0
 # chat gets exactly ONE soft restart (kill the dead task + framework nudge
 # prompt) before flipping to intervention — escalation instead of giving up.
 stall_escalate_to_restart: false
+# v1.24.1: rate-limited soft-dependency probes (goal/heartbeat/paperclip
+# availability) feeding the dashboard widget + self-check. Off — a probe
+# run makes a tick eventful by design.
+capabilities_probe_enabled: false
 # R4 adaptive thresholds: opt-in feedback loop. When enabled, accumulated
 # nudge/wedge remediation outcomes tune the three timing thresholds
 # (nudge_cooldown_minutes, wedge_nudge_after_minutes,

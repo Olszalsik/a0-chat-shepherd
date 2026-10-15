@@ -243,6 +243,13 @@ class Status(ApiHandler):
                 # `running=False` statuses with no signal. Per-iteration
                 # isolation (same contract as the tick's per-chat guard).
                 try:
+                    # v1.24.1 (audit fix P3-4, cycle 3): the shepherd's own
+                    # wake (watchdog) contexts were listed on the dashboard /
+                    # nudgeable via the API — the tick excludes them, the
+                    # status poll did not.
+                    from usr.plugins.chat_shepherd.helpers import wake as _wk
+                    if _wk.is_shepherd_context(ctx):
+                        continue
                     # v1.20.2: apply the SAME real-chat predicate tick() uses.
                     # /status used to list every live AgentContext, so
                     # script-created throwaway contexts (verify-*, ctx-hook-1)
@@ -463,6 +470,8 @@ class Status(ApiHandler):
                 'no_response_minutes': cfg.get('no_response_minutes', 0),
                 'stall_escalate_to_restart': bool(
                     cfg.get('stall_escalate_to_restart', False)),
+                'capabilities_probe_enabled': bool(
+                    cfg.get('capabilities_probe_enabled', False)),
                 'icons': icons,
                 'poll_seconds': poll_seconds,
                 'hot_reload_enabled': bool(cfg.get('hot_reload_enabled', True)),

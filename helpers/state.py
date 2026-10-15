@@ -208,10 +208,26 @@ def load_state() -> dict[str, Any]:
     # identity of the cached fingerprint (see _state_signature_cached).
     raw = ''
     if files.exists(path):
+        # v1.24.1 (audit fix P1-1, cycle 3): the read and the parse are
+        # SEPARATE try blocks — the cycle-2 quarantine renamed the file on
+        # ANY failure, so a transient 9p read error quarantined (and then
+        # overwrote at the next save) HEALTHY state bytes. Read failure =
+        # defaults WITHOUT renaming/corrupt-journaling. Parse failure, or a
+        # parsed non-dict (null / array / scalar), = quarantine.
+        _read_ok = False
+        _corrupt = False
         try:
             raw = files.read_file(path)
-            payload = json.loads(raw)
+            _read_ok = True
         except Exception:
+            raw = ''
+        if _read_ok:
+            try:
+                payload = json.loads(raw)
+                _corrupt = not isinstance(payload, dict)
+            except Exception:
+                _corrupt = True
+        if _corrupt:
             payload = None
             raw = ''
             # v1.23.2 (audit fix 1, cycle 2 — P1): unparseable bytes used to
@@ -220,8 +236,14 @@ def load_state() -> dict[str, Any]:
             # chat, pending supervised draft, durable alert and counter gone
             # PERMANENTLY, with nothing logged or renamed. Quarantine the
             # corrupt bytes (rename, never delete) and leave the evidence.
+            # v1.24.1: unique nanosecond suffix (two quarantines inside one
+            # second previously collided and POSIX rename REPLACED the
+            # earlier evidence).
             try:
-                stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')
+                stamp = (
+                    datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')
+                    + '-' + str(time.time_ns())
+                )
                 renamed = path + '.corrupt-' + stamp
                 os.rename(path, renamed)
                 append_journal({

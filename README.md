@@ -14,6 +14,14 @@
 > a periodic health check that can bring work into existence, not just react (off by
 > default; wake ceiling 0 = off).
 
+> **v1.25.0** is audit cycle 3 (final): fixes its own cycle-2 bug (a transient 9p
+> read error used to quarantine healthy state bytes — read failures no longer rename
+> anything; non-dict state files join the quarantine), wakes a human when a chat has
+> genuinely been unresolved too long (`continuity_on_intervention` now actually
+> fires), gates the goal-completion gate behind the same window/cooldown/diagnosis
+> gates as every other arm, and stops restart detection from firing on a long
+> scheduler task or a wedged tick (persisted per-process session id).
+>
 > **v1.24.0** is audit cycle 2: the settings modal renders ALL its cards again (a
 > multi-root `x-if` in the Alpine template had silently hidden every card but the
 > first since v1.20.0), corrupt `state.json` bytes are quarantined as

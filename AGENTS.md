@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.24.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
+**Version:** 1.25.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
 
 ## v1.23.0 — provider-exhaustion loops, streaming exemption, durable alerts (2026-10-15)
 
@@ -308,6 +308,60 @@ Not ported (deliberate): shepherd2's `plan_chat`/`plan_actions` ladder and
 are injected at seam level instead. Shepherd2's `settled` blocks (budget
 exhaustion "no enabled remedy left") map to v1's existing
 intervention-after-exhaustion behaviour.
+
+## v1.25.0 — audit cycle 3 (final, 2026-10-15)
+
+Fresh-eyes audit over the cycle-2 diffs and the not-yet-covered modules.
+Findings and fixes:
+
+- **P1 my-own-bug: quarantine triggered on ANY read failure** — the
+  cycle-2 fix wrapped the READ and the PARSE in one try, so a transient
+  9p read error renamed (and thereby lost from live state) HEALTHY
+  state.json bytes. Fixed: read failure = defaults WITHOUT
+  renaming/journaling; quarantine now requires raw bytes that
+  json.loads chokes on, OR a parsed non-dict (null/array/scalar — that
+  class previously dodged the quarantine entirely).
+- **P1 dead wake arm**: `minutes_frozen` was hardcoded `0.0` in the wake
+  observation builder, making the settings-exposed
+  `continuity_on_intervention` trigger permanently unfireable
+  (`0.0 >= 30.0`). Fixed: measured from the entry's
+  `intervention_since`/`blocked_at` clocks.
+- **P2 goal gate bypassed the operational gates** — fired during closed
+  active hours / grace, after a termination-cooldown stop, and into
+  gate-HOLD chats. Fixed: `_can_act` + `not _term_cooldown_active`
+  + `gate_verdict == ACT` at the call site, plus honest budget counting.
+- **P2 draft-send residual TOCTOU**: a block_queue could apply BLOCKED
+  between the claim-time snapshot and post-delivery bookkeeping — fixed
+  by applying the /nudge-style release bookkeeping inside the
+  bookkeeping transaction when the entry is blocked at apply time.
+- **P2 SSRF DNS on the tick thread**: `_dispatch_external` built the jobs
+  (synchronous `socket.getaddrinfo` with no timeout; up to five times
+  serially per paging burst) on the shared JobLoop thread — the exact
+  blocking the same cycle-2 fix had offloaded in /test_notify only.
+  Fixed: the build runs inside the daemon worker; the refused-channel
+  fold still goes through `record_channels` for channel health,
+  unchanged.
+- **P2 capability probes were test-only** (stage-5's registry never ran
+  live; the widget stayed empty forever). Now wired into the tick at a
+  15-minute cadence behind a NEW opt-in flag `capabilities_probe_enabled`
+  (default off: an unconfigured probe run would convert quiet ticks into
+  eventful ones — the same new-defaults-must-reach-existing-installs
+  policy). Regressions journal `capability_regressed`.
+- **P3 set**: restart detection now requires a persisted per-process
+  `session_id` CHANGE in addition to the 5-min gap (a long scheduler
+  task or a wedged tick no longer interrupts live chats); the withheld
+  reason text has three honest arms (gate/cooldown/window); a restore
+  that cannot re-queue journals `draft_restore_dropped`; wake contexts
+  are excluded from /status listings and refuse /nudge; the dead
+  `inflight_blocked` variable is removed; unique nanosecond quarantine
+  suffixes (same-second renames previously REPLACED the earlier
+  evidence).
+
+Verified clean this cycle: the wrapper nesting, journal consumed-offsets
++ the caller's out-of-order gate, interrupted re-anchor ordering,
+escalation fallthrough convergence, quarantine vs `_atomic_replace`,
+restart corners (first tick / skew / future last_tick), all caches and
+lock ordering. All suites green.
 
 ## Purpose
 

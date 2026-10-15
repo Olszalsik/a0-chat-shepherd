@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import os
 import threading
+import uuid
 import time
 import json
 import re
@@ -100,6 +101,10 @@ _save_failures = 0
 # v1.22.0 (stage 5): ticks completed since this process started the loop -
 # the startup-grace window (`startup_grace_ticks`) reads this.
 _TICKS_SINCE_START = 0
+
+# v1.24.1 (audit fix P3-1, cycle 3): per-process session discriminator for
+# restart detection (gap alone also fires on a >=5-minute job-loop stall).
+_SESSION_ID = ''
 
 
 def _now() -> datetime:
@@ -757,28 +762,34 @@ def _fold_channel_results(state: dict | None, results: dict[str, str | None]) ->
 
 def _dispatch_external(cfg: dict, kind: str, message: str, priority: str = 'normal', sync: bool = False, state: dict | None = None, skip: tuple = ()) -> None:
     # R3: fan the alert out to optional external channels (generic
-    # webhook + Telegram). URL validation happens on the calling
-    # (tick) thread because it is cheap; the actual POST runs in a
-    # daemon thread so the event-loop tick never blocks. sync=True
-    # is for tests only.
+    # webhook + Telegram). sync=True is for tests only.
     # v1.19.0: job building and posting live in _external_jobs /
     # _post_jobs so the /test_notify endpoint shares this code path.
-    jobs = _external_jobs(cfg, kind, message, priority, skip=skip)
-    if not jobs:
-        return
-    # v1.22.0 (stage 4): a configured channel that produced NO job was
-    # refused (SSRF guard) or routed around as degraded — record a real
-    # outcome instead of leaving it invisible forever (donor F7).
-    _attempted = {j[0] for j in jobs}
-    _refused = {
-        name: 'rejected by the SSRF guard / degraded routing'
-        for name in notify_mod.configured_channels(cfg, skip)
-        if name not in _attempted
-    }
+    # v1.24.1 (audit fix P2-3, cycle 3): the JOB BUILDER runs the SSRF
+    # guard's synchronous socket.getaddrinfo — which this very plugin's
+    # notify.py documents as "must never run on the asking thread" — on
+    # the tick's shared JobLoop thread up to five times serially per
+    # paging burst. The whole build now happens inside the daemon worker,
+    # mirroring the cycle-2 offload of /test_notify.
+    _attempted_cfg = notify_mod.configured_channels(cfg, skip)
+
+    def _build() -> tuple[list, set]:
+        jobs = _external_jobs(cfg, kind, message, priority, skip=skip)
+        attempted = {j[0] for j in jobs}
+        refused = {
+            name: 'rejected by the SSRF guard / degraded routing'
+            for name in _attempted_cfg
+            if name not in attempted
+        }
+        return jobs, refused
+
     def _run() -> None:
-        results = _post_jobs(jobs, message)
-        results.update(_refused)
-        _fold_channel_results(state, results)
+        jobs, _refused = _build()
+        results: dict[str, str | None] = _post_jobs(jobs, message) if jobs else {}
+        if _refused:
+            results.update(_refused)
+        if results:
+            _fold_channel_results(state, results)
 
     if sync:
         _run()
@@ -1539,10 +1550,21 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     # means the server (or job loop) restarted and contexts were
     # rebuilt from disk. A missing last_tick (first ever tick) is not
     # a restart.
+    # v1.24.1 (audit fix P3-1, cycle 3): a gap alone also fires on any
+    # >=5-minute JOB-LOOP STALL with no restart at all — a long scheduler
+    # task or a 9p-wedged tick — re-classifying live contexts "interrupted"
+    # and re-anchoring exhaustion stamps. A per-PROCESS session id is the
+    # honest discriminator: a delayed loop keeps it, a real restart does
+    # not. Persisted at first tick; cleared nowhere.
+    global _SESSION_ID
+    if not _SESSION_ID:
+        _SESSION_ID = uuid.uuid4().hex[:12]
     server_restarted = (
         prev_last_tick is not None
         and _minutes_since(prev_last_tick) > RESTART_GAP_MINUTES
+        and str(state.get('session_id', '') or '') != _SESSION_ID
     )
+    state['session_id'] = _SESSION_ID
     state['last_tick'] = datetime.now(timezone.utc).isoformat()
 
     # v1.20.7: these conversions run OUTSIDE the per-chat try (they feed the
@@ -1682,7 +1704,6 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     inflight_on = bool(cfg.get('inflight_enabled', True))
     inflight_timeout = _as_float(cfg.get('inflight_timeout_minutes', 5), 5.0)
     inflight_timeout = max(0.5, min(120.0, inflight_timeout))
-    inflight_blocked = 0
     # v1.22.0 (stage 5): the operating window and the continuity wake. The
     # window gates EXECUTION (the three drains) while classification and
     # blocking still run — a suppressed window is visible, not blind. The
@@ -1708,7 +1729,6 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
         for _intent in state_mod.reconcile_inflight(state, inflight_timeout):
             summary['inflight_abandoned'] += 1
             try:
-                inflight_blocked += 1
                 _bchat = str(_intent.get('chat_id') or '')
                 _act = str(_intent.get('action') or '')
                 # v1.23.2 (audit fix 9, cycle 2): charging a budget on a
@@ -2158,8 +2178,17 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               # v1.8.0 goal completion gate: a response that claims the work is
               # done while the chat's native goal is still open gets a silent
               # nudge to finish the goal or close it via the goal tool.
+              # v1.24.1 (audit fix P2-1, cycle 3): the gate now obeys the
+              # same operational gates every ladder arm does — operating
+              # window/grace, the termination cooldown (a stopped-by-
+              # security-termination chat re-nudged reproduces the
+              # terminate loop), and the diagnosis gate. Budget badge stays
+              # honest.
               if (
                   goal_gate_enabled
+                  and _can_act
+                  and not _term_cooldown_active
+                  and gate_verdict == planner_mod.ACT
                   and getattr(ctx, 'type', None) == AgentContextType.USER
                   and _goal_gate_check(
                       state, chat_id, ctx, entry, cfg, now_iso, summary,
@@ -2170,6 +2199,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   entry['last_classification'] = (
                       'Goal gate: completion claim while goal still active'
                   )
+                  summary['nudges_this_tick'] += 1
           elif new_status == STATUS_STALLED:
               summary['stalled'] += 1
               last_nudge_dt = _parse_dt(prev.get('last_nudge_at', ''))
@@ -2451,10 +2481,16 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                       # counted as held, never paged, never fallen back to
                       # intervention. Flip to intervention with the
                       # withheld reason so the bell/dashboard own it.
-                      _withheld = (
-                          gate_reason if gate_verdict == planner_mod.HOLD
-                          and gate_reason else 'outside the operating window'
-                      )
+                      # v1.24.1 (audit fix P3-2, cycle 3): three honest
+                      # arms for the withheld reason — the gate, the
+                      # cooldown, the window (cooldown said "outside the
+                      # operating window" before).
+                      if gate_verdict == planner_mod.HOLD and gate_reason:
+                          _withheld = gate_reason
+                      elif _term_cooldown_active:
+                          _withheld = 'recent error/security termination cooldown'
+                      else:
+                          _withheld = 'outside the operating window'
                       new_status = STATUS_INTERVENTION
                       reason = (
                           f'Stalled for a long time, nudges exhausted; '
@@ -2957,6 +2993,37 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     # semantic changed. The save fires when the interval elapsed
     # (periodic flush of volatile dashboard bookkeeping) OR the durable
     # payload signature (chats minus volatile last_ticked, drafts,
+    # v1.24.1 (audit fix P2-4, cycle 3): the capability probes were
+    # TEST-ONLY — probe_all/merge_into_state were never called on a
+    # production path, so state['capabilities'] stayed {} forever: the
+    # dashboard widget always rendered empty, HC_CAPABILITY_DEGRADED could
+    # never fire, and stage-5's advertised regression detection never ran.
+    # Wire them at a rate-limited cadence (the soft imports cost once per
+    # window, not once per tick).
+    # Opt-in (default off — an unconfigured probe run must not convert a
+    # quiet tick into an eventful one): set capabilities_probe_enabled
+    # true to enable stage-5's dependency registry live.
+    _caps_stamp = str(state.get('capabilities_last_probe_at', '') or '')
+    if bool(cfg.get('capabilities_probe_enabled', False))             and clock_mod.is_due(_caps_stamp, '15m'):
+        try:
+            _state_caps_probe = caps_mod.probe_all()
+            _state_caps_regressed = caps_mod.merge_into_state(
+                state, _state_caps_probe)
+            # stamp is a TOP-LEVEL key, not inside the record map: the
+            # dashboard/self-check treat capabilities values as records.
+            state['capabilities_last_probe_at'] = (
+                datetime.now(timezone.utc).isoformat())
+            if _state_caps_regressed:
+                summary['capabilities_regressed'] = _state_caps_regressed
+                state_mod.append_history(state, {
+                    'chat_id': '',
+                    'action': 'capability_regressed',
+                    'capabilities': _state_caps_regressed,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                })
+        except Exception as e:
+            _debug_log('capability_probe_fail', repr(e))
+
     # adaptive overlay) differs from the last written one, so every
     # meaningful state transition persists immediately.
     # v1.22.0 (stage 5): the continuity wake — the one action that can bring
@@ -2973,11 +3040,26 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 _wst = _went.get('status')
                 if _wst in (STATUS_AWAITING_USER, STATUS_STALLED,
                             STATUS_INTERVENTION, STATUS_ERROR, STATUS_BLOCKED):
+                    # v1.24.1 (audit fix P1-2, cycle 3): minutes_frozen was
+                    # hardcoded 0.0, which made the
+                    # continuity_on_intervention wake arm PERMANENTLY DEAD
+                    # (plan_wake requires >= continuity_intervention_minutes
+                    # and the toggle is exposed in the settings — the
+                    # trigger silently never fired). Measure the wait from
+                    # the entry's clocks.
+                    _w_wait = 0.0
+                    _w_anchor = str(
+                        _went.get('intervention_since', '')
+                        or _went.get('blocked_at', '')
+                        or ''
+                    )
+                    if _w_anchor:
+                        _w_wait = _minutes_since(_parse_dt(_w_anchor))
                     _wo = {
                         'chat_id': _wcid,
                         'status': _wst,
                         'nudge_count': _went.get('nudge_count', 0),
-                        'minutes_frozen': 0.0,
+                        'minutes_frozen': round(_w_wait, 1),
                     }
                     if (
                         bool(cfg.get('goal_integration', True))

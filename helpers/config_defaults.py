@@ -71,6 +71,9 @@ DEFAULTS: dict[str, Any] = {
     "exhaustion_kill_after_minutes": 0,
     "no_response_minutes": 0,
     "stall_escalate_to_restart": False,
+    # v1.24.1: rate-limited soft-dep probing feeding the dashboard widget
+    # and the self-check (stage-5 capability registry, live-wired).
+    "capabilities_probe_enabled": False,
     "adaptive_thresholds": False,
     "adaptive_interval_minutes": 60,
     "adaptive_min_samples": 10,
@@ -401,6 +404,10 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
     if "stall_escalate_to_restart" in readable:
         current["stall_escalate_to_restart"] = coerce_bool(
             readable["stall_escalate_to_restart"]
+        )
+    if "capabilities_probe_enabled" in readable:
+        current["capabilities_probe_enabled"] = coerce_bool(
+            readable["capabilities_probe_enabled"]
         )
     if "allowed_chat_ids" in readable:
         raw = readable["allowed_chat_ids"]

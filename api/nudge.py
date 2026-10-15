@@ -139,6 +139,12 @@ class Nudge(ApiHandler):
         ctx = _get_context(chat_id)
         if ctx is None:
             return {'success': False, 'error': f'Context {chat_id} not found'}
+        # v1.24.1 (audit fix P3-4, cycle 3): never nudge the supervisor's
+        # own watchdog context.
+        from usr.plugins.chat_shepherd.helpers import wake as _wk
+        if _wk.is_shepherd_context(ctx):
+            return {'success': False, 'error': f'Chat {chat_id} is a Chat Shepherd wake context'}
+
 
         # v1.20.4: ask before restarting a chat that died from a real error.
         # The guard is evaluated ALWAYS, not only on the unforced path - a
