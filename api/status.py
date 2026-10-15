@@ -88,6 +88,34 @@ def _resolve_icons(cfg: dict[str, Any]) -> dict[str, str]:
     return icons
 
 
+# v1.23.0: the durable alert fold (monitor._fold_alert), newest first, with
+# an unread count keyed off the acknowledged stamp state['alerts_seen_at'].
+def _alerts_block(state: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    alerts = state.get('alerts')
+    rows: list[dict[str, Any]] = []
+    seen_at = str(state.get('alerts_seen_at', '') or '')
+    if isinstance(alerts, dict):
+        for key, row in alerts.items():
+            if not isinstance(row, dict):
+                continue
+            entry = {
+                'key': str(key or ''),
+                'chat_id': str(row.get('chat_id', '') or ''),
+                'kind': str(row.get('kind', '') or ''),
+                'message': str(row.get('message', '') or ''),
+                'first_at': str(row.get('first_at', '') or ''),
+                'last_at': str(row.get('last_at', '') or ''),
+                'count': _to_int(row.get('count', 0)),
+            }
+            # v1.23.0: per-row unread so the sidebar badge can mark the
+            # specific chat that is still unacknowledged.
+            entry['unread'] = (not seen_at) or entry['first_at'] > seen_at
+            rows.append(entry)
+    rows.sort(key=lambda r: r['last_at'], reverse=True)
+    unread = sum(1 for r in rows if r['unread'])
+    return rows, unread
+
+
 def _is_tracked_chat(chat_id: str) -> bool:
     # P6.4: the exact predicate tick() applies - framework id pattern
     # (8 alphanumerics) plus a persisted usr/chats/<id> transcript dir.
@@ -184,6 +212,8 @@ class Status(ApiHandler):
                 'aggregates': None,
                 'drafts': [],
                 'history': [],
+                'alerts': [],
+                'alerts_unread': 0,
             }
 
     def _build_snapshot(self) -> dict | Response:
@@ -192,6 +222,7 @@ class Status(ApiHandler):
         cfg = monitor._load_config()
         state = state_mod.load_state()
         icons = _resolve_icons(cfg)
+        _alerts_rows, _alerts_unread = _alerts_block(state)
 
         contexts: dict[str, dict[str, Any]] = {}
         try:
@@ -408,6 +439,13 @@ class Status(ApiHandler):
                 ),
                 'wedge_soft_restart': bool(cfg.get('wedge_soft_restart', False)),
                 'wedge_liveness_probe': bool(cfg.get('wedge_liveness_probe', True)),
+                # v1.23.0: exhaustion + substantive-progress knobs.
+                'exhaustion_minutes': cfg.get('exhaustion_minutes', 20),
+                'exhaustion_kill_after_minutes': cfg.get(
+                    'exhaustion_kill_after_minutes', 0),
+                'no_response_minutes': cfg.get('no_response_minutes', 0),
+                'stall_escalate_to_restart': bool(
+                    cfg.get('stall_escalate_to_restart', False)),
                 'icons': icons,
                 'poll_seconds': poll_seconds,
                 'hot_reload_enabled': bool(cfg.get('hot_reload_enabled', True)),
@@ -428,6 +466,10 @@ class Status(ApiHandler):
                 state,
                 _to_int(cfg.get('notify_degraded_after_failures', 3)),
             ),
+            # v1.23.0: durable alert rows + how many are not yet acknowledged
+            # (the sidebar badge and the banner strip consume these).
+            'alerts': _alerts_rows,
+            'alerts_unread': _alerts_unread,
             'inflight': [dict(i) for i in (state.get('inflight') or [])
                          if isinstance(i, dict)],
             'health': selfcheck_mod.health_summary(

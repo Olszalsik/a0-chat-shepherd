@@ -2,7 +2,76 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.22.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
+**Version:** 1.23.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
+
+## v1.23.0 — provider-exhaustion loops, streaming exemption, durable alerts (2026-10-15)
+
+Live evidence that drove this release: on 2026-10-15 a USER chat ran ~6h in a
+provider-exhaustion retry loop ("All chat model candidates exhausted" +
+"Critical error occurred, retrying..." cycling every ~12 min; ollama.com 429
+weekly limit). Shepherd was alive, classified it `intervention /
+liveness=spinning` — and remediated nothing for 6h, because the loop's warning
+entries ADVANCE the log (the frozen-clock wedge detector never fires) and
+spinning loops skip Tier-1 by design while `wedge_soft_restart` ships off.
+The same tick's log-tail cause flickered `auth ↔ framework_crash ↔
+tool_error` every ~15 min as the storm rotated which fragment was newest,
+BLOCKING the chat at one point. Alerting was also structurally invisible
+(in-memory 3s toasts). What changed:
+
+- **Streaming false-positive fix (latent v1.10.0 defect)**: while STREAMING,
+  log entries are frozen while `log.updates` advances (the response LogItem is
+  created once and updated in place per chunk), so a long streamed reply was
+  misread as a spinning dead loop — and with `wedge_soft_restart: true` would
+  have been killed mid-stream. Discriminator: frozen + mutations advancing but
+  `view.last_type in ('agent','response')` → no verdict. Pinned by TEST53A.
+  This is what makes it safe to flip `wedge_soft_restart` on (config change,
+  still ships off).
+- **Provider-exhaustion detection** (`diagnose.exhaustion_loop` +
+  `CATEGORY_PROVIDER_EXHAUSTION`, first `_RULES` entry — specific beats
+  general, ahead of the 429/auth fragments the storm tail also carries): ≥2
+  retry markers, newest relevant entry not a response, no newer human turn.
+  The tick stamps a per-chat episode (`exhaustion_since`), clears with a
+  journal `provider_exhaustion_resolved` row on recovery, and
+  `classify_chat` returns intervention with `EXHAUSTION_REASON_PREFIX` after
+  `exhaustion_minutes` (20). The fingerprint override maps it to
+  `provider_exhaustion`, which `plan_seam` HOLDs automatically (outside the
+  allowlist, outside NEVER_REMEDIATE) — this both cures the category flicker
+  and un-BLOCKs the auth-fragment path. Nudges are never sent for it (an
+  exhausted provider cannot be continued into working); the episode pages
+  ONCE with a dedicated message (generic quiet-bell suppressed).
+- **Optional exhaustion kill** (`exhaustion_kill_after_minutes`, default 0 =
+  off): after N minutes of sustained futile looping, `ctx.kill_process()` ONLY
+  — no fresh chain, which would just re-enter the exhausted provider. The
+  chat then sits on a post-kill HOLD (classify returns
+  "killed futile retry task, holding...", cleared by a human turn, a fresh
+  response, or the 240-min `EXHAUSTION_HOLD_MIN` window). WAL-gated
+  (`exhaustion_kill`), USER-type only, gate-not-BLOCK. TEST52A–D.
+- **One-shot stall escalation** (`stall_escalate_to_restart`, default off):
+  after `max_auto_nudges` is exhausted, exactly ONE `ctx.nudge()` (kill is a
+  no-op on the dead task) before flipping to intervention — escalation
+  instead of giving up. Budget 1/episode (`stall_restart_count`, WAL
+  `stall_restart` keyed to nudge_count, reset on recovery). TEST54A.
+- **Substantive-progress liveness** (`no_response_minutes`, default 0 = off):
+  running + entries advancing + no NEW assistant response for N min stamps
+  `spinning_soft` and routes down the CLASSIC wedge ladder (tier-1 first;
+  these paths reach safe points, unlike hard `spinning`). The exhaustion rule
+  owns its specific case, so this is for other spin classes. TEST53B.
+- **Durable alerts**: every `_notify` page folds into `state['alerts']` keyed
+  `chat_id|kind` (`_fold_alert`, re-pages update one row, cap
+  `ALERTS_MAX`=20); `/status` returns `alerts` (per-row `unread` vs
+  `state['alerts_seen_at']`) + `alerts_unread`; new `POST /ack` stamps
+  `alerts_seen_at` and journals `alerts_ack`; dashboard banner + Acknowledge
+  button, sidebar red numeric badge via a second memoized badge element
+  (`setMemo` now mutates in place — a wholesale replace orphaned the handle);
+  in-framework pages now `display_time=15` (was the 3s toast); selfcheck
+  gains `no_alert_channel` (info) when alerts fired while no webhook/Telegram
+  is configured. TEST55A–B (incl. default_config.yaml ↔ DEFAULTS parity).
+  Out-of-band delivery still requires webhook/Telegram — the rows are the
+  durable record, not a new channel.
+
+Status vocabulary unchanged (8 statuses); `provider_exhaustion` is a
+CATEGORY. Suites: backend suite_monitor.py green through TEST55B, node
+suites green with 7 new sidebar assertions.
 
 ## v1.22.0 — the chat_shepherd2 merge (2026-10-12)
 
@@ -166,7 +235,7 @@ them, not here. Do not re-file them.
 - `tick()` runs synchronously on the JobLoop thread (blocking `state.json` I/O + log scans). A filesystem wedge there freezes only shepherding, not chats, and `files.exists` is globally bounded. **As of v1.20.5 every request handler reads off the event loop** — `/status` and `/draft` (v1.18.1) plus `/config`, `/history` and `/export` (v1.20.5), so a slow 9p stat in a plugin request can no longer stall the rest of the server. What remains is the JobLoop side, which is by design: the tick is the shepherd's own work.
 - `api/*` handlers keep their `from`-import bindings until the next plugin refresh, so an endpoint change needs a refresh or restart. The helper/tick path hot-reloads on its own (v1.9.0) and the `hot_reload` block in `/status` reports the last result. **v1.21.0: the three `state` bindings that made this matter for hot reload are gone** (`api/status.py`, `api/export.py`, `api/history.py` now call `state_mod.*`, pinned by TEST45J), so a `helpers/state.py` patch now reaches those endpoints too; anything else they still pin is a smaller surface than before.
 - `state.json` grows with the number of LIVE contexts, not with `MAX_TRACKED_CHATS` (v1.21.0, recorded rather than fixed). Since v1.20.0 a live context is never evicted, so the 100 cap bounds only the dead surplus: the audit host carried 298 entries / 295 KB with 278 live-or-persisted and 20 already prunable. Every poll reads that file and every durable change rewrites it. **v1.21.3 measured this properly: the size was never the cost.** Profiling the 298-entry file gives read 1.1 ms + parse 2.5 ms, and `load_state()` ~19 ms of which **50% was the fingerprint** — which scales with entry count and runs on every poll and every transaction, while the file read does not. The signature is now cached by a digest of the bytes just read (**19 ms → 6 ms**), the transaction baselines on the loaded fingerprint instead of re-serializing, and serialization is compact (v1.21.0). The remaining per-poll cost is the read + parse, which is inherent. If an instance ever passes a *thousand* live contexts, split cold bookkeeping into a second file then — not before.
-- Wedge detection compares the log ENTRY count (plus a mutation counter since v1.10.0, which separates an actively-streaming call from a fully hung one). A long legitimate tool call that emits no entries for `stall_minutes` can still classify as `intervention`. Mitigations: the immediate task-kill requires `wedge_soft_restart: true` (off by default), and the flag drains when the call returns.
+- Wedge detection compares the log ENTRY count (plus a mutation counter since v1.10.0, which separates an actively-streaming call from a fully hung one). A long legitimate tool call that emits no entries for `stall_minutes` can still classify as `intervention`. Mitigations: the immediate task-kill requires `wedge_soft_restart: true` (off by default), and the flag drains when the call returns. **v1.23.0: the actively-streaming misclassification is fixed** — frozen entries + advancing mutations with the log's newest entry being the in-flight agent/response item no longer read as `spinning` (TEST53A); only non-stream spins (warning/error tails) keep the hard verdict. A long SILENT tool call still freezes the clock — the remaining mitigation set is unchanged.
 - `watch_all: false` skips any context with an empty log. The per-chat watch list (`allowed_chat_ids`) is implemented and enforced in `tick()`.
 - `state.json` and `config.json` are deliberately NOT removed by `hooks.uninstall()` - a reinstall resumes monitoring with its history intact. Only the debug logs are deleted.
 

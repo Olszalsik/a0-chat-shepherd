@@ -34,6 +34,7 @@ from usr.plugins.chat_shepherd.helpers.constants import (
     CATEGORY_MODEL_REFUSAL,
     CATEGORY_NETWORK,
     CATEGORY_NONE,
+    CATEGORY_PROVIDER_EXHAUSTION,
     CATEGORY_RATE_LIMIT,
     CATEGORY_SAFETY_TERMINATION,
     CATEGORY_TOOL_ERROR,
@@ -62,7 +63,25 @@ def entry_type(item: Any) -> str:
 # Order matters: the first match wins, so the specific causes are tested
 # before the catch-all. A safety termination is checked first because a
 # termination message often also contains words like "error" or "failed".
+#
+# v1.23.0: the exhaustion rule is FIRST, ahead of even safety_termination.
+# Its text ("all chat model candidates exhausted", "critical error occurred,
+# retrying") is far more specific than any other rule, and during a retry
+# storm the same tail also carries RateLimitError/429/auth fragments that
+# rotated into the newest entry — on the live incident the log_tail cause
+# flickered auth <-> framework_crash <-> tool_error every ~15 min as the
+# storm rotated which error entry was newest. A sustained loop needs a
+# sustained verdict, so the loop's own signature is tested before the
+# fragments it contains.
 _RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        CATEGORY_PROVIDER_EXHAUSTION,
+        re.compile(
+            r'all chat model candidates exhausted|candidates exhausted'
+            r'|critical error occurred, retrying',
+            re.IGNORECASE,
+        ),
+    ),
     (
         CATEGORY_SAFETY_TERMINATION,
         re.compile(
@@ -266,6 +285,96 @@ def last_human_user_at(view: Any) -> float:
         return 0.0
     for item in reversed(getattr(view, 'tail', None) or []):
         if entry_type(item) != 'user' or is_automation_entry(item):
+            continue
+        try:
+            return float(getattr(item, 'timestamp', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+# v1.23.0: the provider-exhaustion retry loop's log signature. The retry
+# machinery (plugins/_error_retry) logs a NEW warning/error entry per failed
+# attempt — "Critical error occurred, retrying..." heading, "All chat model
+# candidates exhausted..." content — so a futile loop ADVANCES the entry
+# count and is invisible to the frozen-log wedge detector by construction.
+_EXHAUSTION_HEADING_RE = re.compile(
+    r'critical error occurred,\s*retrying', re.IGNORECASE
+)
+_EXHAUSTION_CONTENT_RE = re.compile(
+    r'all chat model candidates exhausted|candidates exhausted', re.IGNORECASE
+)
+_EXHAUSTION_TYPES = ('warning', 'error')
+
+
+def _is_exhaustion_marker(item: Any) -> bool:
+    kind = entry_type(item)
+    if kind not in _EXHAUSTION_TYPES:
+        return False
+    heading = str(getattr(item, 'heading', '') or '')
+    content = str(getattr(item, 'content', '') or '')
+    return bool(
+        _EXHAUSTION_HEADING_RE.search(heading)
+        or _EXHAUSTION_CONTENT_RE.search(heading)
+        or _EXHAUSTION_CONTENT_RE.search(content)
+    )
+
+
+def exhaustion_loop(view: Any) -> tuple[bool, int, str]:
+    """Is the log tail a provider-exhaustion retry loop?
+
+    Returns ``(matched, marker_count, excerpt_of_newest_marker)``. Matching
+    needs ALL of:
+
+    - at least two exhaustion markers (warning/error entries) in the bounded
+      tail — one entry is one failed attempt, not a loop;
+    - the newest *relevant* log entry is not a `response` — a real reply
+      after the failures means the loop broke;
+    - no genuine human turn newer than the newest marker — a human taking
+      over is the loop's owner now.
+
+    Takes the caller's `_LogView` (the O5 contract: never the log lock).
+    """
+    if view is None:
+        return False, 0, ''
+    tail = getattr(view, 'tail', None) or []
+    newest_marker_ts = 0.0
+    count = 0
+    newest_text = ''
+    for item in tail:
+        if not _is_exhaustion_marker(item):
+            continue
+        count += 1
+        newest_text = (
+            (getattr(item, 'heading', '') or '') + ' '
+            + (getattr(item, 'content', '') or '')
+        )
+        try:
+            newest_marker_ts = max(
+                newest_marker_ts, float(getattr(item, 'timestamp', 0.0) or 0.0)
+            )
+        except (TypeError, ValueError):
+            pass
+    if count < 2:
+        return False, 0, ''
+    if last_relevant_type(view) == 'response':
+        return False, 0, ''
+    human_ts = last_human_user_at(view)
+    if human_ts > 0.0 and human_ts >= newest_marker_ts:
+        return False, 0, ''
+    return True, count, newest_text
+
+
+def last_response_at(view: Any) -> float:
+    """Epoch seconds of the newest assistant `response` entry, or 0.0.
+
+    Shape-mirror of `last_human_user_at`: the callers need an ORDERING
+    against state stamps (exhaustion recovery, post-kill hold), not a type.
+    """
+    if view is None:
+        return 0.0
+    for item in reversed(getattr(view, 'tail', None) or []):
+        if entry_type(item) != 'response':
             continue
         try:
             return float(getattr(item, 'timestamp', 0.0) or 0.0)

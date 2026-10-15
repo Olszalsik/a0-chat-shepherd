@@ -66,6 +66,11 @@ DEFAULTS: dict[str, Any] = {
     "wedge_remediation_cooldown_minutes": 10,
     "wedge_soft_restart": False,
     "wedge_liveness_probe": True,
+    # v1.23.0: provider-exhaustion retry loops + substantive-progress liveness.
+    "exhaustion_minutes": 20,
+    "exhaustion_kill_after_minutes": 0,
+    "no_response_minutes": 0,
+    "stall_escalate_to_restart": False,
     "adaptive_thresholds": False,
     "adaptive_interval_minutes": 60,
     "adaptive_min_samples": 10,
@@ -370,6 +375,32 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
             current["wedge_remediation_cooldown_minutes"],
             1,
             240,
+        )
+    # v1.23.0: exhaustion + substantive-progress knobs. kill 0 = off.
+    if "exhaustion_minutes" in readable:
+        current["exhaustion_minutes"] = coerce_int(
+            readable["exhaustion_minutes"],
+            current["exhaustion_minutes"],
+            2,
+            240,
+        )
+    if "exhaustion_kill_after_minutes" in readable:
+        current["exhaustion_kill_after_minutes"] = coerce_int(
+            readable["exhaustion_kill_after_minutes"],
+            current["exhaustion_kill_after_minutes"],
+            0,
+            720,
+        )
+    if "no_response_minutes" in readable:
+        current["no_response_minutes"] = coerce_int(
+            readable["no_response_minutes"],
+            current["no_response_minutes"],
+            0,
+            240,
+        )
+    if "stall_escalate_to_restart" in readable:
+        current["stall_escalate_to_restart"] = coerce_bool(
+            readable["stall_escalate_to_restart"]
         )
     if "allowed_chat_ids" in readable:
         raw = readable["allowed_chat_ids"]

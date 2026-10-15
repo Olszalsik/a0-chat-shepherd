@@ -47,7 +47,17 @@
 
   function setMemo(container, chatId, badge) {
     if (!ROW_MEMO) return;
-    ROW_MEMO.set(container, { id: chatId || "", badge: badge || null });
+    // v1.23.0: mutate the existing record IN PLACE instead of replacing it —
+    // a wholesale set orphaned the alert-badge handle between passes (the
+    // badge element stayed in the DOM with nobody left holding it, so the
+    // ack path could never remove it).
+    var hit = ROW_MEMO.get(container);
+    if (hit) {
+      hit.id = chatId || "";
+      hit.badge = badge || null;
+      return;
+    }
+    ROW_MEMO.set(container, { id: chatId || "", badge: badge || null, alertBadge: null });
   }
 
   var DEFAULT_ICONS = {
@@ -267,6 +277,18 @@
       }
     }
 
+    // v1.23.0: durable unread-alert badges. Per-chat alert row counts keyed
+    // by chat_id; only rows the operator has not acknowledged (unread).
+    var alertCounts = {};
+    var anyUnread = false;
+    var alerts = (s && s.data && s.data.alerts) || [];
+    for (var a = 0; a < alerts.length; a++) {
+      var row = alerts[a];
+      if (!row || !row.chat_id || !row.unread || !row.count) continue;
+      anyUnread = true;
+      alertCounts[row.chat_id] = (alertCounts[row.chat_id] || 0) + Number(row.count || 1);
+    }
+
     // v1.21.0 (O11): memoized DOM handles. A repaint used to redo ~4 queries per
     // row per pass - anchorFor (two querySelector calls) plus a
     // .cs-badge lookup - with ~300 rows every 2.5 s plus every debounced
@@ -306,24 +328,52 @@
       var label = "Chat Shepherd: " + (LABELS[status] || status);
       var color = colorFor(s, status);
       var existing = memo && memo.badge;
-      // Fast path: this row is already painted for exactly this status. The
-      // container's own data-cs-status is the cross-check that a stale memo
-      // can never hide a real change.
-      if (existing && existing.parentNode
+      // v1.23.0: the alert badge must be maintained on EVERY pass, including
+      // fast-path ones — the status-badge shortcut would otherwise leave a
+      // stale alert badge behind until the status itself changed. Compute
+      // both, keep the cheap fast path cheap (no anchor walk unless needed).
+      var alertCount = alertCounts[chatId] || 0;
+      var fastPath = existing && existing.parentNode
           && container.getAttribute("data-cs-status") === status
           && existing.textContent === glyph
-          && existing.getAttribute("aria-label") === label) {
+          && existing.getAttribute("aria-label") === label;
+      var anchor = null;
+      if (fastPath) {
         if (existing.style.color !== color) existing.style.color = color;
-        continue;
+      } else {
+        anchor = anchorFor(container);
+        // Alpine may have re-keyed the row; never steal another chat's badge.
+        if (existing && !anchor.host.contains(existing)) existing = null;
+        var badge = existing || makeBadge();
+        applyBadge(badge, status, glyph, color, label);
+        if (!existing) placeBadge(badge, anchor);
+        setMemo(container, chatId, badge);
       }
 
-      var anchor = anchorFor(container);
-      // Alpine may have re-keyed the row; never steal another chat's badge.
-      if (existing && !anchor.host.contains(existing)) existing = null;
-      var badge = existing || makeBadge();
-      applyBadge(badge, status, glyph, color, label);
-      if (!existing) placeBadge(badge, anchor);
-      setMemo(container, chatId, badge);
+      // v1.23.0: the red numeric alert badge rides NEXT to the status badge
+      // for chats with an unacknowledged alert. Removed once acknowledged,
+      // and only ever one per row (the memo holds it separately).
+      if (!memo) memo = memoFor(container); // fresh row: setMemo just ran
+      var alertBadge = (memo && memo.alertBadge) || null;
+      if (!alertCount || !anyUnread) {
+        if (alertBadge && alertBadge.parentNode) alertBadge.remove();
+        if (memo) memo.alertBadge = null;
+      } else {
+        if (!alertBadge || !alertBadge.isConnected) {
+          alertBadge = document.createElement("span");
+          alertBadge.className = "cs-alert-badge";
+          alertBadge.setAttribute("role", "img");
+          alertBadge.style.cssText =
+            "margin-left:3px;flex:none;font-size:10px;line-height:1;pointer-events:none;"
+            + "background:#f44336;color:#fff;border-radius:9px;padding:1px 5px;font-weight:700;";
+          placeBadge(alertBadge, anchor || anchorFor(container));
+        }
+        if (alertBadge.textContent !== String(alertCount)) {
+          alertBadge.textContent = String(alertCount);
+        }
+        alertBadge.title = "Chat Shepherd: unacknowledged alert(s) — open the dashboard";
+        memo.alertBadge = alertBadge;
+      }
     }
   }
 

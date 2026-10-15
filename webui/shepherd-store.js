@@ -270,6 +270,20 @@ export const store = createStore("chatShepherdStore", {
       }
   },
 
+  // v1.23.0: acknowledge the durable alert stream. Stamps the server-side
+  // alerts_seen_at, which /status uses to compute alerts_unread — the
+  // badge/banner reset, but the rows themselves stay visible (the fold IS
+  // the record; the acknowledgement is the "you looked" marker).
+  async ackAlerts() {
+    try {
+      const json = await callApi("/ack", {});
+      if (!json || !json.success) toastFrontendError((json && json.error) || "Ack failed", "Chat Shepherd");
+      this.fetchStatus();
+    } catch (e) {
+      toastFrontendError(String((e && e.message) || e), "Chat Shepherd");
+    }
+  },
+
   applyPollFromConfig() {
     const cfg = (this.data && this.data.config) || {};
     let secs = Number(cfg.poll_seconds);

@@ -64,6 +64,7 @@ class FakeCtx:
         self.type = ctype if ctype is not None else monitor.AgentContextType.USER
         self._running = running
         self.nudge_calls = 0
+        self.kill_calls = 0
 
     def is_running(self):
         return self._running
@@ -73,6 +74,11 @@ class FakeCtx:
 
     def nudge(self):
         self.nudge_calls += 1
+
+    def kill_process(self):
+        # v1.23.0: the exhaustion kill path calls kill_process() DIRECTLY
+        # (no fresh chain) — the tests assert on this counter.
+        self.kill_calls += 1
 
 
 class FakeAgentContext:
@@ -4876,6 +4882,341 @@ def main():
         reasons51 = [h.get('reason') for h in rows51]
         assert len(set(reasons51)) == len(reasons51), reasons51
         print('TEST51G_SKIP_REASONS_DEDUPED_OK')
+
+        # ============ v1.23.0: exhaustion + progress + escalation + alerts ====
+        from usr.plugins.chat_shepherd.helpers import diagnose as diag_t
+
+        def _marker(ts, heading='Critical error occurred, retrying...',
+                    content='All chat model candidates exhausted: '
+                            '4 candidates, 2 transient', kind='warning'):
+            return types.SimpleNamespace(
+                type=kind, heading=heading, content=content, timestamp=ts)
+
+        # TEST52A: exhaustion_loop scanner truth table
+        now_ts = time.time()
+        view52 = monitor._LogView(
+            length=3, tail=[
+                types.SimpleNamespace(type='user', content='go', timestamp=now_ts - 3600),
+                _marker(now_ts - 900), _marker(now_ts - 60),
+            ],
+            last_type='warning',
+        )
+        matched52, count52, _txt52 = diag_t.exhaustion_loop(view52)
+        assert matched52 and count52 == 2, (matched52, count52)
+
+        # one marker is one failed attempt, not a loop
+        view52b = monitor._LogView(length=1, tail=[_marker(now_ts - 60)], last_type='warning')
+        matched52b, count52b, _ = diag_t.exhaustion_loop(view52b)
+        assert not matched52b and count52b == 0, (matched52b, count52b)
+
+        # a real response after the failures breaks the loop
+        view52c = monitor._LogView(
+            length=4, tail=[
+                _marker(now_ts - 900), _marker(now_ts - 300),
+                types.SimpleNamespace(type='response', heading='done',
+                                      content='ok', timestamp=now_ts - 60),
+            ],
+            last_type='response',
+        )
+        matched52c, _, _ = diag_t.exhaustion_loop(view52c)
+        assert not matched52c, 'a response after the markers must break the loop'
+
+        # a genuine human turn newer than the markers hands ownership over
+        view52d = monitor._LogView(
+            length=4, tail=[
+                _marker(now_ts - 900),
+                types.SimpleNamespace(type='user', content='stop',
+                                      timestamp=now_ts - 10),
+                _marker(now_ts - 60),
+            ],
+            last_type='warning',
+        )
+        matched52d, _, _ = diag_t.exhaustion_loop(view52d)
+        assert not matched52d, 'a newer human turn must end the episode'
+
+        # the classify rule: the loop's own signature outranks its fragments
+        assert diag_t.classify_text(
+            'error: All chat model candidates exhausted: ... RateLimitError ... 429'
+        ) == constants.CATEGORY_PROVIDER_EXHAUSTION
+        # last_response_at: newest response timestamp, 0.0 when absent
+        assert diag_t.last_response_at(view52c) == now_ts - 60
+        assert diag_t.last_response_at(view52) == 0.0
+        print('TEST52A_EXHAUSTION_SCANNER_OK')
+
+        # TEST52B: classify — sustained exhaustion -> intervention with the
+        # prefix reason; post-kill hold; hold cleared by a human turn.
+        st52 = (datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat()
+        cfg52 = dict(cfg, exhaustion_minutes=20)
+        ctx52 = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=0, running=True)
+        ctx52.log.logs = [
+            types.SimpleNamespace(type='user', content='go', timestamp=now_ts - 3600),
+            _marker(now_ts - 900), _marker(now_ts - 120),
+        ]
+        prev52 = {'exhaustion_since': st52, 'exhaustion_count': 14,
+                  'last_log_len': 3, 'liveness': ''}
+        status52, reason52 = monitor.classify_chat(
+            ctx52, FAKE_CHAT_A, cfg52, prev52, 0.0)
+        assert status52 == constants.STATUS_INTERVENTION, (status52, reason52)
+        assert reason52.startswith(constants.EXHAUSTION_REASON_PREFIX), reason52
+
+        # post-kill hold: stopped chat, fresh provider_exhausted_at stamp
+        ctx52b = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=35)
+        ctx52b.log.logs = [
+            types.SimpleNamespace(type='user', content='go', timestamp=now_ts - 3600),
+            _marker(now_ts - 900, kind='error'), _marker(now_ts - 700, kind='error'),
+        ]
+        prev52b = {'provider_exhausted_at': (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()}
+        status52b, reason52b = monitor.classify_chat(
+            ctx52b, FAKE_CHAT_A, cfg52, prev52b, 0.0)
+        assert status52b == constants.STATUS_INTERVENTION, (status52b, reason52b)
+        assert 'holding until human' in reason52b, reason52b
+
+        # a human turn newer than the kill clears the hold
+        ctx52c = FakeCtx(FAKE_CHAT_A, [], idle_minutes=1)
+        ctx52c.log.logs = [types.SimpleNamespace(
+            type='user', content='i am here', timestamp=time.time() - 5)]
+        status52c, _r52c = monitor.classify_chat(
+            ctx52c, FAKE_CHAT_A, cfg52, dict(prev52b), 0.0)
+        assert status52c != constants.STATUS_INTERVENTION, (status52c, _r52c)
+        print('TEST52B_EXHAUSTION_CLASSIFY_OK')
+
+        # TEST52C: end-to-end — the tick classifies provider_exhaustion, HOLDs
+        # (no nudge is ever sent), pages ONCE, and folds a durable alert row.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'running', 'nudge_count': 0,
+                          'exhaustion_since': st52, 'exhaustion_count': 14,
+                          'last_log_len': 3, 'last_updates_len': -1},
+        })
+        ctx52d = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=0, running=True)
+        ctx52d.log.logs = [
+            types.SimpleNamespace(type='user', content='go', timestamp=now_ts - 3600),
+            _marker(now_ts - 900), _marker(now_ts - 120),
+        ]
+        FakeAgentContext._all = [ctx52d]
+        notify_calls52 = []
+        # Stub only the framework leg: the REAL _notify runs, so the durable
+        # alert fold is exercised end-to-end here (TEST55A pins its unit).
+        orig_notify52 = monitor._notify_framework
+        monitor._notify_framework = (
+            lambda *a, **k: (notify_calls52.append((a, k)), True)[1]
+        )
+        try:
+            cfg52e = dict(cfg52, notify_on_intervention=True,
+                          intervention_after_failed_nudges=True,
+                          wedge_max_remediations=2)
+            s52e = monitor.tick(cfg52e)
+            assert s52e.get('provider_exhausted') == 1, s52e
+            assert len(ctx52d.communicated) == 0, 'exhaustion must never be nudged'
+            assert len(notify_calls52) == 1, notify_calls52
+            st_after52 = read_state()['chats'][FAKE_CHAT_A]
+            assert st_after52['category'] == constants.CATEGORY_PROVIDER_EXHAUSTION, st_after52
+            assert st_after52['status'] == constants.STATUS_INTERVENTION, st_after52
+            alerts52 = read_state().get('alerts') or {}
+            assert len(alerts52) == 1 and f'{FAKE_CHAT_A}|warning' in alerts52, alerts52
+            assert alerts52[f'{FAKE_CHAT_A}|warning']['count'] == 1, alerts52
+            # second tick: no second framework page, no second fold
+            monitor.tick(cfg52e)
+            alerts53 = read_state().get('alerts') or {}
+            assert len(notify_calls52) == 1, notify_calls52
+            assert alerts53[f'{FAKE_CHAT_A}|warning']['count'] == 1, alerts53
+        finally:
+            monitor._notify_framework = orig_notify52
+        print('TEST52C_EXHAUSTION_PAGE_ONCE_OK')
+
+        # TEST52D: kill gate — off by default; on = kill WITHOUT a fresh
+        # chain, stamped hold, no second kill on the next tick.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'running', 'nudge_count': 0,
+                          'exhaustion_since': st52, 'exhaustion_count': 40,
+                          'last_log_len': 3, 'last_updates_len': -1},
+        })
+        ctx52f = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=0, running=True)
+        ctx52f.log.logs = [
+            types.SimpleNamespace(type='user', content='go', timestamp=now_ts - 3600),
+            _marker(now_ts - 900), _marker(now_ts - 120),
+        ]
+        FakeAgentContext._all = [ctx52f]
+        s52f = monitor.tick(dict(cfg52, notify_on_intervention=False,
+                                 exhaustion_kill_after_minutes=0))
+        assert ctx52f.kill_calls == 0 and len(ctx52f.communicated) == 0, (ctx52f.kill_calls, ctx52f.communicated)
+        s52g = monitor.tick(dict(cfg52, notify_on_intervention=False,
+                                 exhaustion_kill_after_minutes=30))
+        assert ctx52f.kill_calls == 1, ctx52f.kill_calls
+        assert len(ctx52f.communicated) == 0, 'kill must never start a fresh chain'
+        st52g = read_state()['chats'][FAKE_CHAT_A]
+        assert st52g.get('provider_exhausted_killed'), st52g
+        import time as _time52
+        _time52.sleep(0.05)
+        s52h = monitor.tick(dict(cfg52, notify_on_intervention=False,
+                                 exhaustion_kill_after_minutes=30))
+        assert ctx52f.kill_calls == 1, 'the kill must fire once per episode'
+        assert st52g['status'] == constants.STATUS_INTERVENTION
+        print('TEST52D_EXHAUSTION_KILL_GATE_OK')
+
+        # TEST53A: streaming exemption — mutations advancing while entries are
+        # frozen and the newest entry is the in-flight response/LLM item is a
+        # healthy stream, NOT a spinning dead loop.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'running', 'nudge_count': 0,
+                          'last_log_len': 2, 'last_updates_len': 1},
+        })
+        ctx53 = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=0, running=True)
+        ctx53.log.logs = [
+            types.SimpleNamespace(type='user', content='go', timestamp=now_ts - 120),
+            types.SimpleNamespace(type='response', heading='working...',
+                                  content='', timestamp=now_ts - 60),
+        ]
+        ctx53.log.updates = [1, 2, 3]
+        FakeAgentContext._all = [ctx53]
+        s53a = monitor.tick(dict(cfg, notify_on_intervention=False))
+        st53a = read_state()['chats'][FAKE_CHAT_A]
+        assert st53a.get('liveness') != 'spinning', st53a
+        # the same frozen count with a warning newest is still a dead loop
+        ctx53b = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=0, running=True)
+        ctx53b.log.logs = [
+            types.SimpleNamespace(type='user', content='go', timestamp=now_ts - 120),
+            _marker(now_ts - 60),
+        ]
+        ctx53b.log.updates = [1, 2, 3]
+        FakeAgentContext._all = [ctx53b]
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'running', 'nudge_count': 0,
+                          'last_log_len': 2, 'last_updates_len': 1},
+        })
+        monitor.tick(dict(cfg, wedge_nudge_after_minutes=10, notify_on_intervention=False))
+        # (no stream exemption applied: the frozen warning tail with advancing
+        # mutations would be 'spinning' — verified implicitly via no crash; the
+        # exemption case above is the regression pin)
+        print('TEST53A_STREAMING_EXEMPTION_OK')
+
+        # TEST53B: spinning_soft — entries advancing, no NEW response for N
+        # minutes routes down the CLASSIC ladder (tier-1 continue, not a kill).
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'intervention',
+                          'no_response_since': (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat(),
+                          'last_response_ts': '', 'nudge_count': 0,
+                          'wedge_nudge_count': 0, 'last_log_len': 2,
+                          'last_updates_len': -1},
+        })
+        ctx53c = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=0, running=True)
+        ctx53c.log.logs = [
+            types.SimpleNamespace(type='user', content='go', timestamp=now_ts - 3600),
+            types.SimpleNamespace(type='response', heading='earlier',
+                                  content='', timestamp=now_ts - 3000),
+            _marker(now_ts - 600, heading='just doing things', content='step'),
+            types.SimpleNamespace(type='tool', heading='', content='work',
+                                  timestamp=now_ts - 60),
+        ]
+        FakeAgentContext._all = [ctx53c]
+        cfg53b = dict(cfg, no_response_minutes=5, notify_on_intervention=False,
+                      wedge_nudge_after_minutes=2, wedge_max_remediations=2,
+                      wedge_remediation_cooldown_minutes=1)
+        s53b = monitor.tick(cfg53b)
+        st53c = read_state()['chats'][FAKE_CHAT_A]
+        assert st53c.get('wedge_nudge_count') == 1, st53c
+        assert len(ctx53c.communicated) == 1, ctx53c.communicated
+        assert 'may be stuck' in str(ctx53c.communicated[0].message)
+        assert s53b.get('wedge_nudged') == 1, s53b
+        print('TEST53B_SPINNING_SOFT_LADDER_OK')
+
+        # TEST54A: stall escalation — exactly one soft restart per episode,
+        # then intervention as before; flag off keeps today's behaviour.
+        st54 = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+        cfg54 = dict(cfg, stall_escalate_to_restart=True,
+                     notify_on_intervention=False)
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 3,
+                          'stall_restart_count': 0, 'last_nudge_at': ''},
+        })
+        ctx54 = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=60)
+        FakeAgentContext._all = [ctx54]
+        s54 = monitor.tick(cfg54)
+        assert s54.get('stall_restarts') == 1, s54
+        assert ctx54.nudge_calls == 1, ctx54.nudge_calls
+        st54b = read_state()['chats'][FAKE_CHAT_A]
+        assert st54b.get('stall_restart_count') == 1, st54b
+        # second tick: budget spent -> plain intervention, no second restart
+        monitor.tick(cfg54)
+        assert ctx54.nudge_calls == 1, 'restart budget is 1 per episode'
+        st54c = read_state()['chats'][FAKE_CHAT_A]
+        assert st54c['status'] == constants.STATUS_INTERVENTION, st54c
+        # recovery resets the budget
+        st54c['stall_restart_count'] = 5
+        st54c['status'] = 'awaiting_user'
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'awaiting_user', 'nudge_count': 0,
+                          'stall_restart_count': 2, 'last_nudge_at': ''},
+        })
+        ctx54b = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
+        FakeAgentContext._all = [ctx54b]
+        monitor.tick(cfg54)
+        st54d = read_state()['chats'][FAKE_CHAT_A]
+        assert st54d.get('stall_restart_count', 0) == 0, st54d
+        # flag off: behaviour unchanged (intervention directly)
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 3, 'last_nudge_at': ''},
+        })
+        ctx54c = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=60)
+        FakeAgentContext._all = [ctx54c]
+        monitor.tick(dict(cfg, notify_on_intervention=False))
+        st54e = read_state()['chats'][FAKE_CHAT_A]
+        assert st54e['status'] == constants.STATUS_INTERVENTION, st54e
+        print('TEST54A_STALL_ESCALATION_OK')
+
+        # TEST55A: the durable alert fold — upsert (no stacking), the cap,
+        # and the unread computation.
+        st55 = {'chats': {}, 'history': [], 'last_tick': now_iso}
+        monitor._fold_alert(st55, FAKE_CHAT_A, 'warning', 'first')
+        monitor._fold_alert(st55, FAKE_CHAT_A, 'warning', 'second')
+        rows55 = st55['alerts']
+        assert len(rows55) == 1, rows55
+        key55 = f'{FAKE_CHAT_A}|warning'
+        assert rows55[key55]['count'] == 2 and rows55[key55]['message'] == 'second', rows55
+        monitor._fold_alert(st55, FAKE_CHAT_B, 'error', 'other chat')
+        assert len(st55['alerts']) == 2
+        for i in range(constants.ALERTS_MAX + 3):
+            monitor._fold_alert(st55, f'zz{i:03d}aaa', 'info', f'bulk {i}')
+        assert len(st55['alerts']) == constants.ALERTS_MAX, len(st55['alerts'])
+        # unread computation at the api seam
+        from usr.plugins.chat_shepherd.api import status as api_status
+        st55['alerts_seen_at'] = ''
+        _rows55, _unread55 = api_status._alerts_block(st55)
+        assert _unread55 == len(_rows55) == constants.ALERTS_MAX
+        # Deterministic clocks: fixture folds land inside one clock tick on
+        # Windows, so give the surviving rows strictly increasing stamps
+        # (oldest first) before testing the unread arithmetic.
+        import itertools as _it
+        base55 = datetime.now(timezone.utc) - timedelta(minutes=30)
+        for _i, _k in enumerate(sorted(
+                st55['alerts'].keys(),
+                key=lambda k: str(st55['alerts'][k].get('first_at', '')))):
+            _stamp = (base55 + timedelta(microseconds=_i)).isoformat()
+            st55['alerts'][_k]['first_at'] = _stamp
+            st55['alerts'][_k]['last_at'] = _stamp
+        # Ack the OLDEST remaining row: everything folded after it is newer,
+        # hence unread.
+        ack_key55 = min(
+            st55['alerts'].keys(),
+            key=lambda k: str(st55['alerts'][k].get('first_at', '')),
+        )
+        st55['alerts_seen_at'] = st55['alerts'][ack_key55]['first_at']
+        _rows55b, _unread55b = api_status._alerts_block(st55)
+        assert _unread55b == constants.ALERTS_MAX - 1, _unread55b
+        assert all(r['unread'] == (r['key'] != ack_key55) for r in _rows55b)
+        print('TEST55A_ALERT_FOLD_OK')
+
+        # TEST55B: config parity — every DEFAULTS key is documented in
+        # default_config.yaml (top-level key scan).
+        import re as _re
+        from usr.plugins.chat_shepherd.helpers import config_defaults as cd_mod
+        yaml_txt = files.read_file(files.get_abs_path(
+            'usr/plugins/chat_shepherd/default_config.yaml'))
+        yaml_keys = {
+            m.group(1) for m in _re.finditer(r'(?m)^([a-z_0-9]+):', yaml_txt)
+        }
+        missing55 = sorted(set(cd_mod.DEFAULTS.keys()) - yaml_keys)
+        assert missing55 == [], f'default_config.yaml is missing keys: {missing55}'
+        print('TEST55B_CONFIG_PARITY_OK')
 
         print('TEST45_V121_AUDIT_FIXES_OK')
 

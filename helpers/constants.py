@@ -71,6 +71,13 @@ CATEGORY_NETWORK = 'network'
 CATEGORY_JSON_MALFORMED = 'json_malformed'
 CATEGORY_FRAMEWORK_CRASH = 'framework_crash'
 CATEGORY_EXTERNAL_BLOCK = 'external_block'
+# v1.23.0: a running chat cycling provider-exhaustion retry markers ("All chat
+# model candidates exhausted" / "Critical error occurred, retrying...") with no
+# assistant response. Deliberately NOT a member of the remediable settings UI:
+# nudging a rate-limited chat is futile, so the planner HOLDs it automatically
+# (it is outside auto_remediate_categories and outside NEVER_REMEDIATE) — the
+# same posture as rate_limit, but named for the *loop*, not the cause.
+CATEGORY_PROVIDER_EXHAUSTION = 'provider_exhaustion'
 
 CATEGORIES = (
     CATEGORY_NONE,
@@ -84,6 +91,7 @@ CATEGORIES = (
     CATEGORY_JSON_MALFORMED,
     CATEGORY_FRAMEWORK_CRASH,
     CATEGORY_EXTERNAL_BLOCK,
+    CATEGORY_PROVIDER_EXHAUSTION,
 )
 
 # The floor applied AFTER the config allowlist: adding a category to
@@ -103,6 +111,7 @@ CATEGORY_LABELS = {
     CATEGORY_JSON_MALFORMED: 'malformed model output',
     CATEGORY_FRAMEWORK_CRASH: 'framework crash',
     CATEGORY_EXTERNAL_BLOCK: 'blocked by another plugin',
+    CATEGORY_PROVIDER_EXHAUSTION: 'provider exhaustion retry loop',
 }
 
 # v1.22.0 (stage 5, ported from chat_shepherd2): the continuity wake verb.
@@ -166,3 +175,22 @@ WEDGE_REMEDIATION_COOLDOWN_MIN = 10
 # v1.10.0: liveness probe classifies wedges (hung call vs spinning
 # dead loop) via the log mutation counter; off = legacy ladder.
 WEDGE_LIVENESS_PROBE = True
+
+# v1.23.0: the reason prefixes classify_chat stamps for the two new
+# supervisor conditions, and the liveness verdict for the entries-advancing
+# class. The exhaustion arm routes on its prefix the same way the
+# wedged-completion arm routes on HK_REASON_PREFIX.
+EXHAUSTION_REASON_PREFIX = 'Provider exhaustion loop:'
+NO_RESPONSE_REASON_PREFIX = 'Running but no assistant response for'
+LIVENESS_SPINNING_SOFT = 'spinning_soft'
+# One soft restart queued after the stall ladder exhausts (feature C). The
+# exact string is an internal contract between classify_chat and the tick.
+STALL_RESTART_REASON = 'Nudges exhausted; one soft restart queued'
+# v1.23.0: after an exhaustion kill the chat is held for a human for this
+# long, mirroring TERMINATION_NUDGE_COOLDOWN_MIN's durability pattern. The
+# hold clears early on a human turn or a fresh assistant response.
+EXHAUSTION_HOLD_MIN = 240
+# v1.23.0 durable alerts: the dashboard-visible fold of _notify pages. The
+# in-framework notification is a 3s toast wiped on restart; these rows are
+# what makes "the supervisor needs you" survive that.
+ALERTS_MAX = 20

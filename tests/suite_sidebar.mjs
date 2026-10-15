@@ -192,11 +192,13 @@ function buildRow({ scopeOwner, wrapperScope = null, attrs = {}, hasChildren = f
 
 function badgeIn(row) { return row.container.querySelector(".cs-badge"); }
 
-function statusData(pairs, icons = {}) {
-  return {
+function statusData(pairs, icons = {}, alerts = null) {
+  const data = {
     chats: pairs.map(([chat_id, status]) => ({ chat_id, status })),
     config: { icons },
   };
+  if (alerts) data.alerts = alerts;
+  return data;
 }
 
 function installEnv({ data } = {}) {
@@ -542,6 +544,62 @@ function ok(condition, message) { assert.ok(condition, message); checks += 1; }
   ok(after.style.color !== beforeColor, "and pick up the new state's color");
 }
 
+
+// 12. v1.23.0: the durable unread-alert badge rides next to the status badge.
+{
+  const env = installEnv({
+    data: statusData([["chat00al", "intervention"]], {}, [
+      { key: "chat00al|warning", chat_id: "chat00al", kind: "warning",
+        count: 3, unread: true, first_at: "t", last_at: "t", message: "m" },
+    ]),
+  });
+  const row = buildRow({ scopeOwner: { item: { id: "chat00al" } } });
+  env.chatsSection.appendChild(row.li);
+  load()._test.injectBadges();
+  const alertBadge = env.document.querySelector(".cs-alert-badge");
+  ok(alertBadge, "a row with an unacknowledged alert gets an alert badge");
+  ok(alertBadge && alertBadge.textContent === "3",
+    "the alert badge shows the folded page count");
+  ok(badgeIn(row) && badgeIn(row) !== alertBadge,
+    "the status badge is a separate element, not replaced");
+}
+
+// 12b. Acknowledged alerts and unknown chats paint nothing.
+{
+  const env = installEnv({
+    data: statusData([["chat00am", "running"]], {}, [
+      { key: "chat00am|warning", chat_id: "chat00am", kind: "warning",
+        count: 1, unread: false, first_at: "t", last_at: "t", message: "m" },
+      { key: "|warning", chat_id: "", kind: "warning",
+        count: 2, unread: true, first_at: "t", last_at: "t", message: "m" },
+    ]),
+  });
+  const row = buildRow({ scopeOwner: { item: { id: "chat00am" } } });
+  env.chatsSection.appendChild(row.li);
+  load()._test.injectBadges();
+  ok(!env.document.querySelector(".cs-alert-badge"),
+    "an acknowledged alert paints no badge (and a global alert keys no row)");
+}
+
+// 12c. The alert badge disappears once the alert is acknowledged.
+{
+  const env = installEnv({
+    data: statusData([["chat00an", "stalled"]], {}, [
+      { key: "chat00an|warning", chat_id: "chat00an", kind: "warning",
+        count: 1, unread: true, first_at: "t", last_at: "t", message: "m" },
+    ]),
+  });
+  const row = buildRow({ scopeOwner: { item: { id: "chat00an" } } });
+  env.chatsSection.appendChild(row.li);
+  const api = load();
+  api._test.injectBadges();
+  ok(env.document.querySelector(".cs-alert-badge"), "precondition: badge painted");
+  env.store.data.alerts[0].unread = false;
+  api._test.injectBadges();
+  ok(!env.document.querySelector(".cs-alert-badge"),
+    "acknowledging removes the alert badge but keeps the status badge");
+  ok(badgeIn(row), "the status badge survived the ack");
+}
 
 import { readFileSync } from "node:fs";
 const injSrc = readFileSync(new URL("../webui/shepherd-sidebar.js", import.meta.url), "utf8");

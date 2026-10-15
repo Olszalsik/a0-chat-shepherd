@@ -42,6 +42,12 @@
 .shepherd-timeline-row td { background: rgba(0, 0, 0, 0.25); }
 .shepherd-timeline { max-height: 220px; overflow-y: auto; padding: 2px 4px; }
 .shepherd-timeline-title { font-size: 0.75rem; color: var(--text-secondary, #aaa); margin-bottom: 4px; }
+    .shepherd-alerts { border: 1px solid #f44336; background: rgba(244, 67, 54, 0.12); border-radius: 6px; padding: 10px 12px; margin-bottom: 16px; }
+    .shepherd-alerts h3 { margin: 0 0 8px 0; font-size: 0.95rem; color: #f44336; }
+    .shepherd-alert { padding: 6px 0; border-bottom: 1px solid rgba(244,67,54,0.25); font-size: 0.85rem; }
+    .shepherd-alert:last-child { border-bottom: none; }
+    .shepherd-alert .when { color: var(--text-secondary, #aaa); font-size: 0.75rem; margin-right: 8px; }
+    .shepherd-alert .count { background: #f44336; color: #fff; border-radius: 10px; padding: 0 8px; font-size: 0.75rem; margin-right: 8px; }
   </style>
 </head>
 <body>
@@ -76,6 +82,36 @@
             <div class='shepherd-badge' x-show='$store.chatShepherdStore.aggregatesLabel().length > 0'>
              <span x-text='$store.chatShepherdStore.aggregatesLabel()'></span>
             </div>
+
+            <!-- v1.23.0: durable alert fold. Pages used to be 3-second toasts
+                 wiped on restart — an operator returning after hours saw
+                 nothing. These rows survive restarts and sit here until
+                 acknowledged. -->
+            <section class='shepherd-alerts' x-show='$store.chatShepherdStore.data.alerts && $store.chatShepherdStore.data.alerts.length > 0'>
+              <h3>
+                Alerts
+                <template x-if='($store.chatShepherdStore.data.alerts_unread || 0) > 0'>
+                  <span style='background:#f44336;color:#fff;border-radius:10px;padding:1px 8px;font-size:0.8rem;margin-left:6px;'
+                        x-text='`${$store.chatShepherdStore.data.alerts_unread} unread`'></span>
+                </template>
+                <button class='shepherd-btn' style='float:right;'
+                        @click='$store.chatShepherdStore.ackAlerts()'>Acknowledge</button>
+              </h3>
+              <template x-for='alert in $store.chatShepherdStore.data.alerts' :key='alert.key'>
+                <div class='shepherd-alert'>
+                  <template x-if='alert.count > 1'>
+                    <span class='count' x-text='alert.count'></span>
+                  </template>
+                  <span class='when' x-text='$store.chatShepherdStore.formatTime(alert.last_at)'></span>
+                  <template x-if='alert.chat_id'>
+                    <span class='shepherd-chat-id' style='display:inline-block;max-width:120px;vertical-align:bottom;'
+                          x-text='($store.chatShepherdStore.nameFor(alert.chat_id) || alert.chat_id)'></span>
+                  </template>
+                  <span x-text='alert.message'></span>
+                </div>
+              </template>
+            </section>
+
             <template x-if="$store.chatShepherdStore.data.chats.length === 0">
               <div class="shepherd-empty">No chats being monitored. Chats will appear here when the agent runs.</div>
             </template>

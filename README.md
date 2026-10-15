@@ -14,6 +14,17 @@
 > a periodic health check that can bring work into existence, not just react (off by
 > default; wake ceiling 0 = off).
 
+> **v1.23.0** closes the gap a live 6-hour provider-exhaustion loop exposed: a running chat
+> cycling "All chat model candidates exhausted" retries is now categorized
+> `provider_exhaustion`, **held** (no nudges — a rate-limited chat cannot be continued into
+> working), paged once, and optionally killed after `exhaustion_kill_after_minutes` (off by
+> default). Also: the streaming false-positive fix (a long streamed reply no longer reads as
+> a "spinning dead loop", which makes `wedge_soft_restart` safe to enable), opt-in one-shot
+> stall escalation to a soft restart after nudges are exhausted, opt-in
+> substantive-progress liveness (`no_response_minutes`), and **durable alert rows** — pages
+> now survive restarts as an unread alert banner + sidebar badge instead of vanishing
+> 3-second toasts, with an Acknowledge button (`/ack`).
+
 An Agent Zero agent is not always working, even when it looks busy. A chat can stall
 after a tool call, hang on a long streaming request, forget to close its goal, or
 silently die mid-task while the UI still shows a spinner. Chat Shepherd is a
@@ -122,6 +133,10 @@ The most useful knobs:
 | `wedge_nudge_after_minutes` | `10` | Frozen-log delay before wedge Tier 1 fires. |
 | `wedge_max_remediations` | `2` | Wedge attempts before escalation (0 disables). |
 | `wedge_soft_restart` | `false` | Tier 2: kill the hung task and re-nudge. Off by default so long streaming calls are never killed. |
+| `exhaustion_minutes` | `20` | Running chat cycling provider-exhaustion retries with no response → held + paged once (category `provider_exhaustion`). |
+| `exhaustion_kill_after_minutes` | `0` | Kill the futile retry task after this long (0 = never; a recovered provider can still finish unattended). |
+| `no_response_minutes` | `0` | Running + entries advancing + no NEW assistant response for N min → classic wedge ladder (`spinning_soft`). 0 = off. |
+| `stall_escalate_to_restart` | `false` | One soft restart after the nudge budget is exhausted, before `intervention`. |
 | `notify_after_minutes` | `30` | "Quiet bell": page only after the chat needs help this long. `0` = page immediately. |
 | `supervised_mode` | `false` | Queue editable drafts instead of auto-sending nudges. |
 | `save_state_interval_seconds` | `120` | Rate-limits quiet-tick `state.json` rewrites. |

@@ -31,6 +31,13 @@ from usr.plugins.chat_shepherd.helpers.constants import (
     WEDGE_MAX_REMEDIATIONS,
     WEDGE_LIVENESS_PROBE,
     WEDGE_REMEDIATION_COOLDOWN_MIN,
+    CATEGORY_PROVIDER_EXHAUSTION,
+    EXHAUSTION_REASON_PREFIX,
+    NO_RESPONSE_REASON_PREFIX,
+    LIVENESS_SPINNING_SOFT,
+    STALL_RESTART_REASON,
+    EXHAUSTION_HOLD_MIN,
+    ALERTS_MAX,
     PLUGIN_NAME,
     MAX_TRACKED_CHATS,
     CHAT_ID_PATTERN,
@@ -64,6 +71,8 @@ _HK_AGE = re.compile(r'%s \((\d+)m' % re.escape(HK_REASON_PREFIX))
 _BUDGET_KEY_WAL = {
     'restart_resume': 'nudge_count',
     'stall_nudge': 'nudge_count',
+    'stall_restart': 'nudge_count',
+    'exhaustion_kill': 'nudge_count',
     'wedge_auto_continue': 'wedge_nudge_count',
     'wedge_soft_restart': 'wedge_nudge_count',
 }
@@ -774,6 +783,9 @@ def _notify_framework(kind: str, message: str, priority: str = 'normal') -> bool
     # so the /test_notify endpoint can verify it in isolation. Returns
     # True when NotificationManager accepted the notification; failures
     # log notify_fail exactly like the original inline block.
+    # v1.23.0: display_time=15 — the default is a 3-second toast, which is
+    # how an operator who walked away never sees the page they are being
+    # paged about.
     try:
         from helpers.notification import (
             NotificationManager,
@@ -789,7 +801,7 @@ def _notify_framework(kind: str, message: str, priority: str = 'normal') -> bool
             NotificationPriority.HIGH if priority == 'high' else NotificationPriority.NORMAL
         )
         NotificationManager.send_notification(
-            ntype, npri, message, title='Chat Shepherd'
+            ntype, npri, message, title='Chat Shepherd', display_time=15
         )
         return True
     except Exception as e:
@@ -797,15 +809,63 @@ def _notify_framework(kind: str, message: str, priority: str = 'normal') -> bool
         return False
 
 
+def _fold_alert(state: dict, chat_id: str, kind: str, message: str) -> None:
+    # v1.23.0: durable alert fold. The in-framework notification is an
+    # in-memory 3-second toast wiped on restart (helpers/notification.py) and
+    # visible only to a connected browser, so an operator returning after
+    # hours sees NOTHING — on the live incident 8 chats sat in intervention
+    # invisibly. Every page is folded into state['alerts'] keyed chat_id|kind:
+    # re-pages of the same episode UPDATE the row's count instead of stacking.
+    # Capped at ALERTS_MAX (oldest last_at dropped). Journals nothing: the
+    # fold IS the record, and unknown top-level state keys round-trip through
+    # load/save and force an immediate save via the state signature.
+    try:
+        alerts = state.get('alerts')
+        if not isinstance(alerts, dict):
+            alerts = {}
+            state['alerts'] = alerts
+        key = f'{chat_id or ""}|{kind or ""}'
+        now_iso = datetime.now(timezone.utc).isoformat()
+        row = alerts.get(key)
+        if isinstance(row, dict):
+            row['message'] = str(message)[:500]
+            row['last_at'] = now_iso
+            row['count'] = _as_int(row.get('count', 0)) + 1
+        else:
+            alerts[key] = {
+                'chat_id': chat_id or '',
+                'kind': kind or '',
+                'message': str(message)[:500],
+                'first_at': now_iso,
+                'last_at': now_iso,
+                'count': 1,
+            }
+        excess = len(alerts) - ALERTS_MAX
+        if excess > 0:
+            oldest = sorted(
+                alerts.keys(),
+                key=lambda k: str(alerts[k].get('last_at', ''))
+                if isinstance(alerts[k], dict) else '',
+            )
+            for k in oldest[:excess]:
+                alerts.pop(k, None)
+    except Exception as e:
+        _debug_log('alert_fold_fail', repr(e))
+
+
 def _notify(kind: str, message: str, priority: str = 'normal', cfg: dict | None = None,
-            state: dict | None = None) -> bool:
+            state: dict | None = None, chat_id: str = '') -> bool:
     # R2/R3: central notification helper. Returns True when the
     # in-framework notification was accepted; failures are logged,
     # never silently swallowed. R3: also fans out to optional
     # external channels (webhook/Telegram) without blocking.
     # v1.19.0: the framework leg moved verbatim to _notify_framework.
+    # v1.23.0: pages are additionally folded into the durable
+    # state['alerts'] rows (chat_id keys the fold when the caller has it).
     fw_ok = _notify_framework(kind, message, priority)
     try:
+        if isinstance(state, dict):
+            _fold_alert(state, chat_id, kind, message)
         # v1.21.0 (A9): the fallback now goes through the v1.20.3 seam instead
         # of `plugins.get_plugin_config` directly. Calling it directly
         # violated the "no runtime path may call it directly" rule and, being
@@ -957,6 +1017,35 @@ def classify_chat(
         if _progress.startswith('Infection check:') and 'passed' not in _progress:
             return STATUS_RUNNING, f'Safety check in progress ({_progress})'
 
+        # v1.23.0 provider-exhaustion retry loop: a running chat cycling
+        # "All chat model candidates exhausted"/"Critical error occurred,
+        # retrying..." markers (stamped by tick()) with no assistant response.
+        # Specific beats general: checked BEFORE the frozen-clock wedge,
+        # because the loop's warning entries ADVANCE the log and the wedge
+        # clock never starts. Nudging a rate-limited chat is futile, so this
+        # is intervention-for-a-human with the ladder suppressed downstream.
+        _ex_since = str(prev_entry.get('exhaustion_since', '') or '')
+        if _ex_since:
+            _ex_age = _minutes_since(_parse_dt(_ex_since))
+            if _as_float(cfg.get('exhaustion_minutes', 20), 20.0) <= _ex_age:
+                return STATUS_INTERVENTION, (
+                    f'{EXHAUSTION_REASON_PREFIX} ({_ex_age:.0f}m, '
+                    f'{_as_int(prev_entry.get("exhaustion_count", 0))} retry '
+                    'markers, no assistant response)'
+                )
+        # v1.23.0 substantive-progress liveness: entries advancing but no NEW
+        # assistant response for N minutes (0 = off) is `spinning_soft` — the
+        # wedge ladder can drain it with a tier-1 continue (unlike the hard
+        # spinning verdict, these code paths reach safe points).
+        _nr_since = str(prev_entry.get('no_response_since', '') or '')
+        if _nr_since and _as_float(cfg.get('no_response_minutes', 0), 0.0) > 0:
+            _nr_age = _minutes_since(_parse_dt(_nr_since))
+            if _nr_age >= _as_float(cfg.get('no_response_minutes', 0), 0.0):
+                return STATUS_INTERVENTION, (
+                    f'{NO_RESPONSE_REASON_PREFIX} {_nr_age:.0f}m '
+                    '(entries advancing, no response)'
+                )
+
         # P3 (v1.1.0), superseded in v1.2.0: frozen != stalled. A running
         # context whose log stopped growing for stall_minutes is wedged and
         # classified as intervention — but it is no longer left for a human
@@ -996,6 +1085,36 @@ def classify_chat(
 
     if _check_error_file(chat_id):
         return STATUS_ERROR, 'Chat has error.txt'
+
+    # v1.23.0 post-kill hold: after the exhaustion kill the chat is stopped
+    # with the failing retry tail still newest — which is also a fatal-log
+    # tail by construction, so this MUST precede the v1.18.1 fatal guard.
+    # Without the hold, the stall ladder would start nudging the chat back
+    # into the exhausted provider and the tail's 429 fragments would classify
+    # it auth (BLOCK). Held for a human until a human turn or a fresh
+    # response arrives, or the window expires.
+    _pk_at = str(prev_entry.get('provider_exhausted_at', '') or '')
+    if _pk_at and bool(cfg.get('diagnose_enabled', True)):
+        _pk_dt = _parse_dt(_pk_at)
+        _pk_ts = _pk_dt.timestamp() if _pk_dt else 0.0
+        _scan_view = view if view is not None else (
+            _log_snapshot(context) if context is not None else None
+        )
+        _resp_ts = diag_mod.last_response_at(_scan_view)
+        _hum_ts = diag_mod.last_human_user_at(_scan_view)
+        _pk_cleared = bool(
+            _pk_ts
+            and ((_resp_ts and _resp_ts > _pk_ts) or (_hum_ts and _hum_ts > _pk_ts))
+        )
+        if (
+            not _pk_cleared
+            and _pk_dt
+            and _minutes_since(_pk_dt) < EXHAUSTION_HOLD_MIN
+        ):
+            return STATUS_INTERVENTION, (
+                f'{EXHAUSTION_REASON_PREFIX}: killed futile retry task, '
+                'holding until human or provider window resets'
+            )
 
     # v1.18.1: a chat that stopped on an error or a security termination
     # (e.g. infection check) is an error, not a stall — auto-nudging it
@@ -1048,6 +1167,15 @@ def classify_chat(
 
     if minutes_idle > stall_minutes:
         if nudge_count >= max_nudges:
+            # v1.23.0: escalation instead of giving up — exactly ONE soft
+            # restart per stall episode (kill the dead task + framework nudge
+            # prompt) before flipping to intervention. `ctx.nudge()`'s
+            # kill_process is a no-op on an already-dead task, so this is
+            # mechanically safe; budget 1 per episode, reset on recovery.
+            if bool(cfg.get('stall_escalate_to_restart', False)) and _as_int(
+                prev_entry.get('stall_restart_count', 0)
+            ) < 1:
+                return STATUS_NUDGED, STALL_RESTART_REASON
             if bool(cfg.get('intervention_after_failed_nudges', True)):
                 return (
                     STATUS_INTERVENTION,
@@ -1408,6 +1536,15 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     # spinning dead loop via the log mutation counter. Off = legacy.
     wedge_probe = bool(cfg.get('wedge_liveness_probe', WEDGE_LIVENESS_PROBE))
 
+    # v1.23.0: provider-exhaustion loops + substantive-progress liveness +
+    # the stall-escalation restart. All three degrade to shipped defaults on
+    # a hand-edited value (the _as_float contract).
+    exhaustion_minutes = _as_float(cfg.get('exhaustion_minutes', 20), 20.0)
+    exhaustion_kill_after = _as_float(
+        cfg.get('exhaustion_kill_after_minutes', 0), 0.0)
+    no_response_minutes = _as_float(cfg.get('no_response_minutes', 0), 0.0)
+    stall_escalate = bool(cfg.get('stall_escalate_to_restart', False))
+
     # R4 adaptive thresholds: opt-in learning overlay. evaluate() updates
     # the learned values (persisted under state['adaptive']) at most every
     # adaptive_interval_minutes using journal-windowed outcome rates; a
@@ -1481,6 +1618,10 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
         'inflight_abandoned': 0,
         'actions_withheld': '',
         'wakes': 0,
+        # v1.23.0: exhaustion loops, exhaustion kills, stall restarts.
+        'provider_exhausted': 0,
+        'exhaustion_kills': 0,
+        'stall_restarts': 0,
     }
     summary['adaptive'] = adaptive_tag
 
@@ -1490,6 +1631,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     resume_queue: list[tuple[float, str, Any, dict, str, Any]] = []
     resumed_names: list[str] = []
     wedge_queue: list[tuple[float, str, Any, dict, float]] = []
+    # v1.23.0 feature C: one soft restart per stall episode (drain below).
+    stall_restart_queue: list[tuple[float, str, Any, dict, float]] = []
     # v1.22.0 (stage 2): NEW blocked transitions, applied post-loop under a
     # per-tick budget; the rest re-evaluate on the next tick.
     block_queue: list[tuple[str, str, str, dict]] = []
@@ -1598,7 +1741,20 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   prev_updates = _as_int(prev.get('last_updates_len', -1), -1)
                   if cur_updates >= 0 and prev_updates >= 0:
                       if cur_updates > prev_updates:
-                          liveness = 'spinning'
+                          # v1.23.0: mutations advancing while entries are
+                          # frozen is ALSO the signature of healthy STREAMING
+                          # — the response LogItem is created once and updated
+                          # in place per streamed chunk, so a long streamed
+                          # reply looks exactly like a spinning dead loop
+                          # here. An in-flight model call/streamed response
+                          # (last entry is the agent/response item) is not a
+                          # dead loop: no verdict. Without this, enabling
+                          # wedge_soft_restart would kill the agent
+                          # mid-stream on the first frozen clock check.
+                          if view.last_type in ('agent', 'response'):
+                              liveness = ''
+                          else:
+                              liveness = 'spinning'
                       elif cur_updates == prev_updates:
                           liveness = 'hung'
                   prev['liveness'] = liveness
@@ -1608,6 +1764,79 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               # v1.2.0: the log grew again (or the task stopped) - a pending
               # wedge remediation either worked or is moot; credit it if recent.
               _record_wedge_outcome(state, chat_id, now_iso)
+
+          # v1.23.0 exhaustion + substantive-progress tracking. The stamps
+          # feed classify_chat below; recovery = a fresh assistant response
+          # or a genuine human turn newer than the episode start.
+          if diag_enabled:
+              try:
+                  _hum_ts = diag_mod.last_human_user_at(view)
+                  _resp_ts = diag_mod.last_response_at(view)
+                  # post-kill hold upkeep: cleared by human/response, or by
+                  # expiry (classify stops holding; the stamp must too).
+                  if prev.get('provider_exhausted_at', ''):
+                      _pk_dt = _parse_dt(prev['provider_exhausted_at'])
+                      _pk_ts = _pk_dt.timestamp() if _pk_dt else 0.0
+                      if (
+                          _pk_ts
+                          and (
+                              (_resp_ts and _resp_ts > _pk_ts)
+                              or (_hum_ts and _hum_ts > _pk_ts)
+                          )
+                      ) or (_pk_dt and _minutes_since(_pk_dt) >= EXHAUSTION_HOLD_MIN):
+                          prev.pop('provider_exhausted_at', None)
+                          prev.pop('provider_exhausted_killed', None)
+                  # post-detection hold upkeep: same clearing rule while the
+                  # episode is over (chat no longer cycling markers).
+                  _ex_matched = False
+                  _ex_count = 0
+                  if ctx.is_running():
+                      _ex_matched, _ex_count, _ex_txt = diag_mod.exhaustion_loop(view)
+                      if _ex_matched:
+                          if not prev.get('exhaustion_since', ''):
+                              prev['exhaustion_since'] = now_iso
+                          prev['exhaustion_count'] = _ex_count
+                          prev['last_exhaustion_text'] = str(_ex_txt)[:200]
+                      elif prev.get('exhaustion_since', ''):
+                          _ex_ts = _parse_dt(prev['exhaustion_since'])
+                          if _ex_ts is not None and (
+                              (_resp_ts and _resp_ts > _ex_ts.timestamp())
+                              or (_hum_ts and _hum_ts > _ex_ts.timestamp())
+                          ):
+                              prev['exhaustion_since'] = ''
+                              prev['exhaustion_count'] = 0
+                              prev['exhaustion_notified_at'] = ''
+                              state_mod.append_history(state, {
+                                  'chat_id': chat_id,
+                                  'action': 'provider_exhaustion_resolved',
+                                  'detail': 'response or human turn newer than episode',
+                                  'timestamp': now_iso,
+                              })
+                      # v1.23.0 feature B: entries advancing but the newest
+                      # assistant response is older than no_response_minutes.
+                      if no_response_minutes > 0:
+                          _resp_old = not _resp_ts or (
+                              (time.time() - _resp_ts) / 60.0 > no_response_minutes
+                          )
+                          if (
+                              cur_log_len >= 0 and prev_log_len >= 0
+                              and cur_log_len > prev_log_len and _resp_old
+                          ):
+                              if not prev.get('no_response_since', ''):
+                                  prev['no_response_since'] = now_iso
+                              # Re-stamp every active tick: the growth branch
+                              # above wiped `liveness` again this tick.
+                              prev['liveness'] = LIVENESS_SPINNING_SOFT
+                          elif prev.get('no_response_since', ''):
+                              # a fresh response landed (or entries did not
+                              # advance): the soft verdict is moot.
+                              prev['no_response_since'] = ''
+                              if prev.get('liveness', '') == LIVENESS_SPINNING_SOFT:
+                                  prev['liveness'] = ''
+              except Exception as e:
+                  # Best-effort: a bad state value here must not sink the
+                  # per-chat pass (same contract as the reset loop).
+                  _debug_log('exhaustion_track_fail', chat_id + ' ' + repr(e))
 
           # v1.22.0 (stage 2): a blocked chat is released by a human, never
           # by the ladder. Release = a genuine human turn newer than
@@ -1664,6 +1893,20 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               )
               _cat = _fp['category']
               _cat_sig = _fp['signature']
+              # v1.23.0: the classifier's exhaustion verdict outranks the
+              # fragment text. During a retry storm the same tail carries
+              # RateLimitError/traceback/429 fragments that rotate the
+              # fingerprint between auth/rate_limit/network every tick (the
+              # live incident flickered auth <-> framework_crash every ~15
+              # min) — and an auth fragment would BLOCK a chat that only
+              # needs a provider window reset. The sustained loop is ONE
+              # category: provider_exhaustion, which plan_seam HOLDs
+              # (outside auto_remediate_categories, outside NEVER_REMEDIATE).
+              if reason.startswith(EXHAUSTION_REASON_PREFIX):
+                  _cat = CATEGORY_PROVIDER_EXHAUSTION
+                  _cat_sig = diag_mod.signature(_cat, reason)
+                  _fp['source'] = 'classify'
+                  _fp['excerpt'] = diag_mod.excerpt(reason)
               if diag_mod.category_changed(prev.get('category', 'none'), _cat):
                   prev['category_since'] = now_iso
                   state_mod.append_history(state, {
@@ -1872,13 +2115,108 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                       )
                       if gate_verdict == planner_mod.ACT and _can_act:
                           wedge_queue.append((hk_age, chat_id, ctx, entry, now_iso))
+              elif reason.startswith(NO_RESPONSE_REASON_PREFIX):
+                  # v1.23.0: entries advancing but no assistant response for
+                  # N minutes (feature B). These code paths reach intervention
+                  # safe points between entries, so they route down the
+                  # CLASSIC ladder below (tier-1 continue; kill only on the
+                  # final attempt with wedge_soft_restart) — the drain's
+                  # spinning skip only matches the hard 'spinning' verdict.
+                  summary['wedged'] += 1
+                  wedge_count = _as_int(prev.get('wedge_nudge_count', 0))
+                  last_wedge_dt = _parse_dt(prev.get('last_wedge_nudge_at', ''))
+                  wedge_cooldown_ok = _minutes_since(last_wedge_dt) >= wedge_cooldown
+                  if (
+                      wedge_max_remediations > 0
+                      and wedge_count < wedge_max_remediations
+                      and wedge_cooldown_ok
+                      and not _term_cooldown_active
+                      and getattr(ctx, 'type', None) == AgentContextType.USER
+                      and gate_verdict == planner_mod.ACT
+                      and _can_act
+                  ):
+                      _nr_dt = _parse_dt(prev.get('no_response_since', ''))
+                      # Unknown stamp age = queue last (9999 sorts after everything).
+                      _nr_urgency = _minutes_since(_nr_dt) if _nr_dt else 9999.0
+                      wedge_queue.append((_nr_urgency, chat_id, ctx, entry, now_iso))
+              elif reason.startswith(EXHAUSTION_REASON_PREFIX):
+                  # v1.23.0: a provider-exhaustion retry loop. Held for a
+                  # human (the fingerprint override maps it to the HOLDed
+                  # provider_exhaustion category), paged ONCE, never nudged.
+                  summary['provider_exhausted'] += 1
+                  if not prev.get('exhaustion_notified_at', ''):
+                      entry['exhaustion_notified_at'] = now_iso
+                      state_mod.append_history(state, {
+                          'chat_id': chat_id,
+                          'action': 'provider_exhaustion_page',
+                          'detail': str(reason)[:200],
+                          'timestamp': now_iso,
+                      })
+                      if notify_on_intervention and not _notify(
+                          'warning',
+                          f'Chat {fname!r} ({chat_id}) is stuck in a '
+                          f'provider-exhaustion retry loop: {reason}. No '
+                          'nudges will be sent; it needs a human or a '
+                          'provider window reset.',
+                          priority='high',
+                          cfg=cfg,
+                          state=state,
+                          chat_id=chat_id,
+                      ):
+                          summary['notify_failures'] += 1
+                  # Optional kill of the futile loop (opt-in; off by
+                  # default). kill_process() is a non-blocking future.cancel
+                  # safe from this thread; deliberately NO fresh chain — a
+                  # new task would re-enter the same exhausted provider.
+                  # After the kill the post-kill hold keeps the chat
+                  # intervention and the planner keeps it HOLD until a human
+                  # turn, a fresh response, or the hold window expires.
+                  if (
+                      exhaustion_kill_after > 0
+                      and ctx.is_running()
+                      and not prev.get('provider_exhausted_killed', '')
+                      and getattr(ctx, 'type', None) == AgentContextType.USER
+                      and gate_verdict != planner_mod.BLOCK
+                      and _can_act
+                      and _minutes_since(
+                          _parse_dt(prev.get('exhaustion_since', ''))
+                      ) >= exhaustion_kill_after
+                  ):
+                      if inflight_on:
+                          _wal_id = state_mod.begin_inflight(
+                              state, 'exhaustion_kill', chat_id, 2)
+                      try:
+                          ctx.kill_process()
+                          entry['provider_exhausted_at'] = now_iso
+                          entry['provider_exhausted_killed'] = now_iso
+                          entry['status'] = STATUS_INTERVENTION
+                          entry['last_classification'] = (
+                              'Provider exhaustion loop: killed the futile '
+                              'retry task (no auto-restart)'
+                          )
+                          summary['exhaustion_kills'] += 1
+                          state_mod.append_history(state, {
+                              'chat_id': chat_id,
+                              'action': 'exhaustion_kill',
+                              'detail': str(reason)[:200],
+                              'timestamp': now_iso,
+                          })
+                          if inflight_on:
+                              state_mod.end_inflight(state, _wal_id)
+                      except Exception as e:
+                          _debug_log('exhaustion_kill_fail', chat_id + ' ' + repr(e))
               # v1.7.0 quiet bell: persistence-gated paging. A fresh episode starts
               # the clock silently; the bell rings only once the chat has
               # persistently needed human help for >= notify_after minutes
               # (0 = page immediately). notify_rearm re-pages an ongoing
               # episode (0 = one page per episode). Self-healed episodes (e.g.
               # the wedge auto-continue worked) never page.
-              if notify_on_intervention:
+              # v1.23.0: the exhaustion arm pages once itself (with its own
+              # message), so the generic bell is suppressed for it — the
+              # dedicated page replaces it, not double-pages it.
+              if notify_on_intervention and not reason.startswith(
+                  EXHAUSTION_REASON_PREFIX
+              ):
                   since_dt = _parse_dt(prev.get('intervention_since', ''))
                   if since_dt is None:
                       entry['intervention_since'] = now_iso
@@ -1898,6 +2236,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                               priority='high',
                               cfg=cfg,
                               state=state,
+                              chat_id=chat_id,
                               ):
                               summary['notify_failures'] += 1
                           entry['intervention_notify_at'] = now_iso
@@ -1932,6 +2271,16 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               summary['blocked'] += 1
           elif new_status == STATUS_IDLE:
               summary['idle'] += 1
+          elif new_status == STATUS_NUDGED:
+              # v1.23.0 feature C: classify queued exactly one soft restart
+              # after nudge exhaustion; the drain below delivers it
+              # (budget 1 per stall episode).
+              if stall_escalate and reason == STALL_RESTART_REASON:
+                  minutes_idle = _minutes_since(
+                      _parse_dt(getattr(ctx, 'last_message', '')))
+                  stall_restart_queue.append(
+                      (minutes_idle, chat_id, ctx, entry, now_iso)
+                  )
         except Exception as e:
             # Best-effort: keep the other chats supervised and make the
             # failure visible instead of silently losing supervision.
@@ -2136,6 +2485,48 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 'timestamp': now_iso,
             })
 
+    # v1.23.0 feature C drain: exactly ONE soft restart per stall episode,
+    # after the stall ladder exhausted its nudges (escalation instead of
+    # giving up, opt-in via stall_escalate_to_restart). ctx.nudge() kills a
+    # still-alive hung task AND re-sends the framework nudge prompt; on the
+    # already-dead stalled task the kill is a no-op and the fresh chain just
+    # carries the prompt. Budget 1 per episode (stall_restart_count), reset
+    # when the chat recovers — a restart loop is structurally impossible.
+    if stall_restart_queue:
+        stall_restart_queue.sort(key=lambda item: item[0], reverse=True)
+        for _sr_idle, chat_id, ctx, entry, now_iso in stall_restart_queue:
+            if _as_int(entry.get('stall_restart_count', 0)) >= 1:
+                continue
+            if inflight_on:
+                _wal_id = state_mod.begin_inflight(state, 'stall_restart', chat_id, 1)
+            try:
+                ctx.nudge()
+            except Exception as e:
+                _debug_log('stall_restart_fail', chat_id + ' ' + repr(e))
+                continue
+            entry['nudge_count'] = _as_int(entry.get('nudge_count', 0)) + 1
+            entry['nudges_sent'] = _as_int(entry.get('nudges_sent', 0)) + 1
+            entry['stall_restart_count'] = (
+                _as_int(entry.get('stall_restart_count', 0)) + 1
+            )
+            entry['last_nudge_at'] = now_iso
+            entry['status'] = STATUS_NUDGED
+            entry['last_classification'] = (
+                f'Soft restart after nudges exhausted '
+                f'(restart {entry["stall_restart_count"]}/1)'
+            )
+            if inflight_on:
+                try:
+                    state_mod.end_inflight(state, _wal_id)
+                except Exception:
+                    pass
+            summary['stall_restarts'] += 1
+            state_mod.append_history(state, {
+                'chat_id': chat_id,
+                'action': 'stall_restart',
+                'timestamp': now_iso,
+            })
+
     # v1.22.0 (stage 2): apply NEW blocked transitions, with a per-tick
     # budget (1-5, scaled by how many chats are already blocked) so one
     # chaotic tick cannot block half the fleet — the rest re-evaluate on
@@ -2176,6 +2567,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                     priority='high',
                     cfg=cfg,
                     state=state,
+                    chat_id=_b_id,
                 ):
                     summary['notify_failures'] += 1
 
@@ -2215,6 +2607,9 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 continue
             entry['nudge_count'] = 0
             entry['last_nudge_at'] = ''
+            # v1.23.0: the one-restart-per-episode budget clears with the
+            # recovery, like the other ladder budgets.
+            entry['stall_restart_count'] = 0
             # v1.2.0: wedge budget clears on recovery (crediting already
             # happened in the frozen-clock reset above, when applicable).
             entry['wedge_nudge_count'] = 0
@@ -2378,6 +2773,21 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
         (state.get('selfcheck') or {}).get('consecutive_tick_failures'), 0
     ) if isinstance(state.get('selfcheck'), dict) else 0
     try:
+        # v1.23.0: did alerts fire in the last 24h, and does any external
+        # channel exist to have carried them? Feeds the no_alert_channel
+        # info finding — dashboard-only alerting becomes visible.
+        _alerts_recent = 0
+        _alerts_map = state.get('alerts')
+        if isinstance(_alerts_map, dict):
+            for _row in _alerts_map.values():
+                if not isinstance(_row, dict):
+                    continue
+                try:
+                    _row_dt = _parse_dt(str(_row.get('last_at', '') or ''))
+                except Exception:
+                    _row_dt = None
+                if _row_dt is not None and _minutes_since(_row_dt) < 1440.0:
+                    _alerts_recent += 1
         _findings = selfcheck_mod.evaluate(
             {
                 'last_tick': _prev_tick_iso,
@@ -2391,6 +2801,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 'save_failures': _save_failures,
                 'action_cap_reached': False,
                 'blocked_external': len(_ext_blocks),
+                'alerts_recent': _alerts_recent,
+                'channels_configured': bool(notify_mod.configured_channels(cfg)),
                 'wake_cap_reached': bool(cfg.get('continuity_enabled', False))
                 and planner_mod.wakes_used(state)
                 >= max(0, int(_as_float(cfg.get('continuity_max_wakes_per_day'), 12))),

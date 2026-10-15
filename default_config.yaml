@@ -95,6 +95,25 @@ wedge_soft_restart: false
 # v1.10.0 liveness probe: classify wedges via the log mutation counter
 # (hung call vs spinning dead loop). Off restores the legacy ladder.
 wedge_liveness_probe: true
+# v1.23.0 provider-exhaustion retry loops: a running chat cycling "All chat
+# model candidates exhausted"/"Critical error occurred, retrying..." with no
+# assistant response for exhaustion_minutes is categorized provider_exhaustion
+# and HELD (no nudges — a rate-limited chat cannot be continued into working),
+# paged once per episode, and optionally killed when the futile loop has
+# burned for exhaustion_kill_after_minutes (0 = never kill; a provider that
+# recovers mid-run can still finish the job unattended).
+exhaustion_minutes: 20
+exhaustion_kill_after_minutes: 0
+# v1.23.0 substantive-progress liveness: when on (>0), a running chat whose
+# log entries keep advancing but that has produced no NEW assistant response
+# for N minutes is treated as spinning_soft and routed down the classic wedge
+# ladder (tier-1 continue first). 0 disables (default — retry markers alone
+# already own the exhaustion class).
+no_response_minutes: 0
+# v1.23.0 stall escalation: when on, once max_auto_nudges are exhausted the
+# chat gets exactly ONE soft restart (kill the dead task + framework nudge
+# prompt) before flipping to intervention — escalation instead of giving up.
+stall_escalate_to_restart: false
 # R4 adaptive thresholds: opt-in feedback loop. When enabled, accumulated
 # nudge/wedge remediation outcomes tune the three timing thresholds
 # (nudge_cooldown_minutes, wedge_nudge_after_minutes,

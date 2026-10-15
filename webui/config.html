@@ -288,6 +288,37 @@ Chat Shepherd
 <small class="hint">A running chat that stops producing log output is "wedged". After the grace period it gets an automatic "continue" (the same nudge that fixes it manually). When remediations are exhausted and this toggle is on, the final attempt kills the hung task and re-sends the framework nudge — this loses the hung call's partial result. Max remediations 0 disables wedge auto-recovery.</small>
 </div>
 
+<div class="cs-card">
+<h4>Provider exhaustion retry loops</h4>
+<div class="cs-row">
+<div>
+<label>Loop sustained for (minutes) → hold</label>
+<input type="number" min="2" max="240" x-model.number="config.exhaustion_minutes" />
+</div>
+<div>
+<label>Kill the futile task after (minutes, 0 = never)</label>
+<input type="number" min="0" max="720" x-model.number="config.exhaustion_kill_after_minutes" />
+</div>
+</div>
+<small class="hint">A running chat cycling "All chat model candidates exhausted" / "Critical error occurred, retrying..." (e.g. a provider 429 quota limit) with no assistant response is held for you and paged ONCE — nudging a rate-limited chat is futile. While held it keeps retrying, so a provider that recovers mid-run can still finish the job unattended. The optional kill cancels the futile task after N minutes and leaves the chat cleanly stopped for a human (nothing is auto-restarted — a new task would just re-enter the exhausted provider).</small>
+<label style="display: block; margin: 8px 0 0 0;">
+<input type="checkbox" x-model="config.stall_escalate_to_restart" />
+<strong>Soft-restart a stalled chat once after nudges are exhausted</strong>
+</label>
+<small class="hint">Escalation instead of giving up: when max auto-nudges fail, one final soft restart (kill the dead task + framework resume prompt) is attempted before the chat flips to intervention. Exactly one per stall episode — a restart loop is impossible.</small>
+</div>
+
+<div class="cs-card">
+<h4>Substantive-progress liveness (experimental)</h4>
+<div class="cs-row">
+<div>
+<label>Running but no assistant response for (minutes, 0 = off)</label>
+<input type="number" min="0" max="240" x-model.number="config.no_response_minutes" />
+</div>
+</div>
+<small class="hint">Catches spinning classes the frozen-log wedge detector cannot see (entries keep advancing but nothing is produced — retry storms, silent loops). Treated as "spinning softly": it gets the regular auto-continue ladder, not a kill. The provider-exhaustion rule above already owns its specific case; keep this off unless you see other spin classes.</small>
+</div>
+
 <div class='cs-card'>
 <h4>Adaptive thresholds (experimental)</h4>
 <label style='display: block; margin: 4px 0;'>

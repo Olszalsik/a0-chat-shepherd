@@ -45,6 +45,10 @@ HC_EXTERNAL_BLOCKS = 'external_blocks'
 HC_WAKE_CAP = 'wake_cap_reached'
 HC_ACTION_CAP = 'action_cap_reached'
 HC_LOOP_SUSPENDED = 'loop_suspended'
+# v1.23.0: alerts fired recently but every page went to the in-memory toast
+# only — the operator is not told out-of-band. Info severity by design: the
+# dashboard IS the channel, this only makes its limits visible.
+HC_NO_ALERT_CHANNEL = 'no_alert_channel'
 
 FINDING_SEVERITIES = {
     HC_FIRST_RUN: 'info',
@@ -59,6 +63,7 @@ FINDING_SEVERITIES = {
     HC_WAKE_CAP: 'info',
     HC_ACTION_CAP: 'info',
     HC_LOOP_SUSPENDED: 'warning',
+    HC_NO_ALERT_CHANNEL: 'info',
 }
 
 HEALTH_OK = 'ok'
@@ -216,6 +221,21 @@ def _evaluate(snapshot: dict[str, Any], cfg: dict[str, Any], now: Any) -> list[d
     if bool(snapshot.get('loop_suspended')):
         findings.append(
             _finding(HC_LOOP_SUSPENDED, 'the tick wrapper is raising; the loop is suspended')
+        )
+
+    # v1.23.0: alerts fired recently while every external channel is unset.
+    # The pages still happened (durable dashboard rows now exist), but nobody
+    # was told out-of-band — make that a visible finding, not a silent gap.
+    alerts_recent = as_int(snapshot.get('alerts_recent'), 0)
+    if alerts_recent > 0 and not bool(snapshot.get('channels_configured')):
+        findings.append(
+            _finding(
+                HC_NO_ALERT_CHANNEL,
+                f'{alerts_recent} alert(s) fired recently but no external '
+                'alert channel (webhook/Telegram) is configured; they are '
+                'dashboard-only',
+                alerts_recent=alerts_recent,
+            )
         )
 
     return findings
