@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.23.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
+**Version:** 1.23.1 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
 
 ## v1.23.0 — provider-exhaustion loops, streaming exemption, durable alerts (2026-10-15)
 
@@ -72,6 +72,108 @@ BLOCKING the chat at one point. Alerting was also structurally invisible
 Status vocabulary unchanged (8 statuses); `provider_exhaustion` is a
 CATEGORY. Suites: backend suite_monitor.py green through TEST55B, node
 suites green with 7 new sidebar assertions.
+
+## v1.23.1 — audit cycle 1 of the 2026-10-15 goal (report → roadmap → fixes)
+
+Comprehensive audit ordered as an explicit goal (audit + roadmap + full
+auto-remediation authorization, then two more full audit/remediation cycles).
+Method: framework-semantics verification (log entry vocabulary, the
+in-place stream-update mechanics, `_error_retry`'s exact LogItems,
+`kill_process`/`nudge` semantics — several claims probe-verified in the
+container) + an independent adversarial review of the v1.23.0 diff. This is
+the report; everything found was then fixed and regression-pinned in this
+release.
+
+### Report — findings (severity-ordered; all fixed below unless noted)
+
+- **P0 ack-never-persists**: `state_signature()`'s basis excluded
+  `alerts`/`alerts_seen_at`, so an ack-only (or fold-only) transaction
+  computed `sig_after == sig_before` and skipped the save — POST /ack
+  returned `success: true` while state.json never gained the stamp; the
+  unread badge never cleared and the ack died on restart. Probe-verified in
+  the container. (`_fold_alert`'s "unknown top-level keys force an immediate
+  save" comment was factually wrong.)
+- **P1 escalation-restart gate bypass**: the `STALL_RESTART_REASON` queue arm
+  checked neither `gate_verdict == ACT`, `_can_act`, nor the termination
+  cooldown — every sibling arm does. Failure: `ctx.nudge()` into a chat
+  another plugin parked (external BLOCK→HOLD), before the block drain; and
+  outside active hours/grace.
+- **P1 loop-break test wrong both ways** (`exhaustion_loop`): the break
+  required "newest relevant entry is not a response". (a) Normal mid-turn
+  work has a TOOL newest → a >exhaustion_minutes healthy turn still holding
+  2 transient retry warnings stayed matched → false hold+page on a healthy
+  chat. (b) A frozen-hung tail with old markers kept matching forever →
+  `exhaustion_last_matched` refreshed forever → the v1.23.0 staleness gate
+  could never engage → the exhaustion arm shadowed the wedge ladder
+  indefinitely (the exact scenario its own comment claimed to fix).
+- **P1 stream wedged anyway**: the streaming exemption cleared only
+  `liveness`; classify's frozen arm never consulted it, so a stream >10m
+  frozen still classified wedged and the (now-active) drain injected a
+  tier-1 continue into a healthy reply (pre-v1.23.0 this state was inert).
+- **P2 stamps re-inherit** across task death / restart-interrupt
+  (`no_response_since`, `liveness=spinning_soft`, exhaustion episode
+  stamps): a restarted chat classified intervention with PRE-restart ages.
+- **P2 supervised escalation loop**: the escalation draft never spent the
+  `stall_restart_count` budget (send→redraft→send loop; the "structurally
+  impossible restart loop" budget only covered the auto path), and could
+  not draft while any other draft existed. New draft kind `stall_restart`
+  added to `resume_draft` (the whitelist silently returned '' → drafted 0).
+- **P2 reconcile gaps**: `stall_restart` reconcile charged `nudge_count`
+  but not the episode budget (failed delivery → second restart in the same
+  episode); `exhaustion_kill` reconcile charged a NUDGE budget and left
+  `provider_exhausted_killed` unset (a second kill attempt possible).
+- **P2 expiry re-entry silent**: hold expiry did not clear
+  `exhaustion_notified_at` → the supervisor's own re-nudge re-firing the arm
+  paged nobody, forever.
+- **P2 unread arithmetic**: `unread = first_at > seen_at` — an upserted
+  (re-paged) row the operator already acked could never be unread again;
+  the read marker is now per-row `last_at`.
+- **P2 info fold**: info pages (restart summaries) folded into the alarm
+  stream and could evict unacknowledged alarm rows at the cap; only
+  warning/error fold now.
+- **P2 dead fast path** (pre-existing since v1.20.1, found in this cycle):
+  the O11 skip read `data-cs-status` from the CONTAINER, which no code ever
+  sets (applyBadge stamps the badge) — every pass took the full anchor walk.
+- **P3**: comment/code mismatch in the freshness window; two uncoerced
+  `wedge_nudges_sent` reads; `last_exhaustion_text` outliving an episode;
+  unparseable hand-edited stamps read 9999m and never resolved; missing
+  trailing newline in api/ack.py.
+
+### Design notes recorded (no code change intended tradeoffs)
+
+- The first `_RULES` entry (provider_exhaustion) also HOLDs genuinely fatal
+  auth crashes whose text mentions a historical retry line — accepted cost
+  of specific-beats-fragments; the row is still held+paged, just not
+  blocked. (P3-17 of the review.)
+- The exhaustion PAGE (unlike the optional KILL) fires for TASK chats too:
+  the scheduler retries its own chats, but the operator still needs to know
+  a task is burning cycles (P3/finding 5-class, deliberate).
+- Feature B (`no_response_minutes`) is tail-bound (last ~50 entries): a
+  chat >50 entries past its last response is flagged even while legitimately
+  working. Default off; the arm uses the classic (nudge-first) ladder.
+
+### Roadmap executed in this cycle (all items above)
+
+Fixed in order: state signature (P0) → gate bypass → scanner ordering
++ marker-recency (`exhaustion_loop` gains `max_marker_age_s`, wired to
+`exhaustion_minutes` as the freshness bound: a live storm's inter-marker
+gap from the incident was ~12 min, so anything tighter would kill a live
+storm-match) → explicit `LIVENESS_STREAMING` verdict + frozen-arm
+recognition → death/restart stamp clearing (non-running branch + budget
+reset unchanged) → supervised budget spend → reconcile charges
+(`stall_restart_count`, `provider_exhausted_killed`) → expiry clears
+`exhaustion_notified_at` → unread keyed on `last_at` → info-fold gate →
+fast path reads the badge attr → P3 set → suites → this document.
+
+### Regression pins added
+
+TEST53C (stale exhaustion stamp must NOT shadow the wedged verdict; fresh
+stamp must), TEST54B (supervised escalation drafts + budget spend),
+TEST53A strengthened (explicit 'streaming' value; stream never wedged or
+nudged — second-frozen-tick sequence), sidebar suite scenarios 12/12b/12d
+(alert badge paint/ack-removal/re-key-with-different-count; 46 assertions).
+Container probes (sandbox temp dirs) for the ack/fold signature fix are
+described in the review notes; the suite covers them via TEST55A.
 
 ## v1.22.0 — the chat_shepherd2 merge (2026-10-12)
 

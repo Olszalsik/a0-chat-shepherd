@@ -582,6 +582,10 @@ function ok(condition, message) { assert.ok(condition, message); checks += 1; }
 }
 
 // 12c. The alert badge disappears once the alert is acknowledged.
+// 12d. v1.23.1 (review 13): a RE-KEYED row must re-target the alert badge
+// — Alpine reuses the element, exactly the shape that broke the status
+// badge in scenario 11. Re-key to a chat with a different alert count.
+
 {
   const env = installEnv({
     data: statusData([["chat00an", "stalled"]], {}, [
@@ -599,6 +603,35 @@ function ok(condition, message) { assert.ok(condition, message); checks += 1; }
   ok(!env.document.querySelector(".cs-alert-badge"),
     "acknowledging removes the alert badge but keeps the status badge");
   ok(badgeIn(row), "the status badge survived the ack");
+}
+
+{
+  const env = installEnv({
+    data: statusData([["chat00ao", "intervention"]], {}, [
+      { key: "chat00ao|warning", chat_id: "chat00ao", kind: "warning",
+        count: 3, unread: true, first_at: "t", last_at: "t", message: "old" },
+    ]),
+  });
+  const row = buildRow({ scopeOwner: { item: { id: "chat00ao" } } });
+  env.chatsSection.appendChild(row.li);
+  const api = load();
+  api._test.injectBadges();
+  const before = env.document.querySelector(".cs-alert-badge");
+  ok(before && before.textContent === "3", "precondition: count 3 painted");
+  // re-key: the SAME element now represents a chat with 5 unread pages.
+  env.store.data.alerts = [
+    { key: "chat00ap|warning", chat_id: "chat00ap", kind: "warning",
+      count: 5, unread: true, first_at: "t", last_at: "t", message: "new" },
+  ];
+  env.store.data.chats = [
+    { chat_id: "chat00ap", status: "intervention" },
+  ];
+  row.container.setAttribute("data-folder-thread", "chat00ap");
+  api._test.injectBadges();
+  const after = api && env.document.querySelector(".cs-alert-badge");
+  ok(after === before, "the alert badge element is reused across the re-key");
+  ok(after && after.textContent === "5",
+    "a re-keyed row repaints the alert badge with the new chat's count");
 }
 
 import { readFileSync } from "node:fs";

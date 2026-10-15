@@ -313,18 +313,17 @@
       var status = map[chatId];
       if (!status) {
         if (memo && memo.badge && memo.badge.parentNode) memo.badge.remove();
+        // v1.23.1 (audit A2): the alert badge must go with it — otherwise a
+        // chat that crosses to idle keeps its "unacknowledged" badge in the
+        // DOM with nobody maintaining it.
+        if (memo && memo.alertBadge && memo.alertBadge.parentNode) memo.alertBadge.remove();
+        if (memo) memo.alertBadge = null;
         setMemo(container, chatId, null);
         continue;
       }
 
+      var alertCount = alertCounts[chatId] || 0;
       var glyph = iconFor(s, status);
-      // Configurable "no pictogram" for this state.
-      if (!glyph) {
-        if (memo && memo.badge && memo.badge.parentNode) memo.badge.remove();
-        setMemo(container, chatId, null);
-        continue;
-      }
-
       var label = "Chat Shepherd: " + (LABELS[status] || status);
       var color = colorFor(s, status);
       var existing = memo && memo.badge;
@@ -332,13 +331,24 @@
       // fast-path ones — the status-badge shortcut would otherwise leave a
       // stale alert badge behind until the status itself changed. Compute
       // both, keep the cheap fast path cheap (no anchor walk unless needed).
-      var alertCount = alertCounts[chatId] || 0;
+      // v1.23.1 (audit fix 12): the fast path was DEAD CODE since v1.20.1 —
+      // applyBadge stamps `data-cs-status` on the BADGE, but this test read
+      // it from the container, which no code ever sets, so every pass took
+      // the full anchor walk. Read the attribute from the badge (and drop
+      // its stale textContent check — status changes always move it).
       var fastPath = existing && existing.parentNode
-          && container.getAttribute("data-cs-status") === status
+          && existing.getAttribute("data-cs-status") === status
           && existing.textContent === glyph
           && existing.getAttribute("aria-label") === label;
       var anchor = null;
-      if (fastPath) {
+      if (!glyph) {
+        // v1.23.1 (audit A2): a blanked pictogram for this state removes the
+        // status badge only — the alert badge below is an independent signal
+        // (an unacknowledged page) and must not be suppressed by an icon
+        // preference, nor stranded by the early return this branch replaced.
+        if (existing && existing.parentNode) existing.remove();
+        setMemo(container, chatId, null);
+      } else if (fastPath) {
         if (existing.style.color !== color) existing.style.color = color;
       } else {
         anchor = anchorFor(container);

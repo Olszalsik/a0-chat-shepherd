@@ -5070,7 +5070,21 @@ def main():
         FakeAgentContext._all = [ctx53]
         s53a = monitor.tick(dict(cfg, notify_on_intervention=False))
         st53a = read_state()['chats'][FAKE_CHAT_A]
+        # Freeze stamp tick: liveness is only computed on the SECOND
+        # consecutive frozen tick (the stamp-tick branch runs first) — pin
+        # that no hard verdict appeared yet.
         assert st53a.get('liveness') != 'spinning', st53a
+        # a live stream keeps mutating (chunks); advance the counter the way
+        # a real stream would between two ticks
+        ctx53.log.updates = [1, 2, 3, 4, 5]
+        s53a2 = monitor.tick(dict(cfg, notify_on_intervention=False))
+        st53a2 = read_state()['chats'][FAKE_CHAT_A]
+        # v1.23.1: the stream verdict is the explicit 'streaming' value — and
+        # the frozen arm must NOT wedge it (pre-fix, a long stream was still
+        # classified wedged; the ladder then nudged a healthy reply).
+        assert st53a2.get('liveness') == 'streaming', st53a2
+        assert s53a2.get('wedged') == 0 and s53a2.get('intervention') == 0, s53a2
+        assert len(ctx53.communicated) == 0, 'a stream must never be nudged'
         # the same frozen count with a warning newest is still a dead loop
         ctx53b = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=0, running=True)
         ctx53b.log.logs = [
@@ -5163,6 +5177,56 @@ def main():
         assert st54e['status'] == constants.STATUS_INTERVENTION, st54e
         print('TEST54A_STALL_ESCALATION_OK')
 
+        # TEST54B (v1.23.1 audit A1): supervised mode drafts the escalation
+        # restart instead of auto-sending it.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'stalled', 'nudge_count': 3,
+                          'stall_restart_count': 0, 'last_nudge_at': ''},
+        })
+        ctx54sup = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=60)
+        FakeAgentContext._all = [ctx54sup]
+        s54sup = monitor.tick(dict(
+            cfg54, supervised_mode=True))
+        assert s54sup.get('stall_restarts') == 0, s54sup
+        assert s54sup.get('drafted') == 1, s54sup
+        assert ctx54sup.nudge_calls == 0, ctx54sup.nudge_calls
+        st54sup = read_state()
+        drafts54 = [d for d in st54sup.get('drafts', []) if d.get('chat_id') == FAKE_CHAT_A]
+        assert drafts54 and drafts54[0].get('kind') == 'stall_restart', drafts54
+        print('TEST54B_SUPERVISED_ESCALATION_DRAFTS_OK')
+
+        # TEST53C (v1.23.1 audit A3b): a STALE exhaustion episode (tail no
+        # longer matches, last_matched old) must not hold the classification
+        # when the chat's failure changed shape — the wedged (frozen) verdict
+        # takes over so the ladder keeps its tools.
+        cfg53c = dict(cfg52, exhaustion_minutes=20)
+        ctx53c = FakeCtx(FAKE_CHAT_A, ['user'], idle_minutes=0, running=True)
+        ctx53c.log.logs = [
+            types.SimpleNamespace(type='user', content='go', timestamp=now_ts - 3600),
+            types.SimpleNamespace(type='response', heading='old work',
+                                  content='', timestamp=now_ts - 3500),
+            types.SimpleNamespace(type='tool', heading='', content='work',
+                                  timestamp=now_ts - 120),
+        ]
+        prev53c = {
+            'exhaustion_since': st52,
+            'exhaustion_count': 30,
+            'exhaustion_last_matched': (datetime.now(timezone.utc) - timedelta(minutes=25)).isoformat(),
+            'liveness': 'hung',
+        }
+        status53c, reason53c = monitor.classify_chat(
+            ctx53c, FAKE_CHAT_A, cfg53c, prev53c, 15.0)
+        assert status53c == constants.STATUS_INTERVENTION, (status53c, reason53c)
+        assert reason53c.startswith('Agent appears wedged'), reason53c
+        # and with a FRESH last_matched the exhaustion verdict still wins
+        prev53c2 = dict(prev53c, exhaustion_last_matched=(
+            datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat())
+        status53c2, reason53c2 = monitor.classify_chat(
+            ctx53c, FAKE_CHAT_A, cfg53c, prev53c2, 15.0)
+        assert status53c2 == constants.STATUS_INTERVENTION, (status53c2, reason53c2)
+        assert reason53c2.startswith(constants.EXHAUSTION_REASON_PREFIX), reason53c2
+        print('TEST53C_EXHAUSTION_FRESHNESS_GATE_OK')
+
         # TEST55A: the durable alert fold — upsert (no stacking), the cap,
         # and the unread computation.
         st55 = {'chats': {}, 'history': [], 'last_tick': now_iso}
@@ -5236,6 +5300,9 @@ def main():
         # run leaves nothing behind in the plugin tree.
         monitor._debug_log = orig_debug_log
         try:
+            if os.path.exists(_scratch_debug_path) and os.environ.get('KEEP_DEBUG'):
+                import shutil as _sh
+                _sh.copy(_scratch_debug_path, os.environ['KEEP_DEBUG'])
             if os.path.exists(_scratch_debug_path):
                 os.unlink(_scratch_debug_path)
         except OSError:

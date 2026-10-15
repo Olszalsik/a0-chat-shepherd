@@ -13,7 +13,11 @@ from usr.plugins.chat_shepherd.helpers.constants import RESUME_TEXT
 
 KIND_RESTART = 'restart_resume'
 KIND_STALL = 'stall_nudge'
-_KINDS = (KIND_RESTART, KIND_STALL)
+# v1.23.1 (audit A1): the stall-escalation soft restart is a stall
+# remediation, so under supervised_mode it drafts like the others instead
+# of auto-firing.
+KIND_STALL_RESTART = 'stall_restart'
+_KINDS = (KIND_RESTART, KIND_STALL, KIND_STALL_RESTART)
 
 _BASE_TEXTS = {
     KIND_RESTART: (
@@ -26,6 +30,13 @@ _BASE_TEXTS = {
         '[chat_shepherd] You stopped unexpectedly mid-task. If your work '
         'is not finished, continue now from where you left off. If you '
         'are actually done, state clearly that the task is complete.'
+    ),
+    KIND_STALL_RESTART: (
+        '[chat_shepherd] This chat stopped unexpectedly mid-task and the '
+        'automatic nudge budget is exhausted. This draft is the one final '
+        'escalation attempt per stall episode: sending it clears the dead '
+        'task and resumes from where the work left off. If the task is '
+        'actually done, just reply that it is complete.'
     ),
 }
 

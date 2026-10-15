@@ -183,6 +183,11 @@ WEDGE_LIVENESS_PROBE = True
 EXHAUSTION_REASON_PREFIX = 'Provider exhaustion loop:'
 NO_RESPONSE_REASON_PREFIX = 'Running but no assistant response for'
 LIVENESS_SPINNING_SOFT = 'spinning_soft'
+# v1.23.1 (audit fix 4): the streaming case is an explicit verdict, not a
+# bare '' — classify's frozen arm must be able to tell "healthy stream in
+# flight" from "legacy/unknown" so a long streamed reply is never wedged,
+# and the liveness field stays a complete vocabulary.
+LIVENESS_STREAMING = 'streaming'
 # One soft restart queued after the stall ladder exhausts (feature C). The
 # exact string is an internal contract between classify_chat and the tick.
 STALL_RESTART_REASON = 'Nudges exhausted; one soft restart queued'

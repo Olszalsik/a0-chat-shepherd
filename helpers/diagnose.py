@@ -320,7 +320,9 @@ def _is_exhaustion_marker(item: Any) -> bool:
     )
 
 
-def exhaustion_loop(view: Any) -> tuple[bool, int, str]:
+def exhaustion_loop(
+    view: Any, max_marker_age_s: float | None = None
+) -> tuple[bool, int, str]:
     """Is the log tail a provider-exhaustion retry loop?
 
     Returns ``(matched, marker_count, excerpt_of_newest_marker)``. Matching
@@ -328,10 +330,18 @@ def exhaustion_loop(view: Any) -> tuple[bool, int, str]:
 
     - at least two exhaustion markers (warning/error entries) in the bounded
       tail — one entry is one failed attempt, not a loop;
-    - the newest *relevant* log entry is not a `response` — a real reply
-      after the failures means the loop broke;
-    - no genuine human turn newer than the newest marker — a human taking
-      over is the loop's owner now.
+    - no response and no genuine human turn NEWER than the newest marker.
+      "Newest relevant entry is not a response" was the v1.23.0 form and was
+      wrong both ways (v1.23.1 audit, review P1-3): during normal work the
+      newest relevant entry is a TOOL (a reply gets followed by tool entries
+      and re-arms a match on a healthy turn), and a frozen-hung tail with
+      old markers kept matching forever. An ORDERING test is the honest
+      form of "the loop broke": the chat produced a reply or a human took
+      over AFTER the last failure;
+    - the newest marker is RECENCY-bounded (`max_marker_age_s`, the caller
+      passes a freshness window — a live storm logs markers every attempt,
+      so a tail whose newest marker is minutes old is no longer an active
+      loop). None disables the bound (tests).
 
     Takes the caller's `_LogView` (the O5 contract: never the log lock).
     """
@@ -357,10 +367,18 @@ def exhaustion_loop(view: Any) -> tuple[bool, int, str]:
             pass
     if count < 2:
         return False, 0, ''
-    if last_relevant_type(view) == 'response':
+    if (
+        max_marker_age_s is not None
+        and newest_marker_ts > 0.0
+        and _time.time() - newest_marker_ts > max_marker_age_s
+    ):
         return False, 0, ''
+    resp_ts = last_response_at(view)
     human_ts = last_human_user_at(view)
-    if human_ts > 0.0 and human_ts >= newest_marker_ts:
+    if newest_marker_ts > 0.0 and (
+        (resp_ts and resp_ts > newest_marker_ts)
+        or (human_ts and human_ts > newest_marker_ts)
+    ):
         return False, 0, ''
     return True, count, newest_text
 

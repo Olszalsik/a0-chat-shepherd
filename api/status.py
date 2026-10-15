@@ -109,7 +109,12 @@ def _alerts_block(state: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
             }
             # v1.23.0: per-row unread so the sidebar badge can mark the
             # specific chat that is still unacknowledged.
-            entry['unread'] = (not seen_at) or entry['first_at'] > seen_at
+            # v1.23.1 (audit fix 10): the READ marker is `last_at`, not
+            # `first_at` — a re-page (upsert) of an episode the operator
+            # already acknowledged bumps `last_at` and becomes unread again;
+            # keyed on `first_at` it could never be unread twice, and the
+            # badge under-reported exactly when it mattered.
+            entry['unread'] = (not seen_at) or entry['last_at'] > seen_at
             rows.append(entry)
     rows.sort(key=lambda r: r['last_at'], reverse=True)
     unread = sum(1 for r in rows if r['unread'])

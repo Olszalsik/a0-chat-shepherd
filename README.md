@@ -14,6 +14,15 @@
 > a periodic health check that can bring work into existence, not just react (off by
 > default; wake ceiling 0 = off).
 
+> **v1.23.1** is a full audit cycle over v1.23.0: the `POST /ack` stamp now actually
+> persists (a save-signature exclusion silently dropped ack-only writes), the
+> stall-escalation restart now respects the diagnosis gate and the operating window,
+> the exhaustion scanner's loop-break test is ordering-based (a healthy turn with
+> tool work or any reply/human turn newer than the last failure is never held), the
+> streaming verdict is explicit (`streaming` — long streams are never wedged/nudged),
+> soft stamps no longer re-inherit across restarts, and re-paged alerts become
+> unread again after an ack.
+>
 > **v1.23.0** closes the gap a live 6-hour provider-exhaustion loop exposed: a running chat
 > cycling "All chat model candidates exhausted" retries is now categorized
 > `provider_exhaustion`, **held** (no nudges — a rate-limited chat cannot be continued into

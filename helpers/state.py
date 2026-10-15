@@ -430,6 +430,17 @@ def state_signature(state: dict[str, Any]) -> str:
             # the fold transaction must not be treated as a no-op.
             'channels': state.get('channels') if isinstance(
                 state.get('channels'), dict) else {},
+            # v1.23.1 (audit fix 1): the durable alert fold is semantic
+            # state TOO — every page and every fold changes it, so without
+            # it in the basis an ack-only transaction (alerts_seen_at) or a
+            # fold-only save computed sig_after == sig_before and was
+            # SILENTLY DROPPED: /ack returned success while state.json never
+            # gained the stamp, and the unread badge never cleared (and the
+            # ack was lost on restart). These only change on notify/ack —
+            # eventful ticks save anyway — so including them does not churn
+            # the quiet-tick gate.
+            'alerts': state.get('alerts') if isinstance(state.get('alerts'), dict) else {},
+            'alerts_seen_at': str(state.get('alerts_seen_at', '') or ''),
         }
         blob = json.dumps(basis, sort_keys=True, ensure_ascii=False, default=str)
         return hashlib.sha256(blob.encode('utf-8')).hexdigest()
