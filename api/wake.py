@@ -27,7 +27,9 @@ from usr.plugins.chat_shepherd.helpers import monitor, wake
 class Wake(ApiHandler):
     async def process(self, input: dict, request: Request) -> dict | Response:
         body = input if isinstance(input, dict) else {}
-        cfg = monitor._load_config()
+        # v1.23.2 (audit fix 5, cycle 2): cfg load = disk read on the
+        # bounded helpers — off the event loop alongside fire_wake below.
+        cfg = await asyncio.to_thread(monitor._load_config)
         text = str(body.get('text') or '').strip()
         if not text and not bool(cfg.get('continuity_enabled')):
             # Without the toggle on there is no default prompt, so say so
@@ -43,6 +45,9 @@ class Wake(ApiHandler):
             cfg,
             prompt=text,
             manual=True,
-            force=bool(body.get('force')),
+            # v1.23.2 (audit fix 9, cycle 2): strict bool — the string
+            # "false" must not force (bool("false") is True).
+            force=str(body.get('force') or '').strip().lower() in (
+                '1', 'true', 'yes', 'on'),
         )
         return {'success': bool(result.get('success')), **result}

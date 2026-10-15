@@ -53,6 +53,10 @@ DEFAULT_ICONS: dict[str, str] = {
     'error': '❌',
     'paused': '⏸️',
     'idle': '',
+    # v1.23.2 (audit fix 6, cycle 2): `blocked` was MISSING — a customized
+    # blocked pictogram was silently never served (the overlay only touches
+    # keys present in this map) and both JS fallbacks painted the stock ⛔.
+    'blocked': '⛔',
 }
 
 
@@ -233,17 +237,25 @@ class Status(ApiHandler):
         try:
             from agent import AgentContext
             for ctx in AgentContext.all():
-                # v1.20.2: apply the SAME real-chat predicate tick() uses.
-                # /status used to list every live AgentContext, so
-                # script-created throwaway contexts (verify-*, ctx-hook-1)
-                # appeared in the dashboard and counts even though the
-                # shepherd refuses to nudge or track them - the user then
-                # got "not a tracked chat" from /nudge for a row the UI
-                # had just offered them.
-                if not _is_tracked_chat(getattr(ctx, 'id', '')):
+                # v1.23.2 (audit fix 10, cycle 2): one throwing context used
+                # to abort the WHOLE loop — every context after it fell to
+                # the persisted branch for that poll and painted stale
+                # `running=False` statuses with no signal. Per-iteration
+                # isolation (same contract as the tick's per-chat guard).
+                try:
+                    # v1.20.2: apply the SAME real-chat predicate tick() uses.
+                    # /status used to list every live AgentContext, so
+                    # script-created throwaway contexts (verify-*, ctx-hook-1)
+                    # appeared in the dashboard and counts even though the
+                    # shepherd refuses to nudge or track them - the user then
+                    # got "not a tracked chat" from /nudge for a row the UI
+                    # had just offered them.
+                    if not _is_tracked_chat(getattr(ctx, 'id', '')):
+                        continue
+                    info = _serialize_context(ctx)
+                    contexts[info['id']] = info
+                except Exception:
                     continue
-                info = _serialize_context(ctx)
-                contexts[info['id']] = info
         except Exception:
             pass
 

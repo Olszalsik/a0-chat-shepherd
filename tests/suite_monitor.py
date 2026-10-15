@@ -5227,6 +5227,32 @@ def main():
         assert reason53c2.startswith(constants.EXHAUSTION_REASON_PREFIX), reason53c2
         print('TEST53C_EXHAUSTION_FRESHNESS_GATE_OK')
 
+        # TEST54C (v1.23.1 audit fix 5b): the interrupted (restart)
+        # transition re-anchors the exhaustion episode — the stamps do not
+        # carry the pre-restart age into the post-restart chat.
+        write_state((datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(), chats={
+            FAKE_CHAT_A: {'status': 'intervention', 'nudge_count': 3,
+                          'exhaustion_since': st52, 'exhaustion_count': 9,
+                          'exhaustion_last_matched': st52,
+                          'exhaustion_notified_at': now_iso,
+                          'provider_exhausted_at': st52,
+                          'provider_exhausted_killed': st52,
+                          'no_response_since': st52,
+                          'liveness': constants.LIVENESS_SPINNING_SOFT},
+        })
+        ctx54i = FakeCtx(FAKE_CHAT_A, ['user', 'tool'], idle_minutes=45)
+        FakeAgentContext._all = [ctx54i]
+        s54i = monitor.tick(dict(cfg, notify_on_intervention=False))
+        st54i = read_state()['chats'][FAKE_CHAT_A]
+        assert st54i['status'] == constants.STATUS_INTERRUPTED, st54i
+        for k, v in st54i.items():
+            if k in ('exhaustion_since', 'exhaustion_notified_at',
+                     'no_response_since', 'provider_exhausted_at',
+                     'provider_exhausted_killed'):
+                assert v == '', (k, v)
+        assert st54i.get('liveness') != constants.LIVENESS_SPINNING_SOFT, st54i
+        print('TEST54C_INTERRUPT_REANCHORS_EPISODE_OK')
+
         # TEST55A: the durable alert fold — upsert (no stacking), the cap,
         # and the unread computation.
         st55 = {'chats': {}, 'history': [], 'last_tick': now_iso}

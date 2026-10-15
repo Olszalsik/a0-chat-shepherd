@@ -69,6 +69,13 @@ _HK_AGE = re.compile(r'%s \((\d+)m' % re.escape(HK_REASON_PREFIX))
 # charges when the delivery turn out to have crashed (reconcile). The wedge
 # ladder (wedge_*) charges wedge_nudge_count; everything else rides
 # nudge_count.
+class _SkipCharge(Exception):
+    # Internal (v1.23.2 cycle 2): the reconcile phase raises it to skip a
+    # budget charge for an extinct chat while still journaling the
+    # abandonment row.
+    pass
+
+
 _BUDGET_KEY_WAL = {
     'restart_resume': 'nudge_count',
     'stall_nudge': 'nudge_count',
@@ -1155,7 +1162,7 @@ def classify_chat(
     # v1.18.1: a chat that stopped on an error or a security termination
     # (e.g. infection check) is an error, not a stall — auto-nudging it
     # back to life just reproduces the termination.
-    if _last_log_fatal(context):
+    if _last_log_fatal(context, view):
         return (
             STATUS_ERROR,
             'Chat stopped by an error or security termination (no auto-nudge)',
@@ -1704,6 +1711,12 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 inflight_blocked += 1
                 _bchat = str(_intent.get('chat_id') or '')
                 _act = str(_intent.get('action') or '')
+                # v1.23.2 (audit fix 9, cycle 2): charging a budget on a
+                # chat whose dir is gone used to RESURRECT a default entry
+                # via get_chat that the same tick's prune then popped again
+                # — create/destroy churn. The abandonment is still journaled.
+                if _bchat and not _has_chat_dir(_bchat):
+                    raise _SkipCharge()
                 _bentry = state_mod.get_chat(state, _bchat)
                 if _act.startswith('wedge'):
                     _bentry['wedge_nudge_count'] = _as_int(
@@ -1729,6 +1742,10 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                         _bentry['provider_exhausted_killed'] = (
                             datetime.now(timezone.utc).isoformat()
                         )
+            except _SkipCharge:
+                # Extinct chat: the abandonment journal row below is the
+                # record; no budget exists to charge.
+                pass
             except Exception as e:
                 _debug_log('inflight_reconcile_fail', repr(e))
             try:
@@ -2065,6 +2082,23 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               and _last_entry_type(ctx, view) != 'response'
           ):
               new_status = STATUS_INTERRUPTED
+              # v1.23.1 (audit fix 5b): the restart re-anchors EVERYTHING
+              # about the previous run — an exhaustion episode stamp (or a
+              # no-response stamp) carried across the restart would make
+              # the first re-match classify intervention with the
+              # PRE-restart age and instantly suppress the ladder on a
+              # chat that started clean.
+              for _stamp_key in (
+                  'exhaustion_since', 'exhaustion_notified_at',
+                  'no_response_since', 'provider_exhausted_at',
+                  'provider_exhausted_killed',
+              ):
+                  prev[_stamp_key] = ''
+              prev['exhaustion_count'] = 0
+              prev.pop('exhaustion_last_matched', None)
+              prev.pop('last_exhaustion_text', None)
+              if prev.get('liveness', '') == LIVENESS_SPINNING_SOFT:
+                  prev['liveness'] = ''
               reason = (
                   f'Server restarted while chat was {old_status}; '
                   'mid-task work interrupted'
@@ -2408,6 +2442,60 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                       stall_restart_queue.append(
                           (minutes_idle, chat_id, ctx, entry, now_iso)
                       )
+                  else:
+                      # v1.23.2 (audit fix 3, cycle 2): the escalation reason
+                      # could not be delivered (gate HOLD — a chat another
+                      # cause-allowlist does not authorize; or the window/
+                      # cooldown withholds). Leaving status nudged with
+                      # "queued" standing was a silent unbounded limbo: not
+                      # counted as held, never paged, never fallen back to
+                      # intervention. Flip to intervention with the
+                      # withheld reason so the bell/dashboard own it.
+                      _withheld = (
+                          gate_reason if gate_verdict == planner_mod.HOLD
+                          and gate_reason else 'outside the operating window'
+                      )
+                      new_status = STATUS_INTERVENTION
+                      reason = (
+                          f'Stalled for a long time, nudges exhausted; '
+                          f'escalation restart withheld: {_withheld}'
+                      )
+                      entry['last_classification'] = reason
+                      entry['status'] = new_status
+                      summary['held'] += 1
+                      # The generic quiet bell lives in the INTERVENTION
+                      # branch and never sees this chat (classify returned
+                      # NUDGED), so this arm maintains its own
+                      # persistence-gated page with the same clock fields —
+                      # otherwise a help-needing chat goes silent exactly
+                      # under the combination meant to escalate it.
+                      if notify_on_intervention:
+                          _w_since = _parse_dt(entry.get('intervention_since', ''))
+                          if _w_since is None:
+                              entry['intervention_since'] = now_iso
+                          elif (
+                              _minutes_since(_w_since) >= notify_after
+                              and (
+                                  not entry.get('intervention_notify_at', '')
+                                  or (notify_rearm > 0 and _minutes_since(
+                                      _parse_dt(
+                                          entry.get('intervention_notify_at', '')
+                                      )) >= notify_rearm
+                                  )
+                              )
+                          ):
+                              if not _notify(
+                                  'warning',
+                                  f'Chat {fname!r} ({chat_id}) still needs '
+                                  f'human intervention after '
+                                  f'{_minutes_since(_w_since):.0f}m: {reason}',
+                                  priority='high',
+                                  cfg=cfg,
+                                  state=state,
+                                  chat_id=chat_id,
+                              ):
+                                  summary['notify_failures'] += 1
+                              entry['intervention_notify_at'] = now_iso
         except Exception as e:
             # Best-effort: keep the other chats supervised and make the
             # failure visible instead of silently losing supervision.
@@ -2595,8 +2683,14 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
             entry['wedge_nudges_sent'] = _as_int(prev.get('wedge_nudges_sent', 0)) + 1
             entry['last_wedge_nudge_at'] = now_iso
             entry['status'] = STATUS_INTERVENTION
+            # v1.23.2 (audit fix 11, cycle 2): when the last attempt
+            # escalated to a kill+restart, the label said 'auto-continue
+            # sent' — the history row was correct, the entry text lied.
             entry['last_classification'] = (
-                f'Wedged: auto-continue sent (attempt {attempt}'
+                f'Wedged: kill+restart sent (attempt {attempt}'
+                f'/{wedge_max_remediations})'
+                if action == 'wedge_soft_restart'
+                else f'Wedged: auto-continue sent (attempt {attempt}'
                 f'/{wedge_max_remediations})'
             )
             if inflight_on:
@@ -2661,6 +2755,9 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                 except Exception:
                     pass
             summary['stall_restarts'] += 1
+            # v1.23.2 (audit fix 5, cycle 2): it IS a nudge-family send —
+            # the dashboard's per-tick budget badge must count it.
+            summary['nudges_this_tick'] += 1
             state_mod.append_history(state, {
                 'chat_id': chat_id,
                 'action': 'stall_restart',
@@ -2767,6 +2864,20 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
     # eviction are journaled separately. The old lumped "dead/stale"
     # message hid the churn storm where the same live chats were evicted
     # and re-created every tick, wiping their nudge/cooldown bookkeeping.
+    # v1.23.2 (audit fix 14, cycle 2): a dead BLOCKED chat is never
+    # re-ticked (no live context), so its `last_ticked` ages and it is
+    # ALWAYS the next cap-eviction victim — silently dropping a human's
+    # pending block + released_signature. While its dir exists, refresh
+    # the clock (state_signature ignores per-chat last_ticked: no churn).
+    _cap_now = datetime.now(timezone.utc).isoformat()
+    for _bcid, _bentry in (state.get('chats') or {}).items():
+        if (
+            isinstance(_bentry, dict)
+            and _bentry.get('status') == STATUS_BLOCKED
+            and _bcid not in live_contexts
+            and _has_chat_dir(_bcid)
+        ):
+            _bentry['last_ticked'] = _cap_now
     pruned_dead = 0
     for chat_id in list(state.get('chats', {}).keys()):
         if chat_id in live_contexts:
@@ -2829,6 +2940,9 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
      'wedge_nudged': summary['wedge_nudged'],
      'wedge_restarts': summary['wedge_restarts'],
      'wedge_budget': max(1, max_nudges_per_tick),
+     # v1.23.2 (audit fix 5, cycle 2): stall-restart deliveries + budget.
+     'stall_restarts': summary['stall_restarts'],
+     'restart_budget': 0 if max_nudges_per_tick <= 0 else max(3, min(10, max_nudges_per_tick)),
      # v1.20.0: tracked-chats maintenance, split so the dashboard can tell
      # dead-chat pruning (routine) from dead-surplus cap eviction (only
      # possible when dead entries outnumber the cap). A non-zero

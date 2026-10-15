@@ -57,6 +57,17 @@ GUARDS = {
 }
 
 
+# v1.23.2 (audit fix 7, cycle 2): a HELD exhaustion chat gets an explicit
+# guard — manual nudging a held chat makes sense only as a conscious
+# override that deliberately re-enters an exhausted provider.
+HOLD_GUARD_KEY = 'provider_exhaustion'
+GUARDS[HOLD_GUARD_KEY] = (
+    'This chat is HELD in a provider-exhaustion retry loop (or on the '
+    'post-kill hold) — the provider is exhausted and every continue '
+    're-enters an unusable endpoint. A manual nudge is an override.'
+)
+
+
 def _evaluate_guards(ctx: Any, chat_id: str) -> tuple[str, str]:
     """Return (guard_key, operator message), or ('', '') when nudging is safe."""
     try:
@@ -64,19 +75,20 @@ def _evaluate_guards(ctx: Any, chat_id: str) -> tuple[str, str]:
         # v1.22.0 (stage 2): a blocked chat needs a deliberate human decision.
         # A nudge still works as an override (and releases it implicitly via
         # the standard override bookkeeping), but it must be a conscious one.
+        # v1.23.2 (audit fix 30, cycle 2): ONE entry read serves every guard
+        # branch (the second full state.json parse is gone).
         if str((entry or {}).get('status', '') or '') == 'blocked':
             return ('blocked', GUARDS['blocked'])
+        if monitor._termination_cooldown_active(entry or {}):
+            return ('termination_cooldown', GUARDS['termination_cooldown'])
+        if (entry or {}).get('provider_exhausted_at', '') or (
+            entry or {}).get('exhaustion_since', ''):
+            return (HOLD_GUARD_KEY, GUARDS[HOLD_GUARD_KEY])
     except Exception:
         pass
     try:
         if monitor._last_log_fatal(ctx):
             return ('fatal_stop', GUARDS['fatal_stop'])
-    except Exception:
-        pass
-    try:
-        entry = state_mod.read_chat_entry(chat_id)
-        if monitor._termination_cooldown_active(entry):
-            return ('termination_cooldown', GUARDS['termination_cooldown'])
     except Exception:
         pass
     return ('', '')
@@ -111,7 +123,9 @@ class Nudge(ApiHandler):
         if not chat_id:
             return {'success': False, 'error': 'chat_id is required'}
 
-        if not _is_tracked_chat(chat_id):
+        # v1.23.2 (audit fix 4, cycle 2): the tracked predicate does disk
+        # I/O (cached scandir + bounded stats) — off the event loop.
+        if not await asyncio.to_thread(_is_tracked_chat, chat_id):
             # v1.18.3 (P7): reject BEFORE communicate() and before get_chat()
             # can auto-create a ghost state entry for a context the monitor
             # never tracks (e.g. script-created verify-* contexts).
@@ -177,7 +191,7 @@ class Nudge(ApiHandler):
                 # Explicit release evidence: the current verdict's signature.
                 if guard == 'blocked' and prior_status == 'blocked':
                     update_chat(st, chat_id,
-                        nudges_sent=entry.get('nudges_sent', 0) + 1,
+                        nudges_sent=monitor._as_int(entry.get('nudges_sent', 0)) + 1,
                         nudge_count=new_count,
                         last_nudge_at=now_iso,
                         manual_nudge_override_at=now_iso,
@@ -207,7 +221,7 @@ class Nudge(ApiHandler):
                         'message': 'Nudge sent; block released (override)',
                     }
                 update_chat(st, chat_id,
-                    nudges_sent=entry.get('nudges_sent', 0) + 1,
+                    nudges_sent=monitor._as_int(entry.get('nudges_sent', 0)) + 1,
                     nudge_count=new_count,
                     last_nudge_at=now_iso,
                     manual_nudge_override_at=now_iso,
@@ -220,7 +234,7 @@ class Nudge(ApiHandler):
                 )
             else:
                 update_chat(st, chat_id,
-                    nudges_sent=entry.get('nudges_sent', 0) + 1,
+                    nudges_sent=monitor._as_int(entry.get('nudges_sent', 0)) + 1,
                     nudge_count=new_count,
                     last_nudge_at=now_iso,
                     status='nudged',

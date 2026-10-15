@@ -43,7 +43,9 @@ class TestNotify(ApiHandler):
             return {'success': False, 'error': f'Unknown channel: {channel}'}
 
         try:
-            cfg = _load_plugin_config()
+            # v1.23.2 (audit fix 3a, cycle 2): cfg load = disk read on the
+            # bounded helpers — off the event loop.
+            cfg = await asyncio.to_thread(_load_plugin_config)
         except Exception as e:
             return {'success': False, 'error': f'Config load failed: {e}'}
 
@@ -63,8 +65,13 @@ class TestNotify(ApiHandler):
             results['framework'] = None if fw_ok else 'framework notification rejected'
 
         if channel in ('webhook', 'telegram', 'all'):
-            jobs = monitor._external_jobs(
-                cfg, 'info', 'Chat Shepherd test notification (external legs)'
+            # v1.23.2 (audit fix 3b, cycle 2): the job builder contains the
+            # SSRF guard's DNS resolution — notify.py documents that this
+            # must NEVER run on the asking thread; only the posting had
+            # been offloaded before.
+            jobs = await asyncio.to_thread(
+                monitor._external_jobs,
+                cfg, 'info', 'Chat Shepherd test notification (external legs)',
             )
             wanted = ('webhook', 'telegram') if channel == 'all' else (channel,)
             for ch in wanted:
@@ -111,21 +118,17 @@ class TestNotify(ApiHandler):
 
         ok = bool(results) and all(v is None for v in results.values())
         try:
-            for ch, err in results.items():
-                state_mod.append_journal({
-                    'chat_id': '',
-                    'action': 'notify_test',
-                    'channel': ch,
-                    'ok': err is None,
-                    'error': err or '',
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                })
+            # v1.23.2 (audit fix 3c, cycle 2): journal appends are file I/O —
+            # off the event loop.
+            await asyncio.to_thread(_journal_results, results)
         except Exception:
             pass
         # v1.22.0 (stage 4): a deliberate test also maintains channel health —
         # the operator just verified these legs, so the result is evidence.
         try:
-            state_mod.state_transaction_apply(
+            # v1.23.2 (audit fix 3d, cycle 2): the fold is a full
+            # load/parse/signature(+possible save) — off the event loop.
+            await asyncio.to_thread(state_mod.state_transaction_apply,
                 lambda st: {'health': _notify_mod.record_channels(
                     st, {k: v for k, v in results.items() if k != 'framework'})}
             )
@@ -133,3 +136,15 @@ class TestNotify(ApiHandler):
             pass
 
         return {'success': True, 'ok': ok, 'results': results, 'details': details, 'tested': tested}
+
+
+def _journal_results(results: dict) -> None:
+    for ch, err in results.items():
+        state_mod.append_journal({
+            'chat_id': '',
+            'action': 'notify_test',
+            'channel': ch,
+            'ok': err is None,
+            'error': err or '',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        })

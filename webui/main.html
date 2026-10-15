@@ -216,7 +216,12 @@
                   <div class="shepherd-history-item">
                     <span x-text="$store.chatShepherdStore.formatTime(item.timestamp)"></span>
                     <span x-text="item.action"></span>
-                    <span x-text='$store.chatShepherdStore.nameFor(item.chat_id)'></span>
+                    <!-- v1.23.2 (audit fix 13, cycle 2): system-only rows
+                         (chat_id '' — alerts_ack, notify_test, wakes) had an
+                         empty name chip; omit it. -->
+                    <template x-if="item.chat_id">
+                      <span x-text='$store.chatShepherdStore.nameFor(item.chat_id)'></span>
+                    </template>
                     <template x-if="item.nudge_count">
                       <span x-text="`(#${item.nudge_count})`"></span>
                     </template>

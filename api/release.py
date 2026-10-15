@@ -112,7 +112,10 @@ class Release(ApiHandler):
                 return {'success': False, 'error': rejected[0]}
             return {'success': False, 'error': 'chat_id required'}
         bulk = len(ids) > 1
-        if bulk and not body.get('confirm'):
+        # v1.23.2 (audit fix 9, cycle 2): strict bool — the string "false"
+        # must not confirm (bool("false") is True).
+        if bulk and str(body.get('confirm') or '').strip().lower() not in (
+                '1', 'true', 'yes', 'on'):
             # A bulk release is a bulk human decision; require it to be
             # stated rather than inferred from a list a client built by
             # accident.

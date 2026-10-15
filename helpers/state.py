@@ -214,6 +214,24 @@ def load_state() -> dict[str, Any]:
         except Exception:
             payload = None
             raw = ''
+            # v1.23.2 (audit fix 1, cycle 2 — P1): unparseable bytes used to
+            # be treated as "no file at all": the state proceeded on defaults
+            # and the next durable change overwrote the file — every tracked
+            # chat, pending supervised draft, durable alert and counter gone
+            # PERMANENTLY, with nothing logged or renamed. Quarantine the
+            # corrupt bytes (rename, never delete) and leave the evidence.
+            try:
+                stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')
+                renamed = path + '.corrupt-' + stamp
+                os.rename(path, renamed)
+                append_journal({
+                    'chat_id': '',
+                    'action': 'state_corrupt',
+                    'detail': os.path.basename(renamed),
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
     state = default_state()
     if isinstance(payload, dict):
         state.update(payload)
@@ -441,6 +459,16 @@ def state_signature(state: dict[str, Any]) -> str:
             # the quiet-tick gate.
             'alerts': state.get('alerts') if isinstance(state.get('alerts'), dict) else {},
             'alerts_seen_at': str(state.get('alerts_seen_at', '') or ''),
+            # v1.23.2 (audit fix 12, cycle 2): continuity wake bookkeeping is
+            # semantic too — a quiet wake tick where nothing else changed
+            # could skip its save and lose last_at/the day-counter, costing
+            # one duplicate wake attempt (self-correcting, but avoidable).
+            # capabilities only change on probe events; 'daily' has no
+            # writers and stays out of the basis until it means something.
+            'continuity': state.get('continuity') if isinstance(
+                state.get('continuity'), dict) else {},
+            'capabilities': state.get('capabilities') if isinstance(
+                state.get('capabilities'), dict) else {},
         }
         blob = json.dumps(basis, sort_keys=True, ensure_ascii=False, default=str)
         return hashlib.sha256(blob.encode('utf-8')).hexdigest()
@@ -703,11 +731,21 @@ def _journal_scan(
                 if head == c_head:
                     f.seek(c_off)
                     blob = f.read()
+                    # v1.23.2 (audit fix 4, cycle 2): the post-read fstat is
+                    # NOT the consumed offset — an append racing the read
+                    # lands after `blob` ends but before the fstat, so the
+                    # old tuple claimed bytes as parsed that were never
+                    # read; the next scan early-returned (size == c_key)
+                    # and then skipped them FOREVER past that offset until
+                    # compaction. Publish the size actually consumed
+                    # (c_off + len(blob)): raced bytes present themselves as
+                    # ordinary growth on the next scan and are parsed then.
                     st2 = os.fstat(f.fileno())
+                    consumed = c_off + len(blob)
                     parsed = c_parsed + _decode_journal_chunk(blob)
                     return (
-                        (st2.st_mtime_ns, st2.st_size),
-                        st2.st_size,
+                        (st2.st_mtime_ns, consumed),
+                        consumed,
                         parsed,
                         head,
                     )
@@ -720,10 +758,14 @@ def _journal_scan(
     if cut < 0:
         # not a single complete line yet
         return (st2.st_mtime_ns, st2.st_size), 0, [], head
+    # v1.23.2 (audit fix 4, cycle 2): same race on the full path — the
+    # consumed offset is cut+1, not the fstat size; anything appended
+    # between read and fstat must surface as growth next scan.
+    consumed = min(cut + 1, st2.st_size)
     return (
-        (st2.st_mtime_ns, st2.st_size),
-        cut + 1,
-        _decode_journal_chunk(blob[:cut + 1]),
+        (st2.st_mtime_ns, consumed),
+        consumed,
+        _decode_journal_chunk(blob[:consumed]),
         head,
     )
 

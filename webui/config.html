@@ -73,7 +73,17 @@ window.chatShepherdTestNotify = async function (channel) {
 </head>
 <body>
 <div x-data>
+<!--
+  v1.23.2 (audit fix 1, cycle 2 — P1): Alpine's x-if clones content and
+  inserts ONLY the first element child. Until this wrapper existed, the
+  template's ~16 sibling .cs-card divs were 15 element-child siblings after
+  the first — every card after the first (cause-gated remediation,
+  operating window, escalation, wedge, provider exhaustion, liveness,
+  adaptive, supervised, external alerts, allowlist, pictograms) was
+  silently NEVER RENDERED since the v1.20.0 settings migration.
+-->
 <template x-if="config">
+<div>
 <div class="cs-card">
 <h4>
 <span x-text="config.enabled ? '🟢' : '🔴'"></span>
@@ -450,7 +460,7 @@ Chat Shepherd
 </div>
 <small class="hint">Live per-chat statuses are on the Chat Shepherd dashboard (plugin list → Open).</small>
 </div>
-
+</div>
 </template>
 </div>
 </body>

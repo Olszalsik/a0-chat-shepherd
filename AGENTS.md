@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.23.1 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
+**Version:** 1.24.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
 
 ## v1.23.0 — provider-exhaustion loops, streaming exemption, durable alerts (2026-10-15)
 
@@ -164,6 +164,84 @@ reset unchanged) → supervised budget spend → reconcile charges
 (`stall_restart_count`, `provider_exhausted_killed`) → expiry clears
 `exhaustion_notified_at` → unread keyed on `last_at` → info-fold gate →
 fast path reads the badge attr → P3 set → suites → this document.
+
+## v1.24.0 — audit cycle 2 (2026-10-15)
+
+Two independent fresh-eyes auditors over state.py/drains/WAL and api/webui.
+Findings and fixes:
+
+- **P1 config.html multi-root `x-if`** — Alpine's x-if clones ONLY the first
+  element child, and the settings template's ~16 sibling `.cs-card` divs
+  made every card AFTER the first silently never-rendered SINCE THE v1.20.0
+  SETTINGS MIGRATION (probe-verified; other plugins wrap in a single root,
+  chat_shepherd alone deviated). The cause-gated, operating-window,
+  escalation, wedge, exhaustion, liveness, adaptive, supervised,
+  external-alert, allowlist and pictogram cards were all invisible; the
+  v1.23.0 settings cards shipped INTO this hole. Fixed: one root `<div>`
+  wrapper inside the template.
+- **P1 corrupt state.json wiped silently** — load_state() treated
+  unparseable bytes as "missing": defaults proceeded and the next durable
+  change OVERWROTE the file (every pending draft/human-review item, alert
+  fold and counter gone, nothing logged). Fixed: the corrupt bytes are
+  RENAMED to `state.json.corrupt-<ts>` (data-integrity: never deleted) and
+  a `state_corrupt` journal row records it.
+- **P2 restart-resume burst structurally dead** on real process restarts:
+  `server_restarted` is knowable only on tick 0-1, which is inside the
+  startup-grace window (`_can_act` False), and afterwards the flag is gone —
+  so the resume burst never fired; interrupted chats fell to the generic
+  stall ladder ~4 min later, one per tick, with the wrong prompt. Fixed:
+  chats already stamped `interrupted` re-queue into the resume burst on
+  subsequent ticks once the window opens (RESUME_TEXT, cooldown+budget
+  honored).
+- **P2 escalation-HOLD limbo** — with `stall_escalate_to_restart: true`,
+  gate-HOLD (non-allowlisted cause) or window-withheld left classify's
+  `NUDGED + "one soft restart queued"` standing forever: not held-counted,
+  never paged, no fallback. Fixed: un-deliverable escalation reasons fall
+  through to intervention with the withheld reason, maintain the same
+  persistence-gated page clock, and count in `summary['held']`.
+- **P2 journal-scan race** — the growth path's post-read fstat published a
+  cache offset/size including bytes the read never consumed; a racing
+  append between read and fstat made the cache claim bytes it never parsed
+  and the next scan SKIPPED them permanently (silent dashboard-timeline row
+  loss + adaptive undercount) until compaction. Fixed: publish the
+  CONSUMED size/offsets (c_off + len(blob); cut+1 vs the raced size).
+- **P2/P3 event-loop discipline**: `coerce_int` catches OverflowError
+  (the last int seam without it — a raw 500 otherwise); api/test_notify
+  offloaded all four blocking sites (config read, the `_external_jobs`
+  builder CONTAINING the SSRF DNS resolution, journal appends, the
+  channel-health fold); api/wake's config read offloaded; api/nudge's
+  tracked-chat disk probe offloaded and its double state.json parse folded
+  into one guard read.
+- **P2/P3 api semantics**: strict bools at release `confirm` / wake `force`
+  (the string "false" must not confirm/force); a BLOCKED chat refuses a
+  drafted send (the send path used to overwrite the terminal status with
+  dangling block fields and no release bookkeeping — status rides the
+  claim transaction, zero extra reads, hint points at /release);
+  draft-restore dedupes by chat too and respects DRAFT_MAX.
+- **P2 nudge hold guard**: a held exhaustion chat now answers a manual
+  nudge with an explicit `provider_exhaustion` confirmation guard
+  (previously it silently re-entered the exhausted provider, and the
+  post-kill hold fired the wrong `fatal_stop` dialog).
+- **P3 set**: status.py DEFAULT_ICONS gains `blocked` (a customized blocked
+  pictogram was never served); per-iteration try in the AgentContext poll
+  loop (one throwing context dropped the rest of the poll to stale
+  fallbacks); empty-name chip omitted for system-only journal rows;
+  `stall_restart` spends `nudges_this_tick` + the throttle snapshot gains
+  `stall_restarts`/`restart_budget`; reconcile skips budget charges for
+  extinct chats (no resurrect-then-prune churn) with an explicit
+  `_SkipCharge` handler; post-Tier-2 label says kill+restart; both
+  `wedge_nudges_sent` reads coerced; adaptive `_coerce_int` OverflowError +
+  `str(action)` against unhashable journal rows; state_signature basis
+  gains continuity + capabilities (a quiet wake tick no longer risks one
+  duplicate wake attempt; 'daily' has no writers and stays out).
+- **Recorded-not-changed**: supervised mode does NOT gate the wedge Tier-2/
+  kills or the exhaustion kill (DOX frames supervised around the stall
+  family); the WAL contract intentionally charges budget for a failed
+  communicate (documented); status.py's per-poll error.txt stat cadence is
+  noted as a future optimization if it ever shows in profiles.
+
+Regression pins: TEST45O unchanged (2 reads/send — the probe rides the
+claim), full backend + node suites green (46 sidebar assertions).
 
 ### Regression pins added
 

@@ -58,11 +58,22 @@ async def _restore_claimed_draft(claim: dict) -> None:
         if not isinstance(drafts, list):
             drafts = []
             st['drafts'] = drafts
+        if not isinstance(claimed.get('id'), str):
+            return {'success': False}
+        # v1.23.2 (audit fix 14, cycle 2): dedupe by draft id AND by chat —
+        # a failed send raced with a newly queued draft of ANY kind for the
+        # same chat would previously restore next to it, violating the
+        # one-draft-per-chat invariant add_draft enforces (add_draft's
+        # dedupe would then keep refusing new drafts for the chat).
         if not any(
             isinstance(d, dict) and d.get('id') == claimed.get('id')
             for d in drafts
+        ) and not any(
+            isinstance(d, dict) and d.get('chat_id') == claimed.get('chat_id')
+            for d in drafts
         ):
-            drafts.append(claimed)
+            if len(drafts) < state_mod.DRAFT_MAX:
+                drafts.append(claimed)
         return {'success': True}
 
     try:
@@ -143,7 +154,15 @@ class Draft(ApiHandler):
             if claimed is None:
                 return {'success': False, 'error': f'Draft {draft_id} not found'}
             remove_draft(st, draft_id)
-            return {'success': True, 'draft': claimed}
+            # v1.23.2 (audit fix 17, cycle 2): report the chat's CURRENT
+            # status in the same transaction — the send path refuses a
+            # drafted send to a chat that became BLOCKED since the draft
+            # was queued (a stale review item had released a supervisor
+            # block by status overwrite, with no release bookkeeping).
+            _ent = (st.get('chats') or {}).get(
+                str(claimed.get('chat_id') or '')) or {}
+            return {'success': True, 'draft': claimed,
+                    'chat_status': str(_ent.get('status') or '')}
 
         claim = await asyncio.to_thread(state_mod.state_transaction_apply, _claim)
         if not claim.get('success'):
@@ -167,6 +186,22 @@ class Draft(ApiHandler):
         if ctx is None:
             await _restore_claimed_draft(claim)
             return {'success': False, 'error': f'Context {chat_id} not found'}
+
+        # v1.23.2 (audit fix 17, cycle 2): a draft is a snapshot in time —
+        # the chat may have become BLOCKED between draft creation and send.
+        # The send path had no blocked check (unlike /nudge), so it flipped
+        # the terminal status to 'nudged' with the block fields dangling —
+        # a stale review item releasing a block the supervisor judged
+        # human-only, with no release bookkeeping. The status rides the
+        # claim transaction (no extra read); refuse with the hint.
+        if str(claim.get('chat_status') or '') == 'blocked':
+            await _restore_claimed_draft(claim)
+            return {
+                'success': False,
+                'error': ('Chat is BLOCKED pending human release; send the '
+                          'draft only after a deliberate /release'),
+                'hint': 'POST /api/plugins/chat_shepherd/release with chat_id',
+            }
 
         try:
             ctx.communicate(UserMessage(message=text))

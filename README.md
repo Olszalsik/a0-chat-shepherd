@@ -14,6 +14,14 @@
 > a periodic health check that can bring work into existence, not just react (off by
 > default; wake ceiling 0 = off).
 
+> **v1.24.0** is audit cycle 2: the settings modal renders ALL its cards again (a
+> multi-root `x-if` in the Alpine template had silently hidden every card but the
+> first since v1.20.0), corrupt `state.json` bytes are quarantined as
+> `state.json.corrupt-<ts>` with a journal row instead of being silently wiped,
+> the restart-resume burst actually fires after a real server restart, drafted
+> sends refuse a BLOCKED chat, and every remaining event-loop block in the API
+> layer is offloaded.
+>
 > **v1.23.1** is a full audit cycle over v1.23.0: the `POST /ack` stamp now actually
 > persists (a save-signature exclusion silently dropped ack-only writes), the
 > stall-escalation restart now respects the diagnosis gate and the operating window,

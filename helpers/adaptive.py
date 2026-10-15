@@ -58,7 +58,9 @@ _WINDOW_ENTRIES = 500  # hard journal-read cap for one evaluation
 def _coerce_int(val: Any, fallback: int, lo: int, hi: int) -> int:
     try:
         n = int(val)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # v1.23.2 (audit fix 7, cycle 2): OverflowError joins — the exact
+        # hole the same audit closed in _num and in both _as_ints.
         return fallback
     return max(lo, min(hi, n))
 
@@ -146,7 +148,10 @@ def window_rates(window_start: str) -> dict[str, dict[str, int]]:
             ts = _parse_iso(item.get('timestamp', ''))
             if start_dt is not None and (ts is None or ts <= start_dt):
                 continue
-            action = item.get('action', '')
+            # v1.23.2 (audit fix 8, cycle 2): str() — an unhashable action
+            # value in a corrupt/hand-edited journal row raised
+            # "unhashable type" out of the windowed rates.
+            action = str(item.get('action', '') or '')
             if action in sent_actions:
                 sent += 1
             elif action in outcome_actions:
