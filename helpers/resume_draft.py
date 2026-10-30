@@ -17,9 +17,15 @@ KIND_STALL = 'stall_nudge'
 # remediation, so under supervised_mode it drafts like the others instead
 # of auto-firing.
 KIND_STALL_RESTART = 'stall_restart'
-_KINDS = (KIND_RESTART, KIND_STALL, KIND_STALL_RESTART)
+KIND_ERROR_RESUME = 'error_resume'
+_KINDS = (KIND_RESTART, KIND_STALL, KIND_STALL_RESTART, KIND_ERROR_RESUME)
 
 _BASE_TEXTS = {
+    KIND_ERROR_RESUME: (
+        '[chat_shepherd] This chat stopped on a recoverable error. '
+        'Resume the unfinished task from the last safe step. '
+        'If the task is already complete, state that clearly.'
+    ),
     KIND_RESTART: (
         '[chat_shepherd] The Agent Zero server was restarted and this chat '
         'was interrupted mid-task. If your work is not finished, continue '

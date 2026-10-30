@@ -228,6 +228,12 @@ class Draft(ApiHandler):
             # safety net).
             entry = get_chat(st, chat_id)
             now_iso = _now_iso()
+            if draft.get('kind') == 'error_resume':
+                entry['error_recovery_count'] = monitor._as_int(
+                    entry.get('error_recovery_count', 0)) + 1
+                entry['last_error_recovery_at'] = now_iso
+                if not entry.get('error_recovery_since'):
+                    entry['error_recovery_since'] = now_iso
             # v1.21.0 (A1): coerce the persisted counters before the arithmetic
             # - a string counter here raised out of the transaction AFTER the
             # draft had been delivered, so the operator saw a 500 for a send

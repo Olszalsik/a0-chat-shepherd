@@ -6,6 +6,7 @@ import threading
 import uuid
 import time
 import json
+import hashlib
 import re
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -78,6 +79,7 @@ class _SkipCharge(Exception):
 
 
 _BUDGET_KEY_WAL = {
+    'error_resume': 'error_recovery_count',
     'restart_resume': 'nudge_count',
     'stall_nudge': 'nudge_count',
     'stall_restart': 'nudge_count',
@@ -293,14 +295,17 @@ class _LogView:
     entries), `last_type` (type of the very last entry, unfiltered).
     """
 
-    __slots__ = ('length', 'updates', 'tail', 'last_type')
+    __slots__ = ('length', 'updates', 'tail', 'last_type', 'entry_key', 'activity_key')
 
     def __init__(self, length: int = -1, updates: int = -1,
-                 tail: list | None = None, last_type: str = '') -> None:
+                 tail: list | None = None, last_type: str = '',
+                 entry_key: str = '', activity_key: str = '') -> None:
         self.length = length
         self.updates = updates
         self.tail = tail if tail is not None else []
         self.last_type = last_type
+        self.entry_key = entry_key
+        self.activity_key = activity_key
 
 
 def _log_snapshot(context: AgentContext) -> _LogView:
@@ -319,7 +324,19 @@ def _log_snapshot(context: AgentContext) -> _LogView:
             # probe for that chat, which is the correct degradation.
             updates = getattr(context.log, 'updates', None)
             updates_len = len(updates) if updates is not None else -1
-            return _LogView(length, updates_len, tail, last_type)
+            # Retained lists are bounded: neither their length nor an index
+            # into them is a lifetime progress counter. Capture immutable
+            # values under the SAME lock, hash after releasing the writer.
+            latest = logs[-1] if logs else None
+            identity = tuple(getattr(latest, k, None)
+                             for k in ('guid', 'no', 'timestamp', 'type'))
+            activity = tuple(str(getattr(latest, k, '') or '')
+                             for k in ('heading', 'content', 'kvps'))
+        def digest(value):
+            return hashlib.sha256(repr(value).encode('utf-8', 'replace')).hexdigest()
+        entry_key = digest(identity) if identity[1] is not None or identity[2] else ''
+        return _LogView(length, updates_len, tail, last_type, entry_key,
+                        digest(activity) if latest is not None else '')
     except Exception:
         return _LogView()
 
@@ -496,6 +513,12 @@ def _wedge_minutes(
     one /status poll takes ONE log lock per chat, not two.
     """
     cur = _log_len(context, view)
+    if view is not None and (
+        (view.entry_key and view.entry_key != prev_entry.get('last_entry_key'))
+        or (view.last_type in ('agent', 'response') and view.activity_key
+            and view.activity_key != prev_entry.get('last_activity_key'))
+    ):
+        return 0.0
     prev_len = prev_entry.get('last_log_len', -1)
     if not (
         context.is_running() and cur >= 0 and prev_len >= 0 and cur == prev_len
@@ -997,6 +1020,49 @@ def _nudge_context(context: AgentContext, text: str | None = None, chat_id: str 
         return False
 
 
+def _error_text(chat_id: str, view: _LogView) -> str:
+    """Keep crash evidence, but don't let an old file poison a later reply."""
+    if not _check_error_file(chat_id):
+        return ''
+    path = os.path.join(_chat_dir(chat_id), 'error.txt')
+    try:
+        if diag_mod.last_response_at(view) > os.stat(path).st_mtime:
+            return ''
+    except OSError:
+        pass
+    return diag_mod.read_error_head(path)
+
+
+def _recoverable_failure(chat_id: str, cfg: dict, view: _LogView) -> str:
+    """Only a diagnosed, explicitly allowlisted failure may be resumed."""
+    if not bool(cfg.get('diagnose_enabled', True)):
+        return ''
+    fp = diag_mod.fingerprint(chat_id, error_text=_error_text(chat_id, view),
+                              fatal=diag_mod.fatal_text(view))
+    allowed = cfg.get('auto_remediate_categories', [])
+    if not isinstance(allowed, list) or not fp['fatal']:
+        return ''
+    # Provider exhaustion/quotas, policy, and externally-owned stops must
+    # never turn into blind retries even if somebody adds them to the list.
+    if fp['category'] not in ('network', 'tool_error', 'framework_crash', 'json_malformed'):
+        return ''
+    # Installing a supervisor update must not resurrect months-old failed
+    # audit chats. Only a recent, timestamped failure is an automatic retry.
+    if fp['source'] == 'error.txt':
+        try:
+            failed_at = os.stat(os.path.join(_chat_dir(chat_id), 'error.txt')).st_mtime
+        except OSError:
+            return ''
+    else:
+        failed_at = next((_as_float(getattr(x, 'timestamp', 0), 0)
+                          for x in reversed(view.tail) if getattr(x, 'type', '') == 'error'), 0)
+    window = max(60.0, _as_float(cfg.get('nudge_cooldown_minutes', 10), 10)
+                 * max(1, _as_int(cfg.get('max_auto_nudges', 3), 3)) + 5)
+    if failed_at <= 0 or time.time() - failed_at > window * 60:
+        return ''
+    return fp['category'] if planner_mod.may_remediate(fp['category'], allowed) else ''
+
+
 def classify_chat(
     context: AgentContext | None,
     chat_id: str,
@@ -1137,7 +1203,9 @@ def classify_chat(
             return STATUS_INTERVENTION, reason
         return STATUS_RUNNING, 'Agent is actively running'
 
-    if _check_error_file(chat_id):
+    scan = view if view is not None else _log_snapshot(context)
+    recoverable = _recoverable_failure(chat_id, cfg, scan)
+    if _error_text(chat_id, scan) and not recoverable:
         return STATUS_ERROR, 'Chat has error.txt'
 
     # v1.23.0 post-kill hold: after the exhaustion kill the chat is stopped
@@ -1173,7 +1241,7 @@ def classify_chat(
     # v1.18.1: a chat that stopped on an error or a security termination
     # (e.g. infection check) is an error, not a stall — auto-nudging it
     # back to life just reproduces the termination.
-    if _last_log_fatal(context, view):
+    if _last_log_fatal(context, view) and not recoverable:
         return (
             STATUS_ERROR,
             'Chat stopped by an error or security termination (no auto-nudge)',
@@ -1181,7 +1249,7 @@ def classify_chat(
     # v1.18.2 fix (terminate-loop, part 2): the durable state stamp keeps
     # the error verdict alive even when later log items (e.g. chat_shepherd
     # nudges) bury the fatal entry. Cleared by a fresh human turn in tick().
-    if _termination_cooldown_active(prev_entry):
+    if _termination_cooldown_active(prev_entry) and not recoverable:
         return (
             STATUS_ERROR,
             'Recent security termination/error; nudges suppressed for '
@@ -1198,7 +1266,7 @@ def classify_chat(
     if last_log_type == 'response':
         # v1.22.0 (stage 1, ported from chat_shepherd2's 2026-10-09 fix):
         # a turn whose completion path died after logging the response leaves
-        # an in-flight housekeeping marker ("Memorizing new information...")
+        # an in-flight foreground marker ("Preloading knowledge...")
         # as the newest log entry forever. Without this check the chat is
         # indistinguishable from a healthy finished chat - both end in a
         # response entry. A marker older than stall_minutes classifies as a
@@ -1218,6 +1286,12 @@ def classify_chat(
     stall_minutes = _as_float(cfg.get('stall_minutes', 5), 5.0)
     nudge_count = _as_int(prev_entry.get('nudge_count', 0))
     max_nudges = _as_int(cfg.get('max_auto_nudges', 3), 3)
+
+    if recoverable:
+        attempts = _as_int(prev_entry.get('error_recovery_count', 0))
+        if attempts >= max_nudges:
+            return STATUS_INTERVENTION, f'Recoverable {recoverable} error: retry budget exhausted ({attempts}/{max_nudges})'
+        return STATUS_STALLED, f'Recoverable {recoverable} error: retry {attempts}/{max_nudges}'
 
     if minutes_idle > stall_minutes:
         if nudge_count >= max_nudges:
@@ -1745,6 +1819,10 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                     _bkey = _BUDGET_KEY_WAL.get(_act, 'nudge_count')
                     _bentry[_bkey] = _as_int(
                         _bentry.get(_bkey, 0)) + 1
+                if _act == 'error_resume':
+                    _bentry['last_error_recovery_at'] = now_iso = datetime.now(timezone.utc).isoformat()
+                    if not _bentry.get('error_recovery_since'):
+                        _bentry['error_recovery_since'] = now_iso
                 # v1.23.1 (audit fix 7): the stall-restart episode budget and
                 # the exhaustion-kill guard are the ANTI-LOOP budgets —
                 # reconcile must charge them too, or a failed delivery
@@ -1804,6 +1882,25 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
           # times also let the classifier and the frozen clock disagree by one
           # entry on a chat that was logging while the tick ran.
           view = _log_snapshot(ctx)
+          recovery_since = _parse_dt(prev.get('error_recovery_since', ''))
+          if recovery_since and max(diag_mod.last_human_user_at(view),
+                                    diag_mod.last_response_at(view)) > recovery_since.timestamp():
+              recovered_at = str(prev.get('last_error_recovery_at') or '')
+              if (diag_mod.last_response_at(view) > recovery_since.timestamp()
+                  and _as_int(prev.get('error_recovery_count', 0)) > 0
+                  and recovered_at and recovered_at != prev.get('last_nudge_outcome_at')):
+                  elapsed = _minutes_since(_parse_dt(recovered_at))
+                  if elapsed <= NUDGE_EFFECTIVE_WINDOW_MIN:
+                      prev['nudges_effective'] = _as_int(prev.get('nudges_effective', 0)) + 1
+                      prev['last_nudge_outcome_at'] = recovered_at
+                      state_mod.append_history(state, {
+                          'chat_id': chat_id, 'action': 'nudge_effective',
+                          'source': 'error_resume', 'minutes_after_nudge': round(elapsed, 1),
+                          'timestamp': now_iso,
+                      })
+              prev['error_recovery_since'] = ''
+              prev['error_recovery_count'] = 0
+              prev['last_error_recovery_at'] = ''
 
           # P3 wedge detection: capture the log length and compare with the
           # previous tick. Unchanged length while running => start/continue the
@@ -1815,6 +1912,10 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
           # spinning dead loop; both frozen = hung call. O(1) reads
           # under the same lock; unknown counter = legacy behavior.
           cur_updates = view.updates if wedge_probe else -1
+          entry_changed = bool(view.entry_key
+                               and view.entry_key != prev.get('last_entry_key'))
+          activity_changed = bool(view.activity_key and prev.get('last_activity_key')
+                                  and view.activity_key != prev['last_activity_key'])
           frozen_minutes = 0.0
           liveness = ''
           if (
@@ -1822,6 +1923,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
               and cur_log_len >= 0
               and prev_log_len >= 0
               and cur_log_len == prev_log_len
+              and not entry_changed
           ):
               frozen_since = _parse_dt(prev.get('log_len_since', ''))
               if frozen_since is None:
@@ -1831,7 +1933,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   frozen_minutes = _minutes_since(frozen_since)
                   prev_updates = _as_int(prev.get('last_updates_len', -1), -1)
                   if cur_updates >= 0 and prev_updates >= 0:
-                      if cur_updates > prev_updates:
+                      if cur_updates > prev_updates or activity_changed:
                           # v1.23.0: mutations advancing while entries are
                           # frozen is ALSO the signature of healthy STREAMING
                           # — the response/agent LogItem is created once and
@@ -1846,6 +1948,10 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                           # value so classify's frozen arm can recognise it.
                           if view.last_type in ('agent', 'response'):
                               liveness = LIVENESS_STREAMING
+                              # Start a silence clock only AFTER the most
+                              # recent healthy chunk, not at stream start.
+                              prev['log_len_since'] = now_iso
+                              frozen_minutes = 0.0
                           else:
                               liveness = 'spinning'
                       elif cur_updates == prev_updates:
@@ -1853,6 +1959,12 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   prev['liveness'] = liveness
           else:
               prev['log_len_since'] = ''
+              prev['liveness'] = (
+                  LIVENESS_STREAMING if ctx.is_running()
+                  and view.last_type in ('agent', 'response')
+                  and cur_updates > _as_int(prev.get('last_updates_len', -1), -1) >= 0
+                  else ''
+              )
               # v1.23.1 (audit fix 5): when the task is NOT running, a stale
               # 'spinning_soft' no-response stamp must not re-inherit into
               # the next turn (before this, only the run-side upkeep cleared
@@ -2016,11 +2128,7 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
           # safety termination or an auth failure.
           gate_verdict, gate_reason = planner_mod.ACT, ''
           if diag_enabled:
-              _error_txt = ''
-              if _check_error_file(chat_id):
-                  _error_txt = diag_mod.read_error_head(
-                      os.path.join(_chat_dir(chat_id), 'error.txt')
-                  )
+              _error_txt = _error_text(chat_id, view)
               _fp = diag_mod.fingerprint(
                   chat_id,
                   error_text=_error_txt,
@@ -2081,7 +2189,15 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
           # excluded) clears the suppression early. The stamp gates both
           # nudge queues below for TERMINATION_NUDGE_COOLDOWN_MIN minutes.
           _term_found, _term_fresh_human = _scan_log_for_termination(ctx, view)
-          if _term_found:
+          recoverable_category = _recoverable_failure(chat_id, cfg, view)
+          recovering_error = bool(not ctx.is_running() and not ctx.paused
+                                  and recoverable_category
+                                  and not _was_blocked)
+          if recovering_error:
+              if not prev.get('error_recovery_since'):
+                  prev['error_recovery_since'] = now_iso
+              prev['terminated_at'] = ''
+          elif _term_found and not recoverable_category:
               prev['terminated_at'] = now_iso
           elif _term_fresh_human:
               prev['terminated_at'] = ''
@@ -2093,6 +2209,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
           # the scheduler resumes its own task chats on its own cadence.
           if (
               server_restarted
+              and not recoverable_category
+              and new_status not in (STATUS_ERROR, STATUS_BLOCKED)
               and old_status in (
                   STATUS_RUNNING, STATUS_STALLED, STATUS_NUDGED, STATUS_INTERVENTION
               )
@@ -2155,6 +2273,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                last_log_type=_last_log_type(ctx, view) if ctx else '',
               last_log_len=cur_log_len,
               last_updates_len=cur_updates,
+              last_entry_key=view.entry_key,
+              last_activity_key=view.activity_key,
               last_ticked=now_iso,
           )
           if new_status != STATUS_INTERVENTION:
@@ -2202,20 +2322,26 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                   summary['nudges_this_tick'] += 1
           elif new_status == STATUS_STALLED:
               summary['stalled'] += 1
-              last_nudge_dt = _parse_dt(prev.get('last_nudge_at', ''))
+              entry['recovering_error'] = recovering_error
+              last_nudge_dt = _parse_dt(prev.get(
+                  'last_error_recovery_at' if recovering_error else 'last_nudge_at', ''))
               cooldown_ok = _minutes_since(last_nudge_dt) >= nudge_cooldown
               minutes_idle = _minutes_since(_parse_dt(getattr(ctx, 'last_message', '')))
               # v1.21.0 (A1): coerce - classify_chat already coerced this same
               # field, so an unusable value used to yield a status of "nudge
               # 3/3 used" in the UI while this comparison raised and the chat
               # was silently never queued again.
-              nudge_count = _as_int(prev.get('nudge_count', 0))
+              nudge_count = _as_int(prev.get(
+                  'error_recovery_count' if recovering_error else 'nudge_count', 0))
               if (
                   cooldown_ok
                   and not _term_cooldown_active
                   and nudge_count < max_nudges
                   and gate_verdict == planner_mod.ACT
                   and _can_act
+                  and (not recovering_error or getattr(ctx, 'type', None) == AgentContextType.USER)
+                  and not any(i.get('chat_id') == chat_id
+                              for i in state.get('inflight', []) if isinstance(i, dict))
               ):
                   # v1.22.0 (stage 2): the diagnosis gate (hold/block)
                   # precedes the ladder — a non-allowlisted cause is held,
@@ -2609,22 +2735,28 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
             if supervised:
                 # v1.16.0: draft instead of auto-send; no budget use.
                 if state_mod.add_draft(
-                    state, chat_id, 'stall_nudge',
+                    state, chat_id, 'error_resume' if entry.get('recovering_error') else 'stall_nudge',
                     reason=str(entry.get('last_classification', '')),
                 ):
                     summary['drafted'] += 1
                 continue
             if inflight_on:
-                _wal_id = state_mod.begin_inflight(state, 'stall_nudge', chat_id, 1)
+                _wal_id = state_mod.begin_inflight(
+                    state, 'error_resume' if entry.get('recovering_error') else 'stall_nudge', chat_id, 1)
             if _nudge_context(ctx, chat_id=chat_id):
                 # v1.21.0 (A1/O12): coerce the counters (this drain is outside
                 # the per-chat guard) and drop the redundant re-lookup.
-                entry['nudge_count'] = _as_int(entry.get('nudge_count', 0)) + 1
+                recovering_error = bool(entry.get('recovering_error'))
+                count_key = 'error_recovery_count' if recovering_error else 'nudge_count'
+                entry[count_key] = _as_int(entry.get(count_key, 0)) + 1
                 entry['nudges_sent'] = _as_int(entry.get('nudges_sent', 0)) + 1
                 entry['last_nudge_at'] = now_iso
+                if recovering_error:
+                    entry['last_error_recovery_at'] = now_iso
                 entry['status'] = STATUS_NUDGED
                 entry['last_classification'] = (
-                    f'Auto-nudged (attempt {entry["nudge_count"]}/{max_nudges})'
+                    f'Auto-resumed error (attempt {entry[count_key]}/{max_nudges})'
+                    if recovering_error else f'Auto-nudged (attempt {entry[count_key]}/{max_nudges})'
                 )
                 summary['nudged'] += 1
                 summary['nudges_this_tick'] += 1
@@ -2633,8 +2765,8 @@ def _tick_impl(cfg: dict[str, Any]) -> dict[str, Any]:
                     state_mod.end_inflight(state, _wal_id)
                 state_mod.append_history(state, {
                     'chat_id': chat_id,
-                    'action': 'auto_nudge',
-                    'nudge_count': entry['nudge_count'],
+                    'action': 'error_resume' if recovering_error else 'auto_nudge',
+                    'nudge_count': entry[count_key],
                     'timestamp': now_iso,
                 })
 

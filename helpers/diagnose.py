@@ -170,6 +170,16 @@ def classify_text(text: str) -> str:
     if not text or not str(text).strip():
         return CATEGORY_NONE
     haystack = str(text)
+    # Providers sometimes wrap spent credit in PermissionDeniedError/403.
+    # Read the primary message before class names elsewhere in a traceback.
+    primary = haystack.split('Traceback (most recent call last)', 1)[0]
+    if (
+        re.search(r'no quota left|quota (?:exceeded|exhausted)|insufficient_quota'
+                  r'|used all included|reached your .*usage limit', primary, re.I)
+        and not re.search(r'\b401\b|invalid[ _-]*(?:api[ _-]*)?key'
+                          r'|unauthoriz|safety|terminat', primary, re.I)
+    ):
+        return CATEGORY_RATE_LIMIT
     for category, pattern in _RULES:
         if pattern.search(haystack):
             return category
@@ -201,19 +211,12 @@ def signature(category: str, text: str) -> str:
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:12]
 
 
-# The memory plugin's background housekeeping logs a `util` entry when a task
-# (memory recall, memorization) STARTS and updates the same LogItem in place
-# when the task finishes. A wedged utility call therefore leaves one of these
-# start markers as the newest log entry with empty content, forever — that is
-# the shape of every "the response rendered, the spinner never stopped"
-# failure. Matching the headings couples this plugin to the memory plugin's
-# labels, which is the accepted cost: the alternative — any empty `util` as
-# newest entry — also matches benign terminal labels like "Memory recall
-# timed out", whose empty content is a completed outcome, and would flag
-# every chat whose last housekeeping entry happened to carry no content.
+# Only foreground preparation can establish a completion wedge. Memorizing
+# information/solutions runs in a background DeferredTask AFTER the response;
+# even an abandoned marker there must not restart completed foreground work.
+# Terminal labels such as "Memory recall timed out" are not start markers.
 _INFLIGHT_HOUSEKEEPING = re.compile(
-    r'^(?:Preloading knowledge|Searching memories'
-    r'|Memorizing (?:new information|succesful solutions|successful solutions))'
+    r'^(?:Preloading knowledge|Searching memories)'
 )
 
 

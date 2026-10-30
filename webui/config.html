@@ -151,7 +151,7 @@ Chat Shepherd
   { key: 'safety_termination', label: 'Safety terminations (always blocked, not selectable)' },
   { key: 'auth', label: 'Auth failures (always blocked, not selectable)' },
   ],
-}">
+}" x-effect="if (!Array.isArray(config.auto_remediate_categories)) config.auto_remediate_categories = config.auto_remediate_categories === false ? [] : ['tool_error', 'framework_crash', 'network', 'json_malformed']">
 <h4>Cause-gated remediation</h4>
 <small class="hint">Tick the failure causes the auto-ladder is allowed to remediate (tool/framework/network/JSON are the safe defaults). Unticking holds those chats visible with no auto-action. A safety termination or an auth failure is ALWAYS blocked for a human — that floor is not configurable, and these two checkboxes are informational only.</small>
 <template x-for="c in cats" :key="c.key">

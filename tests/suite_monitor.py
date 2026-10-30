@@ -1360,7 +1360,7 @@ def main():
             FakeAgentContext._all = [_ctx18]
             _s18b = monitor.tick(_cfg18)
             assert (_s18b.get('nudged', 0) + _s18b.get('resumed', 0)) >= 1, _s18b
-            assert len(_saves18) == 1, 'eventful tick must save immediately'
+            assert len(_saves18) == 2, 'eventful tick must save its WAL claim before delivery and its result afterwards'
             assert _s18b.get('state_save_skipped') is False, _s18b
             print('TEST18B_EVENTFUL_FORCE_OK')
             # 18c: interval 0 = legacy write-every-tick on a quiet tick
@@ -2192,7 +2192,9 @@ def main():
         # path's job (monitor._load_config / deep_merge_defaults, TEST37).
         from usr.plugins.chat_shepherd.helpers import config_defaults as _cd36
         _cfg_path36 = 'usr/plugins/chat_shepherd/config.json'
-        _raw36 = json.loads(files.read_file(files.get_abs_path(_cfg_path36)))
+        # Instance config is deliberately untracked. A clean clone must test
+        # the contract against a fixture, never depend on production settings.
+        _raw36 = {'stall_minutes': 7, 'some_future_key': 42}
         _pinned36 = sorted(k for k in _cd36.KNOWN_KEYS
                            if k in _raw36 and _raw36[k] == _cd36.DEFAULTS[k])
         assert not _pinned36, (
@@ -4111,7 +4113,7 @@ def main():
         # TEST46A: old in-flight marker -> wedged completion (intervention).
         ctx46a = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=3)
         ctx46a.log.logs.append(types.SimpleNamespace(
-            type='util', heading='Memorizing new information...',
+            type='util', heading='Preloading knowledge...',
             content='', timestamp=_t46 - 7200))
         st46a, r46a = monitor.classify_chat(ctx46a, FAKE_CHAT_A, cfg46, {}, 0.0)
         assert st46a == constants.STATUS_INTERVENTION, (st46a, r46a)
@@ -4121,7 +4123,7 @@ def main():
         # TEST46B: a FRESH marker (< stall_minutes) is within grace.
         ctx46b = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
         ctx46b.log.logs.append(types.SimpleNamespace(
-            type='util', heading='Memorizing new information...',
+            type='util', heading='Preloading knowledge...',
             content='', timestamp=_t46 - 30))
         st46b, _r46b = monitor.classify_chat(ctx46b, FAKE_CHAT_A, cfg46, {}, 0.0)
         assert st46b == constants.STATUS_AWAITING_USER, (st46b, _r46b)
@@ -4130,7 +4132,7 @@ def main():
         # TEST46C: a COMPLETED housekeeping result carries content -> awaiting.
         ctx46c = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=1)
         ctx46c.log.logs.append(types.SimpleNamespace(
-            type='util', heading='Memorizing new information...',
+            type='util', heading='Preloading knowledge...',
             content='12 memories stored', timestamp=_t46 - 3600))
         st46c, _r46c = monitor.classify_chat(ctx46c, FAKE_CHAT_A, cfg46, {}, 0.0)
         assert st46c == constants.STATUS_AWAITING_USER, (st46c, _r46c)
@@ -4177,7 +4179,7 @@ def main():
         })
         ctx46g = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=3)
         ctx46g.log.logs.append(types.SimpleNamespace(
-            type='util', heading='Memorizing successful solutions...',
+            type='util', heading='Preloading knowledge...',
             content='', timestamp=_t46 - 7200))
         FakeAgentContext._all = [ctx46g]
         s46g = monitor.tick(cfg46)
@@ -4206,7 +4208,7 @@ def main():
         cfg46g2['wedge_soft_restart'] = True
         ctx46g2 = FakeCtx(FAKE_CHAT_A, ['user', 'response'], idle_minutes=3)
         ctx46g2.log.logs.append(types.SimpleNamespace(
-            type='util', heading='Memorizing new information...',
+            type='util', heading='Preloading knowledge...',
             content='', timestamp=_t46 - 7200))
         FakeAgentContext._all = [ctx46g2]
         monitor.tick(cfg46g2)

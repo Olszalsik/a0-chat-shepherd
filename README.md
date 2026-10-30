@@ -97,9 +97,16 @@ Icons are fully configurable.
 
 ### Nudging a chat that ended in an error
 
-Shepherd never auto-nudges a chat whose last run stopped on a real error or a
-security termination — a nudge just restarts the code path that already failed,
-and Shepherd cannot know whether the underlying bug was fixed.
+Recent stopped chats with an allowlisted network, tool, framework or malformed
+JSON error can resume automatically. They get at most `max_auto_nudges`
+attempts with `nudge_cooldown_minutes` between attempts. Briefly running again
+does not reset that budget; a newer human message or completed response does.
+Failures older than one hour (or the configured retry window, if longer) are
+left for review so updates never resurrect historical failed chats.
+
+Authentication failures, security terminations, spent provider quotas and
+non-allowlisted causes stay held or blocked for human review. Provider quota
+resets and available API credit remain the provider's responsibility.
 
 You can still nudge it by hand, and the dashboard will make you confirm it
 first:
@@ -247,11 +254,28 @@ still shows every chat's status — only the inline icon is skipped.
 
 ---
 
+## Recovery reliability
+
+Since v1.26.0, activity detection uses entry identity and visible-content
+fingerprints as well as retained-list lengths. Long streams remain active after
+5000 update markers; trimming old log entries does not hide new progress.
+Background memorization after a final response does not restart completed work.
+
+A provider's spent quota is classified as a rate limit even when its SDK wraps
+it in PermissionDeniedError. Existing auth/safety blocks still require a human
+release. The supervisor never silently releases them on an update.
+
+Legacy boolean remediation settings are repaired into a real category list.
+Private config and runtime history are never required by the test suite.
+
 ## Development
 
 ```bash
-# self-test suite (112 markers)
+# backend regression suite
 python usr/plugins/chat_shepherd/tests/suite_monitor.py
+
+# failure-recovery regressions (framework on PYTHONPATH)
+PYTHONPATH=/a0 python -m pytest --import-mode=importlib usr/plugins/chat_shepherd/tests/test_recovery.py
 
 # sidebar badge-injector DOM suite (23 assertions, no external deps)
 node usr/plugins/chat_shepherd/tests/suite_sidebar.mjs

@@ -112,7 +112,7 @@ def coerce_bool(val: Any) -> bool:
 def coerce_int(val: Any, fallback: int, lo: int, hi: int) -> int:
     try:
         n = int(val)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return fallback
     return max(lo, min(hi, n))
 
@@ -123,6 +123,19 @@ def _copy_default(v: Any) -> Any:
     if isinstance(v, list):
         return list(v)
     return v
+
+
+def remediation_categories(value: Any) -> list[str]:
+    """Repair legacy checkbox booleans without enabling extra causes."""
+    if value is False:
+        return []
+    if isinstance(value, str):
+        value = value.split(',')
+    if not isinstance(value, list):
+        return list(DEFAULTS['auto_remediate_categories'])
+    return list(dict.fromkeys(
+        item.strip() for item in value if isinstance(item, str) and item.strip()
+    ))[:20]
 
 
 def deep_merge_defaults(overlay: Any) -> dict[str, Any]:
@@ -139,6 +152,8 @@ def deep_merge_defaults(overlay: Any) -> dict[str, Any]:
             merged[k] = child
         else:
             merged[k] = _copy_default(v) if isinstance(v, (dict, list)) else v
+    merged['auto_remediate_categories'] = remediation_categories(
+        merged['auto_remediate_categories'])
     return merged
 
 
@@ -426,16 +441,8 @@ def apply_overrides(current: dict[str, Any], readable: dict[str, Any]) -> dict[s
         # (same contract as unknown top-level keys). NEVER_REMEDIATE members
         # remain accepted config values but are inert: planner.may_remediate
         # applies the floor after this allowlist.
-        raw_cats = readable["auto_remediate_categories"]
-        if isinstance(raw_cats, str):
-            raw_cats = raw_cats.split(",")
-        if isinstance(raw_cats, list):
-            cats: list[str] = []
-            for item in raw_cats:
-                s = str(item).strip()
-                if s and s not in cats:
-                    cats.append(s)
-            current["auto_remediate_categories"] = cats[:20]
+        current["auto_remediate_categories"] = remediation_categories(
+            readable["auto_remediate_categories"])
     if "webhook_url" in readable:
         current["webhook_url"] = str(readable["webhook_url"]).strip()[:500]
     if "webhook_allow_private" in readable:

@@ -2,7 +2,7 @@
 
 > Continuously watches your chats, auto-nudges stalled agents back to work, auto-continues wedged chats, and flags anything needing human input. Glanceable dashboard with per-chat status icons.
 
-**Version:** 1.25.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
+**Version:** 1.26.0 · **Plugin ID:** `chat_shepherd` · **Last review:** 2026-10-05 full technical audit + three remediation cycles and two closing passes: 21 defects and 16 optimizations closed (coercion at every boundary — load, config and request — so no hand-edited value can abort a tick or degrade a poll; one seam for the chat-dir base; the state fingerprint cached by CONTENT digest, halving `load_state`; journal reads incremental; one log snapshot per chat per pass; dashboard poll cannot stack or orphan a chain; the suite writes nothing into live production state and needs no container runtime) · previous: 2026-09-28 independent bug-hunt: 10 findings fixed (→ v1.20.7; config no longer pins defaults → v1.20.6; endpoint offload + /config silent-drop fix → v1.20.5; manual-override confirmation → v1.20.4; row hook + hook-independent config + lock contract → v1.20.3)
 
 ## v1.23.0 — provider-exhaustion loops, streaming exemption, durable alerts (2026-10-15)
 
@@ -363,6 +363,40 @@ escalation fallthrough convergence, quarantine vs `_atomic_replace`,
 restart corners (first tick / skew / future last_tick), all caches and
 lock ordering. All suites green.
 
+## Recovery contracts (v1.26.0)
+
+- Bounded `log.updates` length is not a monotonic clock. One locked snapshot
+  captures newest-entry identity and visible-content digests; store only the
+  digests. A new entry resets the freeze clock even when the retained log
+  length stays constant. Healthy streaming refreshes the silence clock.
+- `auto_remediate_categories` is normalized at read/save boundaries: legacy
+  `true` or malformed scalars restore the safe default list, `false` and an
+  empty list disable it, and CSV input is normalized. The settings checkbox
+  group initializes an array before Alpine can persist a boolean.
+- Only recent, timestamped, allowlisted tool/framework/network/JSON failures
+  can auto-resume USER chats. The freshness window is at least 60 minutes,
+  extended to cover the configured retry cooldowns. Historical failures are
+  never revived by installing the update. Auth, safety, quotas, provider
+  exhaustion, external blocks, paused chats and TASK contexts are excluded.
+- Failed-stop retries use `error_recovery_count` with `max_auto_nudges` and
+  `nudge_cooldown_minutes`. Running briefly, a restart or an automation message
+  does not replenish that budget; a newer human turn or completed response
+  does. Supervised `error_resume` drafts charge it only on delivery. Retries
+  keep the original error evidence and journal `error_resume`.
+- `begin_inflight` persists its intent before delivery. An outstanding intent
+  suppresses another automated stall send until reconciliation charges its
+  action's own counter. A failed recovery intent also starts its cooldown.
+- Quota text in the primary provider message takes precedence over a generic
+  PermissionDenied wrapper; genuine bad credentials and safety stops retain
+  their blocking rules. Older error.txt evidence does not override a newer
+  completed response and is never deleted by recovery.
+- `Memorizing ...` entries run in background after the response; an empty or
+  old marker is not evidence that foreground work needs another turn.
+- Verification: run `tests/suite_monitor.py`, both Node suites and
+  `python -m pytest --import-mode=importlib tests/test_recovery.py` in the
+  framework environment. The backend suite uses a config fixture, so a clean
+  clone needs no private config.json. New tests redirect every state/chat path.
+
 ## Purpose
 
 Agent monitoring: a `job_loop` extension ticks periodically, classifies every live `AgentContext` into one of 8 statuses (`running / stalled / nudged / intervention / awaiting_user / error / paused / idle`), auto-sends a nudge `UserMessage` to stalled chats (bounded by `max_auto_nudges` + `nudge_cooldown_minutes`), raises a HIGH-priority OS notification when a chat exhausts its nudges, and keeps per-chat state in `data/state.json` plus an append-only action journal in `data/history.jsonl` (v1.6.0); since v1.9.0 patched helper modules hot-reload between ticks. The WebUI sidebar (JS in `sidebar-chats-list-start`) shows a per-chat status icon via `GET /api/plugins/chat_shepherd/status`, with manual nudge / resolve / dismiss actions.
@@ -390,7 +424,7 @@ Agent monitoring: a `job_loop` extension ticks periodically, classifies every li
 - **Sidebar badge row resolution (v1.20.1)**: `webui/shepherd-sidebar.js` resolves a row's chat id in this order — (1) row attributes `data-folder-thread` / `data-context-id` / `data-chat-id` walking up from `.chat-container`; (2) `Alpine.$data(container)` probing the scope keys `context`, `child`, `item`, `task`; (3) the legacy `<li>` scope lookup; (4) `dataset.chatId`. The container's own scope must be read, not only the `<li>`: since the v2.10 sidebar refactor, chat rows come from the shared `sidebar/chats/chat-tree.html` component, and a row-list extension (`_sidebar_folders`) binds the model as `item` on a wrapper `x-data` while its `x-for` scope sits on the `<li>`. The old `<li>`-only lookup returned `null` for those rows, so no badge was painted for top-level chats and only nested children (visible after expanding a parent) showed one.
 - **Config reads are hook-independent (v1.20.3)**: every runtime read goes through `monitor._load_config()`, which re-applies `config_defaults.deep_merge_defaults()` on top of whatever the framework returns. No runtime path may call `plugins.get_plugin_config` directly — the `hooks.py` deep-merge is the *primary* mechanism, but a hook regression must not silently zero every unwritten key. The tick extension, `/status`, and `/test_notify` all use the seam; `api/config.py` keeps its own `_read_disk()` (it must persist, not just read). **The on-disk `config.json` is the inverse of this: it holds ONLY explicitly-set values (v1.20.6), never the full 33-key merge** — a fully-merged file pins every shipped default and would block any future default change. Completeness is the read path's job, proven by TEST36 + TEST37.
 - **Row identity comes from the core hook (v1.20.3)**: `chat-tree.html` now renders `:data-context-id="context.id"` on the same element that carries `.chat-container`, so the badge injector resolves a row from that attribute with no Alpine scope at all. The scope and legacy-attribute lookups remain as fallbacks for third-party row views that do not reuse the core component.
-- **Manual nudges on a fatal stop are confirmed, audited, and non-destructive (v1.20.4)**: the AUTO ladder refuses to nudge a chat that ended on a real error or a security termination, because a nudge restarts the exact code path that just failed. A human must always be able to override that — the operator may have fixed the underlying bug — but the override is never silent and never destroys the evidence. See the v1.20.4 entry in the changelog below for the full request/response contract.
+- **Manual nudges on a fatal stop are confirmed, audited, and non-destructive (v1.20.4)**: the AUTO ladder refuses auth, safety, quota and non-allowlisted stops. Recent allowlisted failures use the bounded recovery contract above. A human must always be able to override that — the operator may have fixed the underlying bug — but the override is never silent and never destroys the evidence. See the v1.20.4 entry in the changelog below for the full request/response contract.
 - **Badge placement**: the badge is hosted by `.chat-list-button` and inserted before `.chat-list-action-btn`, so it sits with the chat name and never shifts when the hover-only close/overflow buttons appear. `pointer-events: none` keeps the whole row clickable.
 - **Badge identity**: repaint is keyed on `data-cs-status`, not on the glyph — two statuses may share one pictogram and must still update colour, tooltip, and `aria-label`. A badge already inside the current host is reused, never recreated; one found in a stale host is dropped.
 - **Extension script idempotence**: the file is a classic script inside the `sidebar-chats-list-start` HTML extension, and the component loader re-executes it on every extension (re)load. The `window.__chatShepherdSidebar` guard makes repeat loads a no-op that only re-runs `refresh()`, so timers and observers cannot stack.

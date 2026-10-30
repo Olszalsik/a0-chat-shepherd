@@ -77,6 +77,9 @@ def begin_inflight(
         inflight = []
         state['inflight'] = inflight
     inflight.append(entry)
+    # Intent must reach disk BEFORE communicate()/nudge()/kill_process().
+    # Otherwise a process exit loses the claim and the next tick replays it.
+    save_state(state)
     return entry['id']
 
 
@@ -129,6 +132,7 @@ def reconcile_inflight(
 # below, so it cannot be forgotten at a new call site.
 #   value -> int, clamped at 0; sentinel fields -> -1 when unusable.
 COUNTER_FIELDS: tuple[str, ...] = (
+    'error_recovery_count',
     'nudge_count',
     'nudges_sent',
     'nudges_effective',

@@ -137,7 +137,7 @@ def compute(
         last_ts = parsed[-1][0]
 
         for dt, action, chat_id, ev in parsed:
-            if action == _STALL_ACTION:
+            if action in (_STALL_ACTION, 'error_resume'):
                 nudges_sent += 1
                 prev = last_nudge.get(chat_id)
                 if prev is None or (dt - prev).total_seconds() > EPISODE_GAP_MINUTES * 60:
